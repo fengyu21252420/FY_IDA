@@ -1,0 +1,8 @@
+{
+  "id": "import-summary",
+  "name": "Import Summary",
+  "version": "0.1.0",
+  "description": "Prints the first imported APIs from the FY_IDA report JSON.",
+  "script": "import_summary.py",
+  "menu": "Tools/Import Summary"
+}

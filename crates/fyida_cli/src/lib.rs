@@ -1,20 +1,21 @@
 use std::collections::BTreeMap;
 use std::fmt::Write as _;
 use std::path::{Path, PathBuf};
+use std::process::Command;
 use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use fyida_analysis::StaticAnalysis;
 use fyida_core::{sha256_hex, RawArch};
 use fyida_loader::RawLoadOptions;
-use serde::Serialize;
+use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Parser)]
 #[command(
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.10.0-alpha.1 已提供 headless JSON/CSV 导出、批量目录分析、错误报告、类型导入导出、PDB 符号和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.11.0-alpha.1 已提供 Python 脚本 API、插件 manifest 扫描、GUI Python 控制台、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -75,6 +76,19 @@ pub struct Cli {
         help = "将 headless 错误报告写入 JSON 文件"
     )]
     pub error_report: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PY",
+        help = "分析后运行 Python 脚本，脚本通过 FYIDA_REPORT_JSON 读取报告"
+    )]
+    pub python_script: Option<PathBuf>,
+
+    #[arg(long, value_name = "DIR", help = "扫描 FY_IDA 插件 manifest 目录")]
+    pub plugins_dir: Option<PathBuf>,
+
+    #[arg(long = "plugin", value_name = "ID", help = "运行指定插件 ID；可重复")]
+    pub plugins: Vec<String>,
 
     #[arg(value_name = "FILE", help = "启动 GUI 时预选的输入文件路径")]
     pub file: Option<PathBuf>,
@@ -283,6 +297,16 @@ struct CliTypeLoad {
     messages: Vec<String>,
 }
 
+#[derive(Debug, Deserialize)]
+struct PluginManifest {
+    id: String,
+    name: String,
+    version: Option<String>,
+    description: Option<String>,
+    script: PathBuf,
+    menu: Option<String>,
+}
+
 pub fn run_headless(cli: &Cli) -> i32 {
     let type_load = match load_cli_types(cli) {
         Ok(types) => types,
@@ -467,7 +491,7 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
         let loaded = fyida_loader::load_raw_file_with_bytes(file, options)
             .map_err(|error| format!("Raw Binary 加载失败：{error}"))?;
         let analysis = fyida_analysis::analyze_raw(&loaded.image, &loaded.bytes);
-        let report = HeadlessReport {
+        let mut report = HeadlessReport {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             input: raw_input_report(&loaded.image, &loaded.bytes),
             analysis: analysis_report(&analysis),
@@ -475,6 +499,7 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
             messages: type_load.messages.clone(),
             elapsed_ms: started.elapsed().as_millis(),
         };
+        run_python_automation(cli, &mut report)?;
         return timeout_checked(cli, started, report);
     }
 
@@ -500,7 +525,7 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
         }
     }
 
-    let report = HeadlessReport {
+    let mut report = HeadlessReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         input: pe_input_report(&loaded.image, &loaded.bytes),
         analysis: analysis_report(&analysis),
@@ -508,7 +533,127 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
         messages,
         elapsed_ms: started.elapsed().as_millis(),
     };
+    run_python_automation(cli, &mut report)?;
     timeout_checked(cli, started, report)
+}
+
+fn run_python_automation(cli: &Cli, report: &mut HeadlessReport) -> Result<(), String> {
+    let mut scripts = Vec::new();
+    if let Some(script) = &cli.python_script {
+        scripts.push(("script".to_owned(), script.clone()));
+    }
+    for plugin in selected_plugins(cli)? {
+        let label = format!(
+            "plugin:{}:{}",
+            plugin.id,
+            plugin.version.as_deref().unwrap_or("dev")
+        );
+        if let Some(description) = &plugin.description {
+            report
+                .messages
+                .push(format!("插件 {} - {}", plugin.name, description));
+        }
+        if let Some(menu) = &plugin.menu {
+            report
+                .messages
+                .push(format!("插件菜单入口 {} -> {}", plugin.name, menu));
+        }
+        scripts.push((label, plugin.script));
+    }
+
+    for (label, script) in scripts {
+        let output = run_python_script(&script, report)
+            .map_err(|message| format!("Python {label} 运行失败：{message}"))?;
+        report
+            .messages
+            .push(format!("Python {label} stdout:\n{}", output.0));
+        if !output.1.trim().is_empty() {
+            report
+                .messages
+                .push(format!("Python {label} stderr:\n{}", output.1));
+        }
+    }
+    Ok(())
+}
+
+fn selected_plugins(cli: &Cli) -> Result<Vec<PluginManifest>, String> {
+    let Some(directory) = &cli.plugins_dir else {
+        return Ok(Vec::new());
+    };
+    let mut manifests = scan_plugin_manifests(directory)?;
+    if !cli.plugins.is_empty() {
+        manifests.retain(|manifest| cli.plugins.iter().any(|id| id == &manifest.id));
+    }
+    Ok(manifests)
+}
+
+fn scan_plugin_manifests(directory: &Path) -> Result<Vec<PluginManifest>, String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("无法扫描插件目录 {}：{error}", directory.display()))?;
+    let mut manifests = Vec::new();
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("插件目录枚举失败：{error}"))?;
+        let path = entry.path();
+        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
+            continue;
+        }
+        let text = std::fs::read_to_string(&path)
+            .map_err(|error| format!("无法读取插件 manifest {}：{error}", path.display()))?;
+        let mut manifest: PluginManifest = serde_json::from_str(&text)
+            .map_err(|error| format!("插件 manifest 格式无效 {}：{error}", path.display()))?;
+        if manifest.script.is_relative() {
+            let base = path.parent().unwrap_or(directory);
+            manifest.script = base.join(&manifest.script);
+        }
+        manifests.push(manifest);
+    }
+    manifests.sort_by(|left, right| left.id.cmp(&right.id));
+    Ok(manifests)
+}
+
+fn run_python_script(script: &Path, report: &HeadlessReport) -> Result<(String, String), String> {
+    let report_path = std::env::temp_dir().join(format!(
+        "fyida_python_report_{}_{}.json",
+        std::process::id(),
+        safe_temp_name(&report.input.path)
+    ));
+    let report_json = serde_json::to_string_pretty(report)
+        .map_err(|error| format!("无法编码脚本报告 JSON：{error}"))?;
+    std::fs::write(&report_path, report_json)
+        .map_err(|error| format!("无法写入脚本报告 {}：{error}", report_path.display()))?;
+
+    let output = Command::new("python")
+        .arg(script)
+        .env("FYIDA_REPORT_JSON", &report_path)
+        .env("FYIDA_INPUT_PATH", &report.input.path)
+        .env("FYIDA_INPUT_KIND", &report.input.kind)
+        .output()
+        .map_err(|error| format!("无法启动 python：{error}"))?;
+    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
+    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    if output.status.success() {
+        Ok((stdout, stderr))
+    } else {
+        Err(format!(
+            "退出码 {:?}\nstdout:\n{}\nstderr:\n{}",
+            output.status.code(),
+            stdout,
+            stderr
+        ))
+    }
+}
+
+fn safe_temp_name(path: &str) -> String {
+    path.chars()
+        .map(|character| {
+            if character.is_ascii_alphanumeric() {
+                character
+            } else {
+                '_'
+            }
+        })
+        .take(80)
+        .collect()
 }
 
 fn timeout_checked(

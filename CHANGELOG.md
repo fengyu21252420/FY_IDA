@@ -4,6 +4,36 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.11.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added `--python-script <PY>` to run a Python script after headless analysis.
+- Added a headless Python report API through `FYIDA_REPORT_JSON`, `FYIDA_INPUT_PATH`, and `FYIDA_INPUT_KIND`.
+- Added `--plugins-dir <DIR>` plugin manifest scanning and `--plugin <ID>` selection.
+- Added plugin manifest support with `id`, `name`, `version`, `description`, `script`, and optional `menu` fields.
+- Added plugin/script stdout and stderr capture into headless report messages.
+- Added a basic GUI Python Console tab that runs local Python code with `FYIDA_SELECTED_FILE`, `FYIDA_CURRENT_VA`, and `FYIDA_CURRENT_FUNCTION`.
+- Added `docs/PYTHON_API.md` with script and plugin usage.
+- Added example Python script and example plugin manifest/script under `examples/`.
+
+### Changed
+
+- Updated the workspace version to `0.11.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the Python/plugin checkpoint.
+
+### Known Issues
+
+- Python execution is process-based through the local `python` executable; FY_IDA does not yet embed or bundle a Python runtime.
+- Scripts can read the report JSON but cannot yet mutate the open GUI project model or saved project annotations directly.
+- GUI plugin menu registration is represented in manifests and report messages; full dynamic GUI menu binding remains future work.
+- Plugin isolation is limited to process execution and captured output; no sandboxing is provided.
+
+### Recovery
+
+- Source tag: `v0.11.0-alpha.1`.
+- Roll back with: `git checkout v0.11.0-alpha.1`.
+
 ## v0.10.0-alpha.1 - 2026-06-23
 
 ### Added

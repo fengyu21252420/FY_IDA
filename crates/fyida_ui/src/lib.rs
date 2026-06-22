@@ -1,5 +1,6 @@
 use std::collections::VecDeque;
 use std::path::PathBuf;
+use std::process::Command;
 
 use eframe::egui::{
     self, Align, CentralPanel, Color32, Context, DragValue, FontData, FontDefinitions, FontFamily,
@@ -79,6 +80,8 @@ struct FyIdaApp {
     rename_text: String,
     comment_open: bool,
     comment_text: String,
+    python_code: String,
+    python_output: String,
     type_editor_open: bool,
     type_editor_kind: TypeEditorKind,
     type_name_text: String,
@@ -180,6 +183,8 @@ impl FyIdaApp {
             rename_text: String::new(),
             comment_open: false,
             comment_text: String::new(),
+            python_code: "import os\nprint('FY_IDA file:', os.environ.get('FYIDA_SELECTED_FILE', '-'))\nprint('Current VA:', os.environ.get('FYIDA_CURRENT_VA', '-'))".to_owned(),
+            python_output: "Python 控制台待运行。".to_owned(),
             type_editor_open: false,
             type_editor_kind: TypeEditorKind::Struct,
             type_name_text: String::new(),
@@ -1363,8 +1368,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.10.0-alpha.1");
-                        ui.label("headless JSON/CSV、批量分析与错误报告 MVP。");
+                        ui.label("FY_IDA v0.11.0-alpha.1");
+                        ui.label("Python 脚本 API、插件 manifest 与 GUI 控制台 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -2232,15 +2237,63 @@ impl FyIdaApp {
         match BOTTOM_TABS[self.bottom_tab] {
             "输出" => log_view(ui, &self.logs),
             "搜索结果" => self.search_results_view(ui),
-            "Python 控制台" => {
-                ui.label("Python 控制台将在脚本系统阶段启用。");
-                ui.add_enabled(
-                    false,
-                    TextEdit::singleline(&mut String::new()).hint_text(">>>"),
-                );
-            }
+            "Python 控制台" => self.python_console_panel(ui),
             "日志" => log_view(ui, &self.logs),
             _ => placeholder_list(ui, &["暂无后台任务"]),
+        }
+    }
+
+    fn python_console_panel(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            if ui.button("运行").clicked() {
+                self.run_python_console();
+            }
+            if ui.button("清空输出").clicked() {
+                self.python_output.clear();
+            }
+        });
+        ui.add(TextEdit::multiline(&mut self.python_code).desired_rows(7));
+        ui.separator();
+        ScrollArea::vertical().max_height(180.0).show(ui, |ui| {
+            ui.monospace(&self.python_output);
+        });
+    }
+
+    fn run_python_console(&mut self) {
+        let script_path =
+            std::env::temp_dir().join(format!("fyida_gui_console_{}.py", std::process::id()));
+        if let Err(error) = std::fs::write(&script_path, &self.python_code) {
+            self.python_output = format!("写入临时脚本失败：{error}");
+            return;
+        }
+
+        let mut command = Command::new("python");
+        command.arg(&script_path);
+        if let Some(selection) = self.project.selected_file() {
+            command.env("FYIDA_SELECTED_FILE", selection.path());
+        }
+        if let Some(address) = self.project.current_address() {
+            command.env("FYIDA_CURRENT_VA", format!("0x{address:016X}"));
+        }
+        if let Some(function) = self.project.current_function() {
+            command.env("FYIDA_CURRENT_FUNCTION", function);
+        }
+
+        match command.output() {
+            Ok(output) => {
+                let stdout = String::from_utf8_lossy(&output.stdout);
+                let stderr = String::from_utf8_lossy(&output.stderr);
+                self.python_output = format!(
+                    "exit: {:?}\n--- stdout ---\n{}\n--- stderr ---\n{}",
+                    output.status.code(),
+                    stdout,
+                    stderr
+                );
+                self.logs.push("Python 控制台脚本已运行。".to_owned());
+            }
+            Err(error) => {
+                self.python_output = format!("启动 python 失败：{error}");
+            }
         }
     }
 
