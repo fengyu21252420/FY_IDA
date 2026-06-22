@@ -17,7 +17,7 @@ The project intentionally does not copy IDA code, icons, database formats, or pr
 
 ## Current Status
 
-Planning phase. See [FY_IDA_DEVELOPMENT_PLAN.md](FY_IDA_DEVELOPMENT_PLAN.md) for the full product and engineering plan.
+`v0.1.0-alpha.2` contains the first runnable Rust workspace and a Chinese GUI shell. It can start `fy_ida.exe`, display the FY Classic layout, and select a file while marking it as not yet analyzed.
 
 ## Recovery Strategy
 
@@ -35,4 +35,3 @@ git tag -a v0.1.0-alpha.0 -m "Initial planning baseline"
 - Feature work should use short-lived branches such as `iter/pe-loader`.
 - Each iteration should update `CHANGELOG.md`.
 - Release tags should use `vMAJOR.MINOR.PATCH-alpha.N` until the tool is stable.
-

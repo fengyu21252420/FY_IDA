@@ -1,0 +1,771 @@
+use std::collections::VecDeque;
+use std::path::PathBuf;
+
+use eframe::egui::{
+    self, Align, CentralPanel, Color32, Context, FontData, FontDefinitions, FontFamily, Frame,
+    Grid, Key, Layout, RichText, ScrollArea, SidePanel, Stroke, TextEdit, TopBottomPanel, Ui,
+    Visuals, Window,
+};
+use fyida_analysis::{file_selected_log_lines, placeholder_disassembly, startup_log_lines};
+use fyida_core::{format_address, FileSelection, ProjectState, APP_NAME};
+use fyida_loader::load_file_metadata;
+use rfd::FileDialog;
+
+const LEFT_TABS: [&str; 7] = ["函数", "名称", "字符串", "导入", "导出", "段", "书签"];
+const CENTER_TABS: [&str; 6] = [
+    "反汇编",
+    "十六进制",
+    "伪代码",
+    "函数图",
+    "调用图",
+    "IR 视图",
+];
+const RIGHT_TABS: [&str; 5] = ["交叉引用", "属性", "局部类型", "结构体", "注释"];
+const BOTTOM_TABS: [&str; 5] = ["输出", "搜索结果", "Python 控制台", "日志", "任务"];
+
+pub fn run(initial_file: Option<PathBuf>) -> eframe::Result<()> {
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default()
+            .with_inner_size([1280.0, 820.0])
+            .with_min_inner_size([960.0, 620.0]),
+        ..Default::default()
+    };
+
+    eframe::run_native(
+        "FY_IDA - 中文逆向分析工作台",
+        options,
+        Box::new(move |creation_context| {
+            Box::new(FyIdaApp::new(creation_context, initial_file.clone()))
+        }),
+    )
+}
+
+struct FyIdaApp {
+    project: ProjectState,
+    left_tab: usize,
+    center_tab: usize,
+    right_tab: usize,
+    bottom_tab: usize,
+    left_filter: String,
+    quick_jump_open: bool,
+    quick_jump_text: String,
+    search_open: bool,
+    search_text: String,
+    logs: Vec<String>,
+    search_results: Vec<String>,
+    recent_files: VecDeque<PathBuf>,
+}
+
+impl FyIdaApp {
+    fn new(creation_context: &eframe::CreationContext<'_>, initial_file: Option<PathBuf>) -> Self {
+        configure_fonts(&creation_context.egui_ctx);
+        configure_style(&creation_context.egui_ctx);
+
+        let mut app = Self {
+            project: ProjectState::default(),
+            left_tab: 0,
+            center_tab: 0,
+            right_tab: 0,
+            bottom_tab: 0,
+            left_filter: String::new(),
+            quick_jump_open: false,
+            quick_jump_text: String::new(),
+            search_open: false,
+            search_text: String::new(),
+            logs: startup_log_lines(),
+            search_results: vec!["尚未执行搜索。".to_owned()],
+            recent_files: VecDeque::new(),
+        };
+
+        if let Some(path) = initial_file {
+            app.select_path(path);
+        }
+
+        app
+    }
+
+    fn open_file_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .set_title("打开文件")
+            .add_filter("可执行文件与二进制", &["exe", "dll", "sys", "bin", "dat"])
+            .add_filter("所有文件", &["*"])
+            .pick_file()
+        {
+            self.select_path(path);
+        }
+    }
+
+    fn select_path(&mut self, path: PathBuf) {
+        match load_file_metadata(&path) {
+            Ok(selection) => self.apply_file_selection(selection),
+            Err(error) => {
+                let message = error.to_string();
+                self.project.set_error(message.clone());
+                self.logs.push(message);
+            }
+        }
+    }
+
+    fn apply_file_selection(&mut self, selection: FileSelection) {
+        self.add_recent_file(selection.path().to_path_buf());
+        self.logs.extend(file_selected_log_lines(&selection));
+        self.project.select_file(selection);
+        self.center_tab = 0;
+        self.bottom_tab = 0;
+    }
+
+    fn add_recent_file(&mut self, path: PathBuf) {
+        self.recent_files.retain(|existing| existing != &path);
+        self.recent_files.push_front(path);
+        while self.recent_files.len() > 8 {
+            self.recent_files.pop_back();
+        }
+    }
+
+    fn handle_shortcuts(&mut self, ctx: &Context) {
+        if ctx.input(|input| input.key_pressed(Key::O) && input.modifiers.ctrl) {
+            self.open_file_dialog();
+        }
+        if ctx.input(|input| input.key_pressed(Key::G)) {
+            self.quick_jump_open = true;
+        }
+        if ctx.input(|input| input.key_pressed(Key::F) && input.modifiers.ctrl) {
+            self.search_open = true;
+        }
+    }
+
+    fn top_menu(&mut self, ctx: &Context) {
+        TopBottomPanel::top("menu_bar")
+            .exact_height(26.0)
+            .frame(panel_frame())
+            .show(ctx, |ui| {
+                egui::menu::bar(ui, |ui| {
+                    ui.menu_button("文件", |ui| {
+                        if ui.button("打开文件...").clicked() {
+                            self.open_file_dialog();
+                            ui.close_menu();
+                        }
+                        if ui.button("打开 Raw Binary...").clicked() {
+                            self.open_file_dialog();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        ui.add_enabled(false, egui::Button::new("打开项目..."));
+                        ui.add_enabled(false, egui::Button::new("保存项目"));
+                        ui.add_enabled(false, egui::Button::new("项目另存为..."));
+                        ui.separator();
+                        ui.menu_button("最近打开", |ui| self.recent_files_menu(ui));
+                        ui.separator();
+                        if ui.button("退出").clicked() {
+                            ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                        }
+                    });
+
+                    ui.menu_button("编辑", |ui| {
+                        disabled_menu_items(
+                            ui,
+                            &[
+                                "撤销",
+                                "重做",
+                                "重命名",
+                                "添加注释",
+                                "添加书签",
+                                "删除书签",
+                                "转为代码",
+                                "转为数据",
+                                "复制地址",
+                                "复制反汇编行",
+                            ],
+                        );
+                    });
+
+                    ui.menu_button("视图", |ui| {
+                        for (index, label) in CENTER_TABS.iter().enumerate() {
+                            if ui.button(*label).clicked() {
+                                self.center_tab = index;
+                                ui.close_menu();
+                            }
+                        }
+                        ui.separator();
+                        ui.add_enabled(false, egui::Button::new("重置布局"));
+                    });
+
+                    ui.menu_button("分析", |ui| {
+                        disabled_menu_items(
+                            ui,
+                            &[
+                                "开始分析",
+                                "重新分析当前函数",
+                                "重新分析全部",
+                                "识别函数",
+                                "提取字符串",
+                                "重建交叉引用",
+                                "识别 switch",
+                                "应用签名库",
+                            ],
+                        );
+                    });
+
+                    ui.menu_button("类型", |ui| {
+                        disabled_menu_items(
+                            ui,
+                            &[
+                                "局部类型",
+                                "新建结构体",
+                                "新建枚举",
+                                "编辑函数原型",
+                                "导入 C Header",
+                                "导出 C Header",
+                                "导入类型库",
+                            ],
+                        );
+                    });
+
+                    ui.menu_button("脚本", |ui| {
+                        disabled_menu_items(
+                            ui,
+                            &[
+                                "Python 控制台",
+                                "运行脚本...",
+                                "插件管理",
+                                "重新加载插件",
+                                "示例脚本",
+                            ],
+                        );
+                    });
+
+                    ui.menu_button("工具", |ui| {
+                        if ui.button("快速跳转").clicked() {
+                            self.quick_jump_open = true;
+                            ui.close_menu();
+                        }
+                        if ui.button("搜索").clicked() {
+                            self.search_open = true;
+                            ui.close_menu();
+                        }
+                        ui.add_enabled(false, egui::Button::new("项目统计"));
+                        ui.add_enabled(false, egui::Button::new("选项"));
+                    });
+
+                    ui.menu_button("帮助", |ui| {
+                        ui.label("FY_IDA v0.1.0-alpha.2");
+                        ui.label("中文 GUI 空壳。");
+                        ui.separator();
+                        disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
+                    });
+                });
+            });
+    }
+
+    fn recent_files_menu(&mut self, ui: &mut Ui) {
+        if self.recent_files.is_empty() {
+            ui.add_enabled(false, egui::Button::new("暂无最近文件"));
+            return;
+        }
+
+        let files: Vec<PathBuf> = self.recent_files.iter().cloned().collect();
+        for path in files {
+            if ui.button(path.display().to_string()).clicked() {
+                self.select_path(path);
+                ui.close_menu();
+            }
+        }
+    }
+
+    fn toolbar(&mut self, ctx: &Context) {
+        TopBottomPanel::top("toolbar")
+            .exact_height(34.0)
+            .frame(panel_frame())
+            .show(ctx, |ui| {
+                ui.horizontal_centered(|ui| {
+                    if toolbar_button(ui, "打开", "打开 PE 文件或 Raw Binary").clicked() {
+                        self.open_file_dialog();
+                    }
+                    toolbar_button(ui, "保存", "保存项目（后续版本实现）");
+                    ui.separator();
+                    toolbar_button(ui, "后退", "返回上一位置");
+                    toolbar_button(ui, "前进", "前进到下一位置");
+                    if toolbar_button(ui, "跳转", "快速跳转 (G)").clicked() {
+                        self.quick_jump_open = true;
+                    }
+                    if toolbar_button(ui, "搜索", "搜索 (Ctrl+F)").clicked() {
+                        self.search_open = true;
+                    }
+                    ui.separator();
+                    toolbar_button(ui, "重命名", "重命名当前符号");
+                    toolbar_button(ui, "注释", "添加注释");
+                    toolbar_button(ui, "交叉引用", "查看交叉引用");
+                    toolbar_button(ui, "重新分析", "重新分析当前目标");
+                    toolbar_button(ui, "函数图", "切换到函数图");
+                    toolbar_button(ui, "伪代码", "切换到伪代码");
+                });
+            });
+    }
+
+    fn left_panel(&mut self, ctx: &Context) {
+        SidePanel::left("left_navigation")
+            .exact_width(260.0)
+            .resizable(false)
+            .frame(panel_frame())
+            .show(ctx, |ui| {
+                panel_title(ui, "左侧导航区");
+                tab_strip(ui, &LEFT_TABS, &mut self.left_tab);
+                ui.add_space(6.0);
+                ui.add(TextEdit::singleline(&mut self.left_filter).hint_text("过滤"));
+                ui.separator();
+                self.left_content(ui);
+            });
+    }
+
+    fn right_panel(&mut self, ctx: &Context) {
+        SidePanel::right("right_information")
+            .exact_width(320.0)
+            .resizable(false)
+            .frame(panel_frame())
+            .show(ctx, |ui| {
+                panel_title(ui, "右侧信息区");
+                tab_strip(ui, &RIGHT_TABS, &mut self.right_tab);
+                ui.separator();
+                self.right_content(ui);
+            });
+    }
+
+    fn bottom_panels(&mut self, ctx: &Context) {
+        TopBottomPanel::bottom("status_bar")
+            .exact_height(26.0)
+            .frame(panel_frame())
+            .show(ctx, |ui| self.status_bar(ui));
+
+        TopBottomPanel::bottom("bottom_panel")
+            .exact_height(180.0)
+            .resizable(false)
+            .frame(panel_frame())
+            .show(ctx, |ui| {
+                panel_title(ui, "底部面板");
+                tab_strip(ui, &BOTTOM_TABS, &mut self.bottom_tab);
+                ui.separator();
+                self.bottom_content(ui);
+            });
+    }
+
+    fn central_panel(&mut self, ctx: &Context) {
+        CentralPanel::default()
+            .frame(panel_frame())
+            .show(ctx, |ui| {
+                panel_title(ui, "中央工作区");
+                tab_strip(ui, &CENTER_TABS, &mut self.center_tab);
+                ui.separator();
+
+                match self.center_tab {
+                    0 => self.disassembly_view(ui),
+                    1 => self.hex_view(ui),
+                    2 => placeholder_center(ui, "伪代码", "反编译器将在后续版本启用。"),
+                    3 => placeholder_center(
+                        ui,
+                        "函数图",
+                        "CFG 图视图将在反汇编与 basic block 识别后启用。",
+                    ),
+                    4 => placeholder_center(ui, "调用图", "调用关系图将在分析引擎完成后启用。"),
+                    _ => placeholder_center(ui, "IR 视图", "中间表示视图将在反编译器阶段启用。"),
+                }
+            });
+    }
+
+    fn left_content(&mut self, ui: &mut Ui) {
+        ScrollArea::vertical().show(ui, |ui| match LEFT_TABS[self.left_tab] {
+            "函数" => self.function_list(ui),
+            "名称" => placeholder_list(ui, &["入口占位", "导入表占位", "字符串表占位"]),
+            "字符串" => placeholder_list(ui, &["尚未扫描字符串", "打开文件后等待分析"]),
+            "导入" => placeholder_list(ui, &["尚未解析导入表"]),
+            "导出" => placeholder_list(ui, &["尚未解析导出表"]),
+            "段" => placeholder_list(ui, &[".text 占位", ".rdata 占位", ".data 占位"]),
+            _ => placeholder_list(ui, &["暂无书签"]),
+        });
+    }
+
+    fn function_list(&mut self, ui: &mut Ui) {
+        let rows = if self.project.selected_file().is_some() {
+            vec![
+                ("140001000", "入口占位", "暂未分析"),
+                ("140001020", "sub_140001020", "待识别"),
+            ]
+        } else {
+            vec![("140001000", "示例入口", "占位")]
+        };
+
+        Grid::new("function_list_grid")
+            .num_columns(3)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("地址");
+                ui.strong("名称");
+                ui.strong("状态");
+                ui.end_row();
+
+                for (address, name, status) in rows {
+                    let address_clicked = ui.selectable_label(false, address).clicked();
+                    let name_clicked = ui.selectable_label(false, name).clicked();
+                    if address_clicked || name_clicked {
+                        self.project.jump_to(0x1400_01000, Some(name.to_owned()));
+                        self.logs.push(format!("跳转到函数：{name}"));
+                    }
+                    ui.label(status);
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn right_content(&self, ui: &mut Ui) {
+        match RIGHT_TABS[self.right_tab] {
+            "交叉引用" => {
+                ui.label("当前地址的交叉引用将在分析完成后显示。");
+                ui.label("状态：暂未分析");
+            }
+            "属性" => {
+                Grid::new("property_grid")
+                    .num_columns(2)
+                    .spacing([12.0, 6.0])
+                    .show(ui, |ui| {
+                        ui.label("文件");
+                        ui.label(
+                            self.project
+                                .selected_file()
+                                .map(FileSelection::display_name)
+                                .unwrap_or("未选择"),
+                        );
+                        ui.end_row();
+
+                        ui.label("大小");
+                        ui.label(
+                            self.project
+                                .selected_file()
+                                .map(FileSelection::formatted_size)
+                                .unwrap_or_else(|| "-".to_owned()),
+                        );
+                        ui.end_row();
+
+                        ui.label("分析状态");
+                        ui.label(self.project.analysis_state().label());
+                        ui.end_row();
+                    });
+            }
+            "局部类型" => placeholder_list(ui, &["暂无局部类型", "后续支持函数原型与结构体"]),
+            "结构体" => placeholder_list(ui, &["暂无结构体定义"]),
+            _ => placeholder_list(ui, &["暂无注释"]),
+        }
+    }
+
+    fn bottom_content(&mut self, ui: &mut Ui) {
+        match BOTTOM_TABS[self.bottom_tab] {
+            "输出" => log_view(ui, &self.logs),
+            "搜索结果" => log_view(ui, &self.search_results),
+            "Python 控制台" => {
+                ui.label("Python 控制台将在脚本系统阶段启用。");
+                ui.add_enabled(
+                    false,
+                    TextEdit::singleline(&mut String::new()).hint_text(">>>"),
+                );
+            }
+            "日志" => log_view(ui, &self.logs),
+            _ => placeholder_list(ui, &["暂无后台任务"]),
+        }
+    }
+
+    fn disassembly_view(&mut self, ui: &mut Ui) {
+        if self.project.selected_file().is_none() {
+            self.empty_state(ui);
+            ui.separator();
+        }
+
+        ScrollArea::both().show(ui, |ui| {
+            Grid::new("disassembly_grid")
+                .num_columns(5)
+                .striped(true)
+                .spacing([18.0, 6.0])
+                .show(ui, |ui| {
+                    ui.strong("地址");
+                    ui.strong("字节");
+                    ui.strong("指令");
+                    ui.strong("操作数");
+                    ui.strong("注释");
+                    ui.end_row();
+
+                    for row in placeholder_disassembly(self.project.selected_file()) {
+                        let address = format!("{:08X}", row.address);
+                        if ui
+                            .selectable_label(false, RichText::new(address).color(address_color()))
+                            .clicked()
+                        {
+                            self.project
+                                .jump_to(row.address, Some("入口占位".to_owned()));
+                        }
+                        ui.label(RichText::new(row.bytes).color(bytes_color()));
+                        ui.label(RichText::new(row.mnemonic).color(mnemonic_color()).strong());
+                        ui.label(row.operands);
+                        ui.label(RichText::new(row.comment).color(comment_color()));
+                        ui.end_row();
+                    }
+                });
+        });
+    }
+
+    fn empty_state(&mut self, ui: &mut Ui) {
+        ui.vertical_centered(|ui| {
+            ui.add_space(18.0);
+            ui.heading("尚未打开文件");
+            ui.label("打开 PE 文件或 Raw Binary 开始分析");
+            ui.add_space(8.0);
+            ui.horizontal(|ui| {
+                if ui.button("打开文件").clicked() {
+                    self.open_file_dialog();
+                }
+                if ui.button("打开 Raw Binary").clicked() {
+                    self.open_file_dialog();
+                }
+                ui.add_enabled(false, egui::Button::new("打开项目"));
+            });
+
+            if !self.recent_files.is_empty() {
+                ui.add_space(12.0);
+                ui.strong("最近文件");
+                let files: Vec<PathBuf> = self.recent_files.iter().cloned().collect();
+                for path in files {
+                    if ui.link(path.display().to_string()).clicked() {
+                        self.select_path(path);
+                    }
+                }
+            }
+            ui.add_space(12.0);
+        });
+    }
+
+    fn hex_view(&self, ui: &mut Ui) {
+        ScrollArea::both().show(ui, |ui| {
+            Grid::new("hex_grid")
+                .num_columns(3)
+                .striped(true)
+                .spacing([18.0, 6.0])
+                .show(ui, |ui| {
+                    ui.strong("文件偏移 / VA");
+                    ui.strong("00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F");
+                    ui.strong("ASCII / UTF-16 预览");
+                    ui.end_row();
+                    ui.label("00001000");
+                    ui.label("4D 5A 90 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??");
+                    ui.label("MZ..");
+                    ui.end_row();
+                    ui.label("00001010");
+                    ui.label("暂未读取文件字节");
+                    ui.label("等待 loader");
+                    ui.end_row();
+                });
+        });
+    }
+
+    fn status_bar(&self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label(format_address(self.project.current_address(), "VA"));
+            ui.separator();
+            ui.label(format_address(self.project.current_rva(), "RVA"));
+            ui.separator();
+            ui.label(format_address(self.project.current_file_offset(), "FO"));
+            ui.separator();
+            ui.label(format!(
+                "当前函数 {}",
+                self.project.current_function().unwrap_or("--------")
+            ));
+            ui.separator();
+            ui.label(format!(
+                "分析状态 {}",
+                self.project.analysis_state().label()
+            ));
+            ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                ui.label(format!("项目状态 {}", self.project.project_status_label()));
+            });
+        });
+    }
+
+    fn dialogs(&mut self, ctx: &Context) {
+        let mut jump_open = self.quick_jump_open;
+        Window::new("快速跳转")
+            .open(&mut jump_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("输入 VA、RVA、文件偏移、函数名或字符串关键词。");
+                ui.add(TextEdit::singleline(&mut self.quick_jump_text).hint_text("140001000"));
+                if ui.button("跳转").clicked() {
+                    self.project
+                        .jump_to(0x1400_01000, Some("入口占位".to_owned()));
+                    self.logs
+                        .push(format!("快速跳转请求：{}", self.quick_jump_text));
+                    self.quick_jump_open = false;
+                }
+            });
+        self.quick_jump_open = jump_open && self.quick_jump_open;
+
+        let mut search_open = self.search_open;
+        Window::new("搜索")
+            .open(&mut search_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("搜索文本、字符串、函数名、导入 API、注释、字节序列或地址。");
+                ui.add(TextEdit::singleline(&mut self.search_text).hint_text("CreateFileW"));
+                if ui.button("搜索").clicked() {
+                    self.search_results = vec![
+                        format!("搜索请求：{}", self.search_text),
+                        "当前版本尚未建立索引，暂无真实结果。".to_owned(),
+                    ];
+                    self.bottom_tab = 1;
+                    self.search_open = false;
+                }
+            });
+        self.search_open = search_open && self.search_open;
+    }
+}
+
+impl eframe::App for FyIdaApp {
+    fn update(&mut self, ctx: &Context, _frame: &mut eframe::Frame) {
+        self.handle_shortcuts(ctx);
+        self.top_menu(ctx);
+        self.toolbar(ctx);
+        self.bottom_panels(ctx);
+        self.left_panel(ctx);
+        self.right_panel(ctx);
+        self.central_panel(ctx);
+        self.dialogs(ctx);
+    }
+}
+
+fn configure_fonts(ctx: &Context) {
+    let mut fonts = FontDefinitions::default();
+
+    for font_path in [
+        r"C:\Windows\Fonts\msyh.ttc",
+        r"C:\Windows\Fonts\simhei.ttf",
+        r"C:\Windows\Fonts\simsun.ttc",
+    ] {
+        if let Ok(bytes) = std::fs::read(font_path) {
+            fonts
+                .font_data
+                .insert("fy_cjk".to_owned(), FontData::from_owned(bytes));
+            fonts
+                .families
+                .entry(FontFamily::Proportional)
+                .or_default()
+                .insert(0, "fy_cjk".to_owned());
+            fonts
+                .families
+                .entry(FontFamily::Monospace)
+                .or_default()
+                .insert(0, "fy_cjk".to_owned());
+            break;
+        }
+    }
+
+    ctx.set_fonts(fonts);
+}
+
+fn configure_style(ctx: &Context) {
+    let mut visuals = Visuals::light();
+    visuals.panel_fill = background_color();
+    visuals.window_fill = panel_color();
+    visuals.extreme_bg_color = panel_color();
+    visuals.widgets.noninteractive.bg_fill = title_color();
+    visuals.widgets.inactive.bg_fill = Color32::from_rgb(245, 246, 248);
+    visuals.widgets.hovered.bg_fill = Color32::from_rgb(221, 235, 255);
+    visuals.widgets.active.bg_fill = Color32::from_rgb(179, 212, 255);
+    visuals.selection.bg_fill = Color32::from_rgb(221, 235, 255);
+    visuals.selection.stroke = Stroke::new(1.0, Color32::from_rgb(0, 90, 156));
+    ctx.set_visuals(visuals);
+}
+
+fn panel_frame() -> Frame {
+    Frame::none()
+        .fill(background_color())
+        .stroke(Stroke::new(1.0, Color32::from_rgb(200, 205, 210)))
+        .inner_margin(egui::Margin::same(6.0))
+}
+
+fn panel_title(ui: &mut Ui, title: &str) {
+    ui.horizontal(|ui| {
+        ui.strong(title);
+        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+            ui.label(RichText::new(APP_NAME).color(comment_color()));
+        });
+    });
+}
+
+fn tab_strip(ui: &mut Ui, labels: &[&str], selected: &mut usize) {
+    ui.horizontal_wrapped(|ui| {
+        for (index, label) in labels.iter().enumerate() {
+            if ui.selectable_label(*selected == index, *label).clicked() {
+                *selected = index;
+            }
+        }
+    });
+}
+
+fn toolbar_button(ui: &mut Ui, label: &str, tooltip: &str) -> egui::Response {
+    ui.add_sized([72.0, 24.0], egui::Button::new(label))
+        .on_hover_text(tooltip)
+}
+
+fn disabled_menu_items(ui: &mut Ui, labels: &[&str]) {
+    for label in labels {
+        ui.add_enabled(false, egui::Button::new(*label));
+    }
+}
+
+fn placeholder_center(ui: &mut Ui, title: &str, body: &str) {
+    ui.vertical_centered(|ui| {
+        ui.add_space(60.0);
+        ui.heading(title);
+        ui.label(body);
+        ui.label("当前版本仅提供布局占位。");
+    });
+}
+
+fn placeholder_list(ui: &mut Ui, rows: &[&str]) {
+    for row in rows {
+        ui.label(*row);
+    }
+}
+
+fn log_view(ui: &mut Ui, logs: &[String]) {
+    ScrollArea::vertical().stick_to_bottom(true).show(ui, |ui| {
+        for line in logs {
+            ui.label(line);
+        }
+    });
+}
+
+fn background_color() -> Color32 {
+    Color32::from_rgb(247, 247, 244)
+}
+
+fn panel_color() -> Color32 {
+    Color32::from_rgb(255, 255, 255)
+}
+
+fn title_color() -> Color32 {
+    Color32::from_rgb(232, 235, 239)
+}
+
+fn address_color() -> Color32 {
+    Color32::from_rgb(94, 107, 120)
+}
+
+fn bytes_color() -> Color32 {
+    Color32::from_rgb(138, 111, 61)
+}
+
+fn mnemonic_color() -> Color32 {
+    Color32::from_rgb(20, 61, 115)
+}
+
+fn comment_color() -> Color32 {
+    Color32::from_rgb(106, 115, 125)
+}

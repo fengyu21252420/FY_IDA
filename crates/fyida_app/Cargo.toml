@@ -1,0 +1,15 @@
+[package]
+name = "fyida_app"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[[bin]]
+name = "fy_ida"
+path = "src/main.rs"
+
+[dependencies]
+clap.workspace = true
+fyida_cli.workspace = true
+fyida_ui.workspace = true

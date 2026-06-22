@@ -1,0 +1,16 @@
+[package]
+name = "fyida_ui"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+publish = false
+
+[dependencies]
+eframe.workspace = true
+rfd.workspace = true
+fyida_analysis.workspace = true
+fyida_core.workspace = true
+fyida_loader.workspace = true
+
+[lib]
+path = "src/lib.rs"

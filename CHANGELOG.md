@@ -4,6 +4,36 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.1.0-alpha.2 - 2026-06-23
+
+### Added
+
+- Added a Rust workspace for the FY_IDA application.
+- Added `fyida_app`, `fyida_core`, `fyida_loader`, `fyida_analysis`, `fyida_ui`, and `fyida_cli` crates.
+- Added the first runnable `fy_ida.exe` GUI shell with Chinese menus, toolbar, left navigation, central workspace, right information panel, bottom panel, and status bar.
+- Added file selection through the GUI and command-line preselection, showing the selected file as not yet analyzed.
+- Added placeholder disassembly, hex, pseudocode, graph, xref, output, search, and Python console views.
+- Added basic CLI help and headless placeholder output.
+
+### Changed
+
+- Updated the repository status from planning-only to the first runnable GUI checkpoint.
+
+### Fixed
+
+- Nothing fixed yet.
+
+### Known Issues
+
+- PE, Raw Binary, x64 disassembly, xref, string, import, and export analysis are still placeholders.
+- File opening records metadata only and does not parse binary contents yet.
+- Project save/load and real docking customization are not implemented yet.
+
+### Recovery
+
+- Source tag: `v0.1.0-alpha.2`.
+- Roll back with: `git checkout v0.1.0-alpha.2`.
+
 ## v0.1.0-alpha.1 - 2026-06-23
 
 ### Added
