@@ -17,7 +17,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.17.0-alpha.1 已提供伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.18.0-alpha.1 已提供伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -154,6 +154,8 @@ pub enum ExportKind {
     Exports,
     Xrefs,
     RuntimeSignatures,
+    Pseudocode,
+    Ir,
     Types,
 }
 
@@ -269,6 +271,7 @@ struct PseudocodeRecord {
     function_start: u64,
     name: String,
     lines: Vec<String>,
+    line_addresses: Vec<Option<u64>>,
     ir: Vec<IrRecord>,
 }
 
@@ -907,6 +910,7 @@ fn analysis_report(analysis: &StaticAnalysis) -> AnalysisReport {
                     .iter()
                     .map(|line| line.text.clone())
                     .collect(),
+                line_addresses: function.lines.iter().map(|line| line.address).collect(),
                 ir: function
                     .ir
                     .iter()
@@ -986,7 +990,7 @@ fn type_library_report(types: &[fyida_core::ProjectType]) -> TypeLibraryReport {
 
 fn emit_single_report(cli: &Cli, report: &HeadlessReport) -> Result<(), String> {
     let encoded = match cli.export_format {
-        ExportFormat::Text => text_report(report),
+        ExportFormat::Text => text_report(report, cli.export),
         ExportFormat::Json => serde_json::to_string_pretty(report)
             .map_err(|error| format!("JSON 编码失败：{error}"))?,
         ExportFormat::Csv => csv_report(report, cli.export),
@@ -1026,7 +1030,25 @@ fn write_errors(cli: &Cli, errors: &[BatchError]) -> Result<(), String> {
     std::fs::write(path, encoded).map_err(|error| format!("无法写入 {}：{error}", path.display()))
 }
 
-fn text_report(report: &HeadlessReport) -> String {
+fn text_report(report: &HeadlessReport, kind: ExportKind) -> String {
+    match kind {
+        ExportKind::All => text_full_report(report),
+        ExportKind::Summary => text_summary_report(report),
+        ExportKind::Functions => text_functions(&report.analysis.functions),
+        ExportKind::Strings => text_strings(&report.analysis.strings),
+        ExportKind::Imports => text_imports(&report.analysis.imports),
+        ExportKind::Exports => text_exports(&report.analysis.exports),
+        ExportKind::Xrefs => text_xrefs(&report.analysis.xrefs),
+        ExportKind::RuntimeSignatures => {
+            text_runtime_signatures(&report.analysis.runtime_signatures)
+        }
+        ExportKind::Pseudocode => text_pseudocode(&report.analysis.pseudocode_functions),
+        ExportKind::Ir => text_ir(&report.analysis.pseudocode_functions),
+        ExportKind::Types => text_types(&report.type_library.types),
+    }
+}
+
+fn text_full_report(report: &HeadlessReport) -> String {
     let mut text = String::new();
     let _ = writeln!(
         text,
@@ -1106,6 +1128,165 @@ fn text_report(report: &HeadlessReport) -> String {
     text
 }
 
+fn text_summary_report(report: &HeadlessReport) -> String {
+    let mut text = String::new();
+    let _ = writeln!(text, "Path: {}", report.input.path);
+    let _ = writeln!(text, "Kind: {}", report.input.kind);
+    let _ = writeln!(text, "Functions: {}", report.analysis.functions.len());
+    let _ = writeln!(text, "Strings: {}", report.analysis.strings.len());
+    let _ = writeln!(text, "Imports: {}", report.analysis.imports.len());
+    let _ = writeln!(text, "Exports: {}", report.analysis.exports.len());
+    let _ = writeln!(text, "Xrefs: {}", report.analysis.xrefs.len());
+    let _ = writeln!(
+        text,
+        "Pseudocode: {}",
+        report.analysis.pseudocode_functions.len()
+    );
+    let _ = writeln!(
+        text,
+        "RuntimeSignatures: {}",
+        report.analysis.runtime_signatures.len()
+    );
+    let _ = writeln!(text, "TypeLibrary: {}", report.type_library.count);
+    text
+}
+
+fn text_functions(functions: &[FunctionRecord]) -> String {
+    let mut text = String::from("Functions\n");
+    for function in functions {
+        let _ = writeln!(
+            text,
+            "{:016X}\t{}\tsize 0x{:X}\tinsns {}\tcalls {}",
+            function.start_va,
+            function.name,
+            function.size,
+            function.instruction_count,
+            function.call_count
+        );
+    }
+    text
+}
+
+fn text_strings(strings: &[StringRecord]) -> String {
+    let mut text = String::from("Strings\n");
+    for string in strings {
+        let _ = writeln!(
+            text,
+            "{:016X}\t{:08X}\t{}\t{}",
+            string.address, string.file_offset, string.encoding, string.value
+        );
+    }
+    text
+}
+
+fn text_imports(imports: &[ImportRecord]) -> String {
+    let mut text = String::from("Imports\n");
+    for import in imports {
+        let _ = writeln!(
+            text,
+            "{:016X}\t{}\t{}",
+            import.thunk_va, import.dll, import.display_name
+        );
+    }
+    text
+}
+
+fn text_exports(exports: &[ExportRecord]) -> String {
+    let mut text = String::from("Exports\n");
+    for export in exports {
+        let _ = writeln!(
+            text,
+            "{:016X}\t{:08X}\t{}\t{}",
+            export.va, export.rva, export.ordinal, export.name
+        );
+    }
+    text
+}
+
+fn text_xrefs(xrefs: &[XrefRecord]) -> String {
+    let mut text = String::from("Xrefs\n");
+    for xref in xrefs {
+        let _ = writeln!(
+            text,
+            "{:016X}\t{:016X}\t{}\t{}",
+            xref.from_va, xref.to_va, xref.kind, xref.label
+        );
+    }
+    text
+}
+
+fn text_runtime_signatures(signatures: &[RuntimeSignatureRecord]) -> String {
+    let mut text = String::from("RuntimeSignatures\n");
+    for signature in signatures {
+        let _ = writeln!(
+            text,
+            "{:016X}\t{}\t{}\t{}\t{}\tconfidence {}\t{}",
+            signature.address,
+            signature.name,
+            signature.kind,
+            signature.target,
+            signature.library,
+            signature.confidence,
+            signature.evidence
+        );
+    }
+    text
+}
+
+fn text_pseudocode(functions: &[PseudocodeRecord]) -> String {
+    let mut text = String::from("Pseudocode\n");
+    for function in functions {
+        let _ = writeln!(text, "\n{:016X} {}", function.function_start, function.name);
+        for (index, line) in function.lines.iter().enumerate() {
+            let address = function
+                .line_addresses
+                .get(index)
+                .copied()
+                .flatten()
+                .map(format_va)
+                .unwrap_or_else(|| "-".to_owned());
+            let _ = writeln!(text, "  {:>4} {}\t{}", index, address, line);
+        }
+    }
+    text
+}
+
+fn text_ir(functions: &[PseudocodeRecord]) -> String {
+    let mut text = String::from("IR\n");
+    for function in functions {
+        let _ = writeln!(text, "\n{:016X} {}", function.function_start, function.name);
+        for instruction in &function.ir {
+            let args = instruction.args.join(", ");
+            if instruction.comment.is_empty() {
+                let _ = writeln!(
+                    text,
+                    "  {:016X}\t{}\t{}",
+                    instruction.address, instruction.op, args
+                );
+            } else {
+                let _ = writeln!(
+                    text,
+                    "  {:016X}\t{}\t{}\t; {}",
+                    instruction.address, instruction.op, args, instruction.comment
+                );
+            }
+        }
+    }
+    text
+}
+
+fn text_types(types: &[TypeRecord]) -> String {
+    let mut text = String::from("Types\n");
+    for type_item in types {
+        let _ = writeln!(
+            text,
+            "{}\t{}\t{}\t{}",
+            type_item.kind, type_item.name, type_item.source, type_item.signature
+        );
+    }
+    text
+}
+
 fn text_batch_report(report: &BatchReport) -> String {
     let mut text = String::new();
     let ok_count = report
@@ -1147,6 +1328,8 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::RuntimeSignatures => {
             csv_runtime_signatures(&report.analysis.runtime_signatures)
         }
+        ExportKind::Pseudocode => csv_pseudocode(&report.analysis.pseudocode_functions),
+        ExportKind::Ir => csv_ir(&report.analysis.pseudocode_functions),
         ExportKind::Types => csv_types(&report.type_library.types),
         ExportKind::All => {
             let mut csv = String::new();
@@ -1180,6 +1363,14 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
             push_csv_row(
                 &mut csv,
                 &["summary", "xrefs", &report.analysis.xrefs.len().to_string()],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "pseudocode_functions",
+                    &report.analysis.pseudocode_functions.len().to_string(),
+                ],
             );
             push_csv_row(
                 &mut csv,
@@ -1221,6 +1412,13 @@ fn csv_summary(report: &HeadlessReport) -> String {
     push_csv_row(
         &mut csv,
         &["xrefs", &report.analysis.xrefs.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "pseudocode_functions",
+            &report.analysis.pseudocode_functions.len().to_string(),
+        ],
     );
     push_csv_row(
         &mut csv,
@@ -1344,6 +1542,52 @@ fn csv_runtime_signatures(signatures: &[RuntimeSignatureRecord]) -> String {
     csv
 }
 
+fn csv_pseudocode(functions: &[PseudocodeRecord]) -> String {
+    let mut csv = String::from("function_start,function_name,line_index,address,text\n");
+    for function in functions {
+        for (index, line) in function.lines.iter().enumerate() {
+            let address = function
+                .line_addresses
+                .get(index)
+                .copied()
+                .flatten()
+                .map(format_va)
+                .unwrap_or_default();
+            push_csv_row(
+                &mut csv,
+                &[
+                    &format!("{:016X}", function.function_start),
+                    &function.name,
+                    &index.to_string(),
+                    &address,
+                    line,
+                ],
+            );
+        }
+    }
+    csv
+}
+
+fn csv_ir(functions: &[PseudocodeRecord]) -> String {
+    let mut csv = String::from("function_start,function_name,address,op,args,comment\n");
+    for function in functions {
+        for instruction in &function.ir {
+            push_csv_row(
+                &mut csv,
+                &[
+                    &format!("{:016X}", function.function_start),
+                    &function.name,
+                    &format!("{:016X}", instruction.address),
+                    &instruction.op,
+                    &instruction.args.join(", "),
+                    &instruction.comment,
+                ],
+            );
+        }
+    }
+    csv
+}
+
 fn csv_types(types: &[TypeRecord]) -> String {
     let mut csv = String::from("name,kind,source,signature\n");
     for type_item in types {
@@ -1401,6 +1645,10 @@ fn csv_escape(value: &str) -> String {
     } else {
         value.to_owned()
     }
+}
+
+fn format_va(address: u64) -> String {
+    format!("{address:016X}")
 }
 
 fn collect_batch_files(root: &Path, recursive: bool) -> Result<Vec<PathBuf>, String> {
@@ -1547,5 +1795,74 @@ mod tests {
         let cli = Cli::try_parse_from(["fy_ida", "--headless", "inspect", "sample.exe"]).unwrap();
 
         assert!(cli.headless_input_file().is_err());
+    }
+
+    #[test]
+    fn parses_pseudocode_and_ir_export_kinds() {
+        let pseudocode = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--export",
+            "pseudocode",
+            "sample.exe",
+        ])
+        .unwrap();
+        let ir =
+            Cli::try_parse_from(["fy_ida", "--headless", "--export", "ir", "sample.exe"]).unwrap();
+
+        assert_eq!(pseudocode.export, ExportKind::Pseudocode);
+        assert_eq!(ir.export, ExportKind::Ir);
+    }
+
+    #[test]
+    fn csv_pseudocode_export_includes_function_line_and_address() {
+        let functions = vec![sample_pseudocode_record()];
+
+        let csv = csv_pseudocode(&functions);
+
+        assert!(csv.starts_with("function_start,function_name,line_index,address,text\n"));
+        assert!(csv.contains("0000000140001000,sub_test,0,,uint64_t sub_test(void) {"));
+        assert!(csv.contains("0000000140001000,sub_test,1,0000000140001004,return rax;"));
+    }
+
+    #[test]
+    fn csv_ir_export_includes_operation_arguments_and_comments() {
+        let functions = vec![sample_pseudocode_record()];
+
+        let csv = csv_ir(&functions);
+
+        assert!(csv.starts_with("function_start,function_name,address,op,args,comment\n"));
+        assert!(csv.contains(
+            "0000000140001000,sub_test,0000000140001004,ret,rax,\"returns, quoted \"\"value\"\"\""
+        ));
+    }
+
+    #[test]
+    fn text_ir_export_prints_function_blocks() {
+        let functions = vec![sample_pseudocode_record()];
+
+        let text = text_ir(&functions);
+
+        assert!(text.contains("0000000140001000 sub_test"));
+        assert!(text.contains("0000000140001004\tret\trax\t; returns, quoted \"value\""));
+    }
+
+    fn sample_pseudocode_record() -> PseudocodeRecord {
+        PseudocodeRecord {
+            function_start: 0x0000_0001_4000_1000,
+            name: "sub_test".to_owned(),
+            lines: vec![
+                "uint64_t sub_test(void) {".to_owned(),
+                "return rax;".to_owned(),
+                "}".to_owned(),
+            ],
+            line_addresses: vec![None, Some(0x0000_0001_4000_1004), None],
+            ir: vec![IrRecord {
+                address: 0x0000_0001_4000_1004,
+                op: "ret".to_owned(),
+                args: vec!["rax".to_owned()],
+                comment: "returns, quoted \"value\"".to_owned(),
+            }],
+        }
     }
 }

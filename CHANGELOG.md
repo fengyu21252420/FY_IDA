@@ -4,6 +4,33 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.18.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added `--export pseudocode` and `--export ir` for headless text and CSV output.
+- Added pseudocode line-address preservation in the headless report model through `line_addresses`.
+- Added selected text output for summary, functions, strings, imports, exports, xrefs, runtime signatures, pseudocode, IR, and types.
+- Added CSV exports for generated pseudo-C lines and generated IR instructions.
+- Added unit coverage for pseudocode/IR export-kind parsing, CSV output, and IR text output.
+
+### Changed
+
+- Updated the workspace version to `0.18.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the pseudocode/IR headless-export checkpoint.
+- Summary text/CSV output now includes the generated pseudocode function count.
+
+### Known Issues
+
+- Pseudocode and IR are still first-pass generated views; SSA, stack-variable modeling, and richer type propagation remain future work.
+- Pseudocode CSV address fields are intentionally blank for generated header/brace lines that do not correspond to one source instruction address.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.18.0-alpha.1`.
+- Roll back with: `git checkout v0.18.0-alpha.1`.
+
 ## v0.17.0-alpha.1 - 2026-06-23
 
 ### Added
