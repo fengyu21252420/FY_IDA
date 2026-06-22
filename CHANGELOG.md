@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.20.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added structured JSON `automation` reports for successful headless Python scripts and plugins.
+- Added `--export automation` for text and CSV automation run output.
+- Added automation run metadata for label, kind, plugin ID/name/version, script path, status, exit code, elapsed time, stdout, stderr, and output truncation flags.
+- Added `FYIDA_AUTOMATION_LABEL`, `FYIDA_AUTOMATION_KIND`, `FYIDA_PLUGIN_ID`, `FYIDA_PLUGIN_NAME`, and `FYIDA_PLUGIN_VERSION` environment variables for Python automation.
+- Added batch `automation_runs` counts for successful file reports.
+- Added CLI unit coverage for automation export parsing, structured JSON/text/CSV automation output, and missing selected-plugin IDs.
+
+### Changed
+
+- Updated the workspace version to `0.20.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the structured-Python-automation checkpoint.
+- Selected plugin IDs now fail clearly when no plugin directory is provided or no scanned manifest matches instead of silently running no plugin.
+
+### Known Issues
+
+- Python automation still uses the local `python` executable instead of an embedded interpreter.
+- Automation stdout/stderr are bounded in reports to avoid oversized JSON/CSV output.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.20.0-alpha.1`.
+- Roll back with: `git checkout v0.20.0-alpha.1`.
+
 ## v0.19.0-alpha.1 - 2026-06-23
 
 ### Added

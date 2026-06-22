@@ -17,7 +17,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.19.0-alpha.1 已提供 headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.20.0-alpha.1 已提供结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -164,6 +164,7 @@ pub enum ExportKind {
     Pseudocode,
     Ir,
     Search,
+    Automation,
     Types,
 }
 
@@ -174,8 +175,32 @@ struct HeadlessReport {
     analysis: AnalysisReport,
     type_library: TypeLibraryReport,
     search: Option<SearchReport>,
+    automation: AutomationReport,
     messages: Vec<String>,
     elapsed_ms: u128,
+}
+
+#[derive(Debug, Default, Serialize)]
+struct AutomationReport {
+    run_count: usize,
+    runs: Vec<AutomationRunRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct AutomationRunRecord {
+    label: String,
+    kind: String,
+    id: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
+    script: String,
+    status: String,
+    exit_code: Option<i32>,
+    elapsed_ms: u128,
+    stdout: String,
+    stderr: String,
+    stdout_truncated: bool,
+    stderr_truncated: bool,
 }
 
 #[derive(Debug, Serialize)]
@@ -381,6 +406,7 @@ struct BatchFileReport {
     exports: usize,
     xrefs: usize,
     search_results: usize,
+    automation_runs: usize,
     pdb_symbols: usize,
     pdb_types: usize,
     error: Option<String>,
@@ -406,6 +432,16 @@ struct PluginManifest {
     description: Option<String>,
     script: PathBuf,
     menu: Option<String>,
+}
+
+#[derive(Debug)]
+struct AutomationTarget {
+    label: String,
+    kind: String,
+    id: Option<String>,
+    name: Option<String>,
+    version: Option<String>,
+    script: PathBuf,
 }
 
 pub fn run_headless(cli: &Cli) -> i32 {
@@ -525,6 +561,7 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                         exports: 0,
                         xrefs: 0,
                         search_results: 0,
+                        automation_runs: 0,
                         pdb_symbols: 0,
                         pdb_types: 0,
                         error: Some(message),
@@ -554,6 +591,7 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                     exports: 0,
                     xrefs: 0,
                     search_results: 0,
+                    automation_runs: 0,
                     pdb_symbols: 0,
                     pdb_types: 0,
                     error: Some(message),
@@ -600,6 +638,7 @@ fn batch_success(path: String, elapsed_ms: u128, report: HeadlessReport) -> Batc
             .as_ref()
             .map(|search| search.result_count)
             .unwrap_or(0),
+        automation_runs: report.automation.run_count,
         pdb_symbols: report.analysis.pdb_symbols.len(),
         pdb_types: report.analysis.pdb_types.len(),
         error: None,
@@ -632,6 +671,7 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
             analysis,
             type_library,
             search,
+            automation: AutomationReport::default(),
             messages,
             elapsed_ms: started.elapsed().as_millis(),
         };
@@ -679,6 +719,7 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
         analysis,
         type_library,
         search,
+        automation: AutomationReport::default(),
         messages,
         elapsed_ms: started.elapsed().as_millis(),
     };
@@ -703,10 +744,19 @@ fn apply_signature_libraries(cli: &Cli, analysis: &mut StaticAnalysis, messages:
     }
 }
 
+const MAX_AUTOMATION_OUTPUT_CHARS: usize = 16 * 1024;
+
 fn run_python_automation(cli: &Cli, report: &mut HeadlessReport) -> Result<(), String> {
-    let mut scripts = Vec::new();
+    let mut targets = Vec::new();
     if let Some(script) = &cli.python_script {
-        scripts.push(("script".to_owned(), script.clone()));
+        targets.push(AutomationTarget {
+            label: "script".to_owned(),
+            kind: "script".to_owned(),
+            id: None,
+            name: None,
+            version: None,
+            script: script.clone(),
+        });
     }
     for plugin in selected_plugins(cli)? {
         let label = format!(
@@ -724,30 +774,51 @@ fn run_python_automation(cli: &Cli, report: &mut HeadlessReport) -> Result<(), S
                 .messages
                 .push(format!("插件菜单入口 {} -> {}", plugin.name, menu));
         }
-        scripts.push((label, plugin.script));
+        targets.push(AutomationTarget {
+            label,
+            kind: "plugin".to_owned(),
+            id: Some(plugin.id),
+            name: Some(plugin.name),
+            version: plugin.version,
+            script: plugin.script,
+        });
     }
 
-    for (label, script) in scripts {
-        let output = run_python_script(&script, report)
-            .map_err(|message| format!("Python {label} 运行失败：{message}"))?;
+    for target in targets {
+        let run = run_python_script(&target, report)
+            .map_err(|message| format!("Python {} 运行失败：{message}", target.label))?;
         report
             .messages
-            .push(format!("Python {label} stdout:\n{}", output.0));
-        if !output.1.trim().is_empty() {
+            .push(format!("Python {} stdout:\n{}", run.label, run.stdout));
+        if !run.stderr.trim().is_empty() {
             report
                 .messages
-                .push(format!("Python {label} stderr:\n{}", output.1));
+                .push(format!("Python {} stderr:\n{}", run.label, run.stderr));
         }
+        report.automation.runs.push(run);
+        report.automation.run_count = report.automation.runs.len();
     }
     Ok(())
 }
 
 fn selected_plugins(cli: &Cli) -> Result<Vec<PluginManifest>, String> {
     let Some(directory) = &cli.plugins_dir else {
+        if !cli.plugins.is_empty() {
+            return Err("使用 --plugin 时必须同时提供 --plugins-dir。".to_owned());
+        }
         return Ok(Vec::new());
     };
     let mut manifests = scan_plugin_manifests(directory)?;
     if !cli.plugins.is_empty() {
+        let missing = cli
+            .plugins
+            .iter()
+            .filter(|id| !manifests.iter().any(|manifest| &manifest.id == *id))
+            .cloned()
+            .collect::<Vec<_>>();
+        if !missing.is_empty() {
+            return Err(format!("未找到指定插件 ID：{}", missing.join(", ")));
+        }
         manifests.retain(|manifest| cli.plugins.iter().any(|id| id == &manifest.id));
     }
     Ok(manifests)
@@ -777,7 +848,10 @@ fn scan_plugin_manifests(directory: &Path) -> Result<Vec<PluginManifest>, String
     Ok(manifests)
 }
 
-fn run_python_script(script: &Path, report: &HeadlessReport) -> Result<(String, String), String> {
+fn run_python_script(
+    target: &AutomationTarget,
+    report: &HeadlessReport,
+) -> Result<AutomationRunRecord, String> {
     let report_path = std::env::temp_dir().join(format!(
         "fyida_python_report_{}_{}.json",
         std::process::id(),
@@ -788,17 +862,48 @@ fn run_python_script(script: &Path, report: &HeadlessReport) -> Result<(String, 
     std::fs::write(&report_path, report_json)
         .map_err(|error| format!("无法写入脚本报告 {}：{error}", report_path.display()))?;
 
-    let output = Command::new("python")
-        .arg(script)
+    let started = Instant::now();
+    let mut command = Command::new("python");
+    command
+        .arg(&target.script)
         .env("FYIDA_REPORT_JSON", &report_path)
         .env("FYIDA_INPUT_PATH", &report.input.path)
         .env("FYIDA_INPUT_KIND", &report.input.kind)
+        .env("FYIDA_AUTOMATION_LABEL", &target.label)
+        .env("FYIDA_AUTOMATION_KIND", &target.kind);
+    if let Some(id) = &target.id {
+        command.env("FYIDA_PLUGIN_ID", id);
+    }
+    if let Some(name) = &target.name {
+        command.env("FYIDA_PLUGIN_NAME", name);
+    }
+    if let Some(version) = &target.version {
+        command.env("FYIDA_PLUGIN_VERSION", version);
+    }
+    let output = command
         .output()
         .map_err(|error| format!("无法启动 python：{error}"))?;
-    let stdout = String::from_utf8_lossy(&output.stdout).to_string();
-    let stderr = String::from_utf8_lossy(&output.stderr).to_string();
+    let elapsed_ms = started.elapsed().as_millis();
+    let (stdout, stdout_truncated) =
+        bounded_automation_output(&String::from_utf8_lossy(&output.stdout));
+    let (stderr, stderr_truncated) =
+        bounded_automation_output(&String::from_utf8_lossy(&output.stderr));
     if output.status.success() {
-        Ok((stdout, stderr))
+        Ok(AutomationRunRecord {
+            label: target.label.clone(),
+            kind: target.kind.clone(),
+            id: target.id.clone(),
+            name: target.name.clone(),
+            version: target.version.clone(),
+            script: target.script.display().to_string(),
+            status: "ok".to_owned(),
+            exit_code: output.status.code(),
+            elapsed_ms,
+            stdout,
+            stderr,
+            stdout_truncated,
+            stderr_truncated,
+        })
     } else {
         Err(format!(
             "退出码 {:?}\nstdout:\n{}\nstderr:\n{}",
@@ -807,6 +912,19 @@ fn run_python_script(script: &Path, report: &HeadlessReport) -> Result<(String, 
             stderr
         ))
     }
+}
+
+fn bounded_automation_output(output: &str) -> (String, bool) {
+    let char_count = output.chars().count();
+    if char_count <= MAX_AUTOMATION_OUTPUT_CHARS {
+        return (output.to_owned(), false);
+    }
+    let mut bounded = output
+        .chars()
+        .take(MAX_AUTOMATION_OUTPUT_CHARS)
+        .collect::<String>();
+    bounded.push_str("\n...[truncated by FY_IDA]");
+    (bounded, true)
 }
 
 fn safe_temp_name(path: &str) -> String {
@@ -1486,6 +1604,7 @@ fn text_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Pseudocode => text_pseudocode(&report.analysis.pseudocode_functions),
         ExportKind::Ir => text_ir(&report.analysis.pseudocode_functions),
         ExportKind::Search => text_search(report.search.as_ref()),
+        ExportKind::Automation => text_automation(&report.automation),
         ExportKind::Types => text_types(&report.type_library.types),
     }
 }
@@ -1551,6 +1670,14 @@ fn text_full_report(report: &HeadlessReport) -> String {
             search.result_count, search.query
         );
     }
+    let _ = writeln!(text, "  Automation: {} runs", report.automation.run_count);
+    for run in report.automation.runs.iter().take(16) {
+        let _ = writeln!(
+            text,
+            "    {} [{}] {} code {:?} {} ms",
+            run.label, run.kind, run.status, run.exit_code, run.elapsed_ms
+        );
+    }
     for signature in report.analysis.runtime_signatures.iter().take(32) {
         let _ = writeln!(
             text,
@@ -1599,6 +1726,7 @@ fn text_summary_report(report: &HeadlessReport) -> String {
     if let Some(search) = &report.search {
         let _ = writeln!(text, "SearchResults: {}", search.result_count);
     }
+    let _ = writeln!(text, "AutomationRuns: {}", report.automation.run_count);
     let _ = writeln!(text, "TypeLibrary: {}", report.type_library.count);
     text
 }
@@ -1768,6 +1896,29 @@ fn text_search(search: Option<&SearchReport>) -> String {
     text
 }
 
+fn text_automation(automation: &AutomationReport) -> String {
+    let mut text = String::from("Automation\n");
+    let _ = writeln!(text, "Runs: {}", automation.run_count);
+    if automation.runs.is_empty() {
+        let _ = writeln!(text, "No automation ran.");
+        return text;
+    }
+    for run in &automation.runs {
+        let _ = writeln!(
+            text,
+            "{}\t{}\t{}\tcode {:?}\t{} ms\t{}",
+            run.kind, run.label, run.status, run.exit_code, run.elapsed_ms, run.script
+        );
+        if !run.stdout.trim().is_empty() {
+            let _ = writeln!(text, "stdout:\n{}", run.stdout);
+        }
+        if !run.stderr.trim().is_empty() {
+            let _ = writeln!(text, "stderr:\n{}", run.stderr);
+        }
+    }
+    text
+}
+
 fn text_batch_report(report: &BatchReport) -> String {
     let mut text = String::new();
     let ok_count = report
@@ -1785,7 +1936,7 @@ fn text_batch_report(report: &BatchReport) -> String {
     for entry in &report.files {
         let _ = writeln!(
             text,
-            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\tsearch {}\t{}",
+            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\tsearch {}\tautomation {}\t{}",
             entry.status,
             entry.path,
             entry.functions,
@@ -1793,6 +1944,7 @@ fn text_batch_report(report: &BatchReport) -> String {
             entry.imports,
             entry.xrefs,
             entry.search_results,
+            entry.automation_runs,
             entry.error.as_deref().unwrap_or("")
         );
     }
@@ -1813,6 +1965,7 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Pseudocode => csv_pseudocode(&report.analysis.pseudocode_functions),
         ExportKind::Ir => csv_ir(&report.analysis.pseudocode_functions),
         ExportKind::Search => csv_search(report.search.as_ref()),
+        ExportKind::Automation => csv_automation(&report.automation),
         ExportKind::Types => csv_types(&report.type_library.types),
         ExportKind::All => {
             let mut csv = String::new();
@@ -1877,6 +2030,14 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
                 &mut csv,
                 &[
                     "summary",
+                    "automation_runs",
+                    &report.automation.run_count.to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
                     "type_library",
                     &report.type_library.count.to_string(),
                 ],
@@ -1926,6 +2087,10 @@ fn csv_summary(report: &HeadlessReport) -> String {
             &["search_results", &search.result_count.to_string()],
         );
     }
+    push_csv_row(
+        &mut csv,
+        &["automation_runs", &report.automation.run_count.to_string()],
+    );
     push_csv_row(
         &mut csv,
         &["type_library", &report.type_library.count.to_string()],
@@ -2124,9 +2289,38 @@ fn csv_search(search: Option<&SearchReport>) -> String {
     csv
 }
 
+fn csv_automation(automation: &AutomationReport) -> String {
+    let mut csv = String::from(
+        "label,kind,id,name,version,status,exit_code,elapsed_ms,script,stdout,stderr,stdout_truncated,stderr_truncated\n",
+    );
+    for run in &automation.runs {
+        push_csv_row(
+            &mut csv,
+            &[
+                &run.label,
+                &run.kind,
+                run.id.as_deref().unwrap_or(""),
+                run.name.as_deref().unwrap_or(""),
+                run.version.as_deref().unwrap_or(""),
+                &run.status,
+                &run.exit_code
+                    .map(|code| code.to_string())
+                    .unwrap_or_default(),
+                &run.elapsed_ms.to_string(),
+                &run.script,
+                &run.stdout,
+                &run.stderr,
+                &run.stdout_truncated.to_string(),
+                &run.stderr_truncated.to_string(),
+            ],
+        );
+    }
+    csv
+}
+
 fn csv_batch_report(report: &BatchReport) -> String {
     let mut csv = String::from(
-        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,pdb_symbols,pdb_types,error\n",
+        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,pdb_symbols,pdb_types,error\n",
     );
     for entry in &report.files {
         push_csv_row(
@@ -2141,6 +2335,7 @@ fn csv_batch_report(report: &BatchReport) -> String {
                 &entry.exports.to_string(),
                 &entry.xrefs.to_string(),
                 &entry.search_results.to_string(),
+                &entry.automation_runs.to_string(),
                 &entry.pdb_symbols.to_string(),
                 &entry.pdb_types.to_string(),
                 entry.error.as_deref().unwrap_or(""),
@@ -2401,6 +2596,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_automation_export_kind() {
+        let cli = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--export",
+            "automation",
+            "sample.exe",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.export, ExportKind::Automation);
+    }
+
+    #[test]
     fn search_report_finds_pseudocode_ir_runtime_and_types() {
         let input = sample_input_report();
         let analysis = sample_analysis_report();
@@ -2464,6 +2673,70 @@ mod tests {
     }
 
     #[test]
+    fn automation_text_csv_and_json_include_run_records() {
+        let report = sample_headless_report_with_automation();
+
+        let text = text_summary_report(&report);
+        let csv = csv_automation(&report.automation);
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(text.contains("AutomationRuns: 1"));
+        assert!(csv.starts_with("label,kind,id,name,version,status,exit_code,elapsed_ms,script,stdout,stderr,stdout_truncated,stderr_truncated\n"));
+        assert!(csv.contains(
+            "plugin:import-summary:0.1.0,plugin,import-summary,Import Summary,0.1.0,ok,0,7,examples/plugins/import-summary/import_summary.py,\"imports, 3\",,false,false"
+        ));
+        assert!(json.contains("\"automation\""));
+        assert!(json.contains("\"stdout\":\"imports, 3\""));
+    }
+
+    #[test]
+    fn selected_plugins_reports_missing_ids() {
+        let directory = unique_test_dir("missing-plugin");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(
+            directory.join("plugin.json"),
+            r#"{
+  "id": "present",
+  "name": "Present",
+  "version": "0.1.0",
+  "script": "present.py"
+}"#,
+        )
+        .unwrap();
+        let cli = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--plugins-dir",
+            directory.to_str().unwrap(),
+            "--plugin",
+            "absent",
+            "sample.exe",
+        ])
+        .unwrap();
+
+        let error = selected_plugins(&cli).unwrap_err();
+
+        assert!(error.contains("absent"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn selected_plugin_requires_plugins_dir() {
+        let cli = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--plugin",
+            "import-summary",
+            "sample.exe",
+        ])
+        .unwrap();
+
+        let error = selected_plugins(&cli).unwrap_err();
+
+        assert!(error.contains("--plugins-dir"));
+    }
+
+    #[test]
     fn csv_pseudocode_export_includes_function_line_and_address() {
         let functions = vec![sample_pseudocode_record()];
 
@@ -2512,6 +2785,36 @@ mod tests {
                 args: vec!["rax".to_owned()],
                 comment: "returns, quoted \"value\"".to_owned(),
             }],
+        }
+    }
+
+    fn sample_headless_report_with_automation() -> HeadlessReport {
+        HeadlessReport {
+            version: "0.20.0-alpha.1".to_owned(),
+            input: sample_input_report(),
+            analysis: sample_analysis_report(),
+            type_library: sample_type_library_report(),
+            search: None,
+            automation: AutomationReport {
+                run_count: 1,
+                runs: vec![AutomationRunRecord {
+                    label: "plugin:import-summary:0.1.0".to_owned(),
+                    kind: "plugin".to_owned(),
+                    id: Some("import-summary".to_owned()),
+                    name: Some("Import Summary".to_owned()),
+                    version: Some("0.1.0".to_owned()),
+                    script: "examples/plugins/import-summary/import_summary.py".to_owned(),
+                    status: "ok".to_owned(),
+                    exit_code: Some(0),
+                    elapsed_ms: 7,
+                    stdout: "imports, 3".to_owned(),
+                    stderr: String::new(),
+                    stdout_truncated: false,
+                    stderr_truncated: false,
+                }],
+            },
+            messages: Vec::new(),
+            elapsed_ms: 11,
         }
     }
 
@@ -2601,5 +2904,17 @@ mod tests {
                 signature: "typedef int QUOTED_TYPE;".to_owned(),
             }],
         }
+    }
+
+    fn unique_test_dir(name: &str) -> PathBuf {
+        std::env::temp_dir().join(format!(
+            "fyida_cli_test_{}_{}_{}",
+            name,
+            std::process::id(),
+            std::time::SystemTime::now()
+                .duration_since(std::time::UNIX_EPOCH)
+                .unwrap()
+                .as_nanos()
+        ))
     }
 }
