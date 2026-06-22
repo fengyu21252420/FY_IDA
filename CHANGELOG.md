@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.22.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added Python annotation actions through `FYIDA_ACTIONS_JSON` for names, address comments, function comments, bookmarks, and manual code/data definitions.
+- Added headless `--save-project <PROJECT>` for saving a single-file analysis report and applied Python annotations as a FY_IDA project file.
+- Added JSON report `annotations`, automation `action_count`, and `automation.actions` records.
+- Added text/CSV automation exports for action rows alongside run rows.
+- Added helper methods in `examples/python/fyida.py` for `set_name`, `set_comment`, `set_function_comment`, `add_bookmark`, `mark_code`, and `mark_data`.
+- Added `examples/scripts/batch_rename_import_callers.py` to queue import-caller renames, function comments, and bookmarks.
+- Added CLI unit coverage for `--save-project`, Python action parsing/application, automation action exports, and project serialization with script annotations.
+
+### Changed
+
+- Updated the workspace version to `0.22.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the Python annotation-action checkpoint.
+
+### Known Issues
+
+- `--save-project` currently supports single-file headless analysis only, not batch directory reports.
+- Python automation still uses the local `python` executable instead of an embedded interpreter.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.22.0-alpha.1`.
+- Roll back with: `git checkout v0.22.0-alpha.1`.
+
 ## v0.21.0-alpha.1 - 2026-06-23
 
 ### Added

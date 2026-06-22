@@ -1,6 +1,6 @@
 # FY_IDA Python API
 
-FY_IDA v0.21.0-alpha.1 and later expose a lightweight script API through environment variables and the headless JSON report model.
+FY_IDA v0.22.0-alpha.1 and later expose a lightweight script API through environment variables, the headless JSON report model, and a JSON action file for saved annotations.
 
 ## Headless Scripts
 
@@ -17,12 +17,13 @@ The script receives:
 - `FYIDA_INPUT_KIND`: `PE` or `Raw Binary`.
 - `FYIDA_SCRIPT_PATH`: Python script path being executed.
 - `FYIDA_SCRIPT_DIR`: directory containing the Python script.
+- `FYIDA_ACTIONS_JSON`: writable JSON file where scripts can queue annotation actions.
 - `FYIDA_AUTOMATION_LABEL`: `script` for direct scripts, or a plugin label.
 - `FYIDA_AUTOMATION_KIND`: `script` or `plugin`.
 
-The JSON report contains input metadata, sections, functions, strings, imports, exports, relocations, xrefs, PDB records/symbols/types, the current type library, optional headless search results, and structured Python automation results.
+The JSON report contains input metadata, sections, functions, strings, imports, exports, relocations, xrefs, PDB records/symbols/types, the current type library, optional headless search results, current annotations, and structured Python automation results.
 
-Successful Python runs are also recorded under `automation.runs` with label, kind, plugin metadata, script path, status, exit code, elapsed time, stdout, stderr, and output-truncation flags. Use `--export automation --export-format text` or `--export automation --export-format csv` to emit only those run records.
+Successful Python runs are recorded under `automation.runs` with label, kind, plugin metadata, script path, status, exit code, elapsed time, stdout, stderr, and output-truncation flags. Annotation actions are recorded under `automation.actions`, summarized by `automation.action_count`, applied to report `annotations`, and saved by `--save-project`. Use `--export automation --export-format text` or `--export automation --export-format csv` to emit only automation run/action records.
 
 ## Helper Module
 
@@ -39,9 +40,23 @@ for string in project.strings("http"):
     print(hex(string.address), string.value)
     for xref in project.xrefs_to(string.address):
         print("xref from", hex(xref.from_va))
+
+project.set_name(0x140001000, "entry_main")
+project.set_comment(0x140001004, "references URL string")
+project.set_function_comment(0x140001000, "entry wrapper")
+project.add_bookmark(0x140001000)
+project.mark_code(0x140001000)
 ```
 
-Example scripts add `examples\python` to `sys.path` before importing the helper. `examples\scripts\find_string_xrefs.py` searches strings and prints their xrefs; set `FYIDA_QUERY` or pass a first script argument when running it directly.
+Example scripts add `examples\python` to `sys.path` before importing the helper. `examples\scripts\find_string_xrefs.py` searches strings and prints their xrefs; set `FYIDA_QUERY` or pass a first script argument when running it directly. `examples\scripts\batch_rename_import_callers.py` demonstrates queuing names, function comments, and bookmarks for functions that reference imports.
+
+To persist script-requested annotations into a FY_IDA project file, run:
+
+```powershell
+target\release\fy_ida.exe --headless analyze --python-script examples\scripts\batch_rename_import_callers.py --save-project out.fyida.json C:\path\sample.exe
+```
+
+Writable helper methods append JSON actions to `FYIDA_ACTIONS_JSON`. FY_IDA currently supports `set_name`, `set_comment`, `set_function_comment`, `add_bookmark`, `mark_code`, and `mark_data`.
 
 ## Plugins
 
@@ -93,4 +108,4 @@ The GUI Python Console tab runs the text in its editor through the local `python
 - `FYIDA_CURRENT_VA`
 - `FYIDA_CURRENT_FUNCTION`
 
-This first API is process-based rather than embedded. It keeps the Windows single-exe core usable without bundling a Python runtime.
+This API is process-based rather than embedded. It keeps the Windows single-exe core usable without bundling a Python runtime. Annotation actions are applied after each successful headless script/plugin process; GUI console runs do not currently write saved-project annotations.

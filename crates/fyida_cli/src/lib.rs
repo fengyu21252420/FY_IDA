@@ -6,7 +6,12 @@ use std::time::{Duration, Instant};
 
 use clap::{Parser, ValueEnum};
 use fyida_analysis::StaticAnalysis;
-use fyida_core::{sha256_hex, RawArch};
+use fyida_core::{
+    sha256_hex, Bookmark, FunctionComment, ManualDefinition, ManualDefinitionKind,
+    ProjectDebugInfo, ProjectDocument, ProjectFunction, ProjectInput, ProjectInputKind,
+    ProjectSourceFile, ProjectSymbol, ProjectType, ProjectTypeApplication, RawArch,
+    UserAnnotations, UserComment, UserName,
+};
 use fyida_loader::RawLoadOptions;
 use serde::{Deserialize, Serialize};
 
@@ -17,7 +22,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.21.0-alpha.1 已提供 Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.22.0-alpha.1 已提供 Python 标注动作写入、headless `--save-project` 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -75,6 +80,13 @@ pub struct Cli {
 
     #[arg(long, value_name = "OUTPUT", help = "将 headless 报告写入文件")]
     pub output: Option<PathBuf>,
+
+    #[arg(
+        long,
+        value_name = "PROJECT",
+        help = "将 headless 分析结果和 Python 标注动作保存为 FY_IDA 项目文件"
+    )]
+    pub save_project: Option<PathBuf>,
 
     #[arg(long, value_name = "DIR", help = "批量分析目录中的文件")]
     pub batch_dir: Option<PathBuf>,
@@ -176,6 +188,7 @@ struct HeadlessReport {
     type_library: TypeLibraryReport,
     search: Option<SearchReport>,
     automation: AutomationReport,
+    annotations: UserAnnotations,
     messages: Vec<String>,
     elapsed_ms: u128,
 }
@@ -183,7 +196,9 @@ struct HeadlessReport {
 #[derive(Debug, Default, Serialize)]
 struct AutomationReport {
     run_count: usize,
+    action_count: usize,
     runs: Vec<AutomationRunRecord>,
+    actions: Vec<AutomationActionRecord>,
 }
 
 #[derive(Debug, Serialize)]
@@ -201,6 +216,17 @@ struct AutomationRunRecord {
     stderr: String,
     stdout_truncated: bool,
     stderr_truncated: bool,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct AutomationActionRecord {
+    source_label: String,
+    action: String,
+    address: Option<u64>,
+    function_start: Option<u64>,
+    name: Option<String>,
+    text: Option<String>,
+    kind: Option<String>,
 }
 
 #[derive(Debug, Serialize)]
@@ -420,7 +446,7 @@ struct BatchError {
 }
 
 struct CliTypeLoad {
-    types: Vec<fyida_core::ProjectType>,
+    types: Vec<ProjectType>,
     messages: Vec<String>,
 }
 
@@ -442,6 +468,11 @@ struct AutomationTarget {
     name: Option<String>,
     version: Option<String>,
     script: PathBuf,
+}
+
+struct AutomationExecution {
+    run: AutomationRunRecord,
+    actions: Vec<AutomationActionRecord>,
 }
 
 pub fn run_headless(cli: &Cli) -> i32 {
@@ -476,6 +507,18 @@ pub fn run_headless(cli: &Cli) -> i32 {
     };
 
     if let Some(batch_dir) = &cli.batch_dir {
+        if cli.save_project.is_some() {
+            let message = "--save-project 当前仅支持单文件 headless 分析。".to_owned();
+            let _ = write_errors(
+                cli,
+                &[BatchError {
+                    path: batch_dir.display().to_string(),
+                    message: message.clone(),
+                }],
+            );
+            eprintln!("{message}");
+            return 2;
+        }
         return run_batch(cli, batch_dir, &type_load);
     }
 
@@ -493,20 +536,40 @@ pub fn run_headless(cli: &Cli) -> i32 {
     };
 
     match analyze_one(cli, file, &type_load) {
-        Ok(report) => match emit_single_report(cli, &report) {
-            Ok(()) => 0,
-            Err(message) => {
-                let _ = write_errors(
-                    cli,
-                    &[BatchError {
-                        path: file.display().to_string(),
-                        message: message.clone(),
-                    }],
-                );
-                eprintln!("导出失败：{message}");
-                1
+        Ok(mut report) => {
+            if let Some(path) = &cli.save_project {
+                match save_project_report(path, &report) {
+                    Ok(()) => report
+                        .messages
+                        .push(format!("项目已保存：{}", path.display())),
+                    Err(message) => {
+                        let _ = write_errors(
+                            cli,
+                            &[BatchError {
+                                path: file.display().to_string(),
+                                message: message.clone(),
+                            }],
+                        );
+                        eprintln!("项目保存失败：{message}");
+                        return 1;
+                    }
+                }
             }
-        },
+            match emit_single_report(cli, &report) {
+                Ok(()) => 0,
+                Err(message) => {
+                    let _ = write_errors(
+                        cli,
+                        &[BatchError {
+                            path: file.display().to_string(),
+                            message: message.clone(),
+                        }],
+                    );
+                    eprintln!("导出失败：{message}");
+                    1
+                }
+            }
+        }
         Err(message) => {
             let _ = write_errors(
                 cli,
@@ -672,6 +735,7 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
             type_library,
             search,
             automation: AutomationReport::default(),
+            annotations: UserAnnotations::default(),
             messages,
             elapsed_ms: started.elapsed().as_millis(),
         };
@@ -720,6 +784,7 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
         type_library,
         search,
         automation: AutomationReport::default(),
+        annotations: UserAnnotations::default(),
         messages,
         elapsed_ms: started.elapsed().as_millis(),
     };
@@ -786,17 +851,24 @@ fn run_python_automation(cli: &Cli, report: &mut HeadlessReport) -> Result<(), S
     }
 
     for target in targets {
-        let run = run_python_script(&target, report)
+        let execution = run_python_script(&target, report)
             .map_err(|message| format!("Python {} 运行失败：{message}", target.label))?;
-        report
-            .messages
-            .push(format!("Python {} stdout:\n{}", run.label, run.stdout));
-        if !run.stderr.trim().is_empty() {
-            report
-                .messages
-                .push(format!("Python {} stderr:\n{}", run.label, run.stderr));
+        report.messages.push(format!(
+            "Python {} stdout:\n{}",
+            execution.run.label, execution.run.stdout
+        ));
+        if !execution.run.stderr.trim().is_empty() {
+            report.messages.push(format!(
+                "Python {} stderr:\n{}",
+                execution.run.label, execution.run.stderr
+            ));
         }
-        report.automation.runs.push(run);
+        for action in &execution.actions {
+            apply_automation_action(&mut report.annotations, action);
+        }
+        report.automation.actions.extend(execution.actions);
+        report.automation.action_count = report.automation.actions.len();
+        report.automation.runs.push(execution.run);
         report.automation.run_count = report.automation.runs.len();
     }
     Ok(())
@@ -885,12 +957,19 @@ fn collect_plugin_manifest_paths(
 fn run_python_script(
     target: &AutomationTarget,
     report: &HeadlessReport,
-) -> Result<AutomationRunRecord, String> {
+) -> Result<AutomationExecution, String> {
     let report_path = std::env::temp_dir().join(format!(
         "fyida_python_report_{}_{}.json",
         std::process::id(),
         safe_temp_name(&report.input.path)
     ));
+    let actions_path = std::env::temp_dir().join(format!(
+        "fyida_python_actions_{}_{}_{}.json",
+        std::process::id(),
+        safe_temp_name(&target.label),
+        safe_temp_name(&report.input.path)
+    ));
+    let _ = std::fs::remove_file(&actions_path);
     let report_json = serde_json::to_string_pretty(report)
         .map_err(|error| format!("无法编码脚本报告 JSON：{error}"))?;
     std::fs::write(&report_path, report_json)
@@ -901,6 +980,7 @@ fn run_python_script(
     command
         .arg(&target.script)
         .env("FYIDA_REPORT_JSON", &report_path)
+        .env("FYIDA_ACTIONS_JSON", &actions_path)
         .env("FYIDA_INPUT_PATH", &report.input.path)
         .env("FYIDA_INPUT_KIND", &report.input.kind)
         .env("FYIDA_SCRIPT_PATH", target.script.display().to_string())
@@ -927,20 +1007,24 @@ fn run_python_script(
     let (stderr, stderr_truncated) =
         bounded_automation_output(&String::from_utf8_lossy(&output.stderr));
     if output.status.success() {
-        Ok(AutomationRunRecord {
-            label: target.label.clone(),
-            kind: target.kind.clone(),
-            id: target.id.clone(),
-            name: target.name.clone(),
-            version: target.version.clone(),
-            script: target.script.display().to_string(),
-            status: "ok".to_owned(),
-            exit_code: output.status.code(),
-            elapsed_ms,
-            stdout,
-            stderr,
-            stdout_truncated,
-            stderr_truncated,
+        let actions = read_automation_actions(&actions_path, &target.label)?;
+        Ok(AutomationExecution {
+            run: AutomationRunRecord {
+                label: target.label.clone(),
+                kind: target.kind.clone(),
+                id: target.id.clone(),
+                name: target.name.clone(),
+                version: target.version.clone(),
+                script: target.script.display().to_string(),
+                status: "ok".to_owned(),
+                exit_code: output.status.code(),
+                elapsed_ms,
+                stdout,
+                stderr,
+                stdout_truncated,
+                stderr_truncated,
+            },
+            actions,
         })
     } else {
         Err(format!(
@@ -963,6 +1047,218 @@ fn bounded_automation_output(output: &str) -> (String, bool) {
         .collect::<String>();
     bounded.push_str("\n...[truncated by FY_IDA]");
     (bounded, true)
+}
+
+fn read_automation_actions(
+    path: &Path,
+    source_label: &str,
+) -> Result<Vec<AutomationActionRecord>, String> {
+    if !path.exists() {
+        return Ok(Vec::new());
+    }
+    let text = std::fs::read_to_string(path)
+        .map_err(|error| format!("无法读取 Python 标注动作 {}：{error}", path.display()))?;
+    if text.trim().is_empty() {
+        return Ok(Vec::new());
+    }
+    let value: serde_json::Value = serde_json::from_str(&text)
+        .map_err(|error| format!("Python 标注动作 JSON 无效 {}：{error}", path.display()))?;
+    let actions = match value {
+        serde_json::Value::Array(items) => items,
+        serde_json::Value::Object(mut object) => match object.remove("actions") {
+            Some(serde_json::Value::Array(items)) => items,
+            _ => {
+                return Err("Python 标注动作 JSON 需要是数组或包含 actions 数组。".to_owned());
+            }
+        },
+        _ => return Err("Python 标注动作 JSON 需要是数组或包含 actions 数组。".to_owned()),
+    };
+
+    actions
+        .into_iter()
+        .enumerate()
+        .map(|(index, value)| parse_automation_action(source_label, index, value))
+        .collect()
+}
+
+fn parse_automation_action(
+    source_label: &str,
+    index: usize,
+    value: serde_json::Value,
+) -> Result<AutomationActionRecord, String> {
+    let serde_json::Value::Object(object) = value else {
+        return Err(format!("Python 标注动作 #{index} 不是对象。"));
+    };
+    let action = string_field(&object, "action")
+        .or_else(|| string_field(&object, "type"))
+        .ok_or_else(|| format!("Python 标注动作 #{index} 缺少 action。"))?
+        .to_ascii_lowercase();
+    let address = optional_address_field(&object, "address")
+        .or_else(|| optional_address_field(&object, "va"));
+    let function_start = optional_address_field(&object, "function_start")
+        .or_else(|| optional_address_field(&object, "function"));
+    let name = string_field(&object, "name");
+    let text = string_field(&object, "text")
+        .or_else(|| string_field(&object, "comment"))
+        .or_else(|| string_field(&object, "value"));
+    let mut kind = string_field(&object, "kind").map(|value| value.to_ascii_lowercase());
+
+    let canonical = match action.as_str() {
+        "rename" | "set_name" => {
+            require_address(index, address)?;
+            require_text(index, name.as_deref(), "name")?;
+            "rename"
+        }
+        "comment" | "set_comment" | "address_comment" => {
+            require_address(index, address)?;
+            require_text(index, text.as_deref(), "text")?;
+            "comment"
+        }
+        "function_comment" | "set_function_comment" => {
+            if function_start.or(address).is_none() {
+                return Err(format!(
+                    "Python 标注动作 #{index} 需要 function_start 或 address。"
+                ));
+            }
+            require_text(index, text.as_deref(), "text")?;
+            "function_comment"
+        }
+        "bookmark" | "add_bookmark" => {
+            require_address(index, address)?;
+            "bookmark"
+        }
+        "manual_definition" | "mark_code" | "mark_data" => {
+            require_address(index, address)?;
+            if action == "mark_code" {
+                kind = Some("code".to_owned());
+            } else if action == "mark_data" {
+                kind = Some("data".to_owned());
+            }
+            match kind.as_deref() {
+                Some("code" | "data") => {}
+                _ => {
+                    return Err(format!(
+                        "Python 标注动作 #{index} 的 manual_definition 需要 kind=code/data。"
+                    ));
+                }
+            }
+            "manual_definition"
+        }
+        _ => {
+            return Err(format!(
+                "Python 标注动作 #{index} 不支持 action `{action}`。"
+            ))
+        }
+    };
+
+    Ok(AutomationActionRecord {
+        source_label: source_label.to_owned(),
+        action: canonical.to_owned(),
+        address,
+        function_start,
+        name,
+        text,
+        kind,
+    })
+}
+
+fn string_field(object: &serde_json::Map<String, serde_json::Value>, name: &str) -> Option<String> {
+    object
+        .get(name)
+        .and_then(serde_json::Value::as_str)
+        .map(str::trim)
+        .filter(|value| !value.is_empty())
+        .map(str::to_owned)
+}
+
+fn optional_address_field(
+    object: &serde_json::Map<String, serde_json::Value>,
+    name: &str,
+) -> Option<u64> {
+    object.get(name).and_then(parse_json_address)
+}
+
+fn parse_json_address(value: &serde_json::Value) -> Option<u64> {
+    match value {
+        serde_json::Value::Number(number) => number.as_u64(),
+        serde_json::Value::String(text) => parse_number(text),
+        _ => None,
+    }
+}
+
+fn require_address(index: usize, address: Option<u64>) -> Result<u64, String> {
+    address.ok_or_else(|| format!("Python 标注动作 #{index} 缺少 address。"))
+}
+
+fn require_text(index: usize, value: Option<&str>, field: &str) -> Result<(), String> {
+    match value.map(str::trim).filter(|value| !value.is_empty()) {
+        Some(_) => Ok(()),
+        None => Err(format!("Python 标注动作 #{index} 缺少 {field}。")),
+    }
+}
+
+fn apply_automation_action(annotations: &mut UserAnnotations, action: &AutomationActionRecord) {
+    match action.action.as_str() {
+        "rename" => {
+            if let (Some(address), Some(name)) = (action.address, action.name.as_ref()) {
+                annotations.names.retain(|item| item.address != address);
+                annotations.names.push(UserName {
+                    address,
+                    name: name.clone(),
+                });
+            }
+        }
+        "comment" => {
+            if let (Some(address), Some(text)) = (action.address, action.text.as_ref()) {
+                annotations.comments.retain(|item| item.address != address);
+                annotations.comments.push(UserComment {
+                    address,
+                    text: text.clone(),
+                });
+            }
+        }
+        "function_comment" => {
+            if let Some(text) = action.text.as_ref() {
+                let function_start = action.function_start.or(action.address);
+                if let Some(function_start) = function_start {
+                    annotations
+                        .function_comments
+                        .retain(|item| item.function_start != function_start);
+                    annotations.function_comments.push(FunctionComment {
+                        function_start,
+                        text: text.clone(),
+                    });
+                }
+            }
+        }
+        "bookmark" => {
+            if let Some(address) = action.address {
+                if !annotations
+                    .bookmarks
+                    .iter()
+                    .any(|bookmark| bookmark.address == address)
+                {
+                    annotations.bookmarks.push(Bookmark { address });
+                }
+            }
+        }
+        "manual_definition" => {
+            if let (Some(address), Some(kind)) = (action.address, action.kind.as_deref()) {
+                let kind = match kind {
+                    "code" => ManualDefinitionKind::Code,
+                    "data" => ManualDefinitionKind::Data,
+                    _ => return,
+                };
+                annotations
+                    .manual_definitions
+                    .retain(|item| item.address != address);
+                annotations
+                    .manual_definitions
+                    .push(ManualDefinition { address, kind });
+            }
+        }
+        _ => {}
+    }
 }
 
 fn safe_temp_name(path: &str) -> String {
@@ -1708,7 +2004,11 @@ fn text_full_report(report: &HeadlessReport) -> String {
             search.result_count, search.query
         );
     }
-    let _ = writeln!(text, "  Automation: {} runs", report.automation.run_count);
+    let _ = writeln!(
+        text,
+        "  Automation: {} runs / {} actions",
+        report.automation.run_count, report.automation.action_count
+    );
     for run in report.automation.runs.iter().take(16) {
         let _ = writeln!(
             text,
@@ -1765,6 +2065,11 @@ fn text_summary_report(report: &HeadlessReport) -> String {
         let _ = writeln!(text, "SearchResults: {}", search.result_count);
     }
     let _ = writeln!(text, "AutomationRuns: {}", report.automation.run_count);
+    let _ = writeln!(
+        text,
+        "AutomationActions: {}",
+        report.automation.action_count
+    );
     let _ = writeln!(text, "TypeLibrary: {}", report.type_library.count);
     text
 }
@@ -1937,7 +2242,8 @@ fn text_search(search: Option<&SearchReport>) -> String {
 fn text_automation(automation: &AutomationReport) -> String {
     let mut text = String::from("Automation\n");
     let _ = writeln!(text, "Runs: {}", automation.run_count);
-    if automation.runs.is_empty() {
+    let _ = writeln!(text, "Actions: {}", automation.action_count);
+    if automation.runs.is_empty() && automation.actions.is_empty() {
         let _ = writeln!(text, "No automation ran.");
         return text;
     }
@@ -1953,6 +2259,27 @@ fn text_automation(automation: &AutomationReport) -> String {
         if !run.stderr.trim().is_empty() {
             let _ = writeln!(text, "stderr:\n{}", run.stderr);
         }
+    }
+    for action in &automation.actions {
+        let address = action
+            .address
+            .map(format_va)
+            .unwrap_or_else(|| "-".to_owned());
+        let function_start = action
+            .function_start
+            .map(format_va)
+            .unwrap_or_else(|| "-".to_owned());
+        let _ = writeln!(
+            text,
+            "action\t{}\t{}\taddress {}\tfunction {}\t{}\t{}\t{}",
+            action.source_label,
+            action.action,
+            address,
+            function_start,
+            action.name.as_deref().unwrap_or(""),
+            action.text.as_deref().unwrap_or(""),
+            action.kind.as_deref().unwrap_or("")
+        );
     }
     text
 }
@@ -2076,6 +2403,14 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
                 &mut csv,
                 &[
                     "summary",
+                    "automation_actions",
+                    &report.automation.action_count.to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
                     "type_library",
                     &report.type_library.count.to_string(),
                 ],
@@ -2128,6 +2463,13 @@ fn csv_summary(report: &HeadlessReport) -> String {
     push_csv_row(
         &mut csv,
         &["automation_runs", &report.automation.run_count.to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "automation_actions",
+            &report.automation.action_count.to_string(),
+        ],
     );
     push_csv_row(
         &mut csv,
@@ -2329,12 +2671,13 @@ fn csv_search(search: Option<&SearchReport>) -> String {
 
 fn csv_automation(automation: &AutomationReport) -> String {
     let mut csv = String::from(
-        "label,kind,id,name,version,status,exit_code,elapsed_ms,script,stdout,stderr,stdout_truncated,stderr_truncated\n",
+        "record,label,kind,id,name,version,status,exit_code,elapsed_ms,script,stdout,stderr,stdout_truncated,stderr_truncated,action,address,function_start,text\n",
     );
     for run in &automation.runs {
         push_csv_row(
             &mut csv,
             &[
+                "run",
                 &run.label,
                 &run.kind,
                 run.id.as_deref().unwrap_or(""),
@@ -2350,6 +2693,37 @@ fn csv_automation(automation: &AutomationReport) -> String {
                 &run.stderr,
                 &run.stdout_truncated.to_string(),
                 &run.stderr_truncated.to_string(),
+                "",
+                "",
+                "",
+                "",
+            ],
+        );
+    }
+    for action in &automation.actions {
+        let address = action.address.map(format_va).unwrap_or_default();
+        let function_start = action.function_start.map(format_va).unwrap_or_default();
+        push_csv_row(
+            &mut csv,
+            &[
+                "action",
+                &action.source_label,
+                action.kind.as_deref().unwrap_or(""),
+                "",
+                action.name.as_deref().unwrap_or(""),
+                "",
+                "applied",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                &action.action,
+                &address,
+                &function_start,
+                action.text.as_deref().unwrap_or(""),
             ],
         );
     }
@@ -2434,6 +2808,107 @@ fn collect_batch_files(root: &Path, recursive: bool) -> Result<Vec<PathBuf>, Str
     Ok(files)
 }
 
+fn save_project_report(path: &Path, report: &HeadlessReport) -> Result<(), String> {
+    let document = project_document_from_report(report)?;
+    document
+        .save_to_path(path)
+        .map_err(|error| format!("无法写入项目 {}：{error}", path.display()))
+}
+
+fn project_document_from_report(report: &HeadlessReport) -> Result<ProjectDocument, String> {
+    let kind = match report.input.kind.as_str() {
+        "PE" => ProjectInputKind::Pe,
+        "Raw Binary" => ProjectInputKind::Raw {
+            base_address: report.input.base_address.unwrap_or(0),
+            entry_address: report
+                .input
+                .entry_va
+                .or(report.input.base_address)
+                .unwrap_or(0),
+            arch: RawArch::X64,
+        },
+        other => return Err(format!("不支持保存为项目的输入类型：{other}")),
+    };
+    let functions = report
+        .analysis
+        .functions
+        .iter()
+        .map(|function| ProjectFunction {
+            start_va: function.start_va,
+            name: annotation_name_for(&report.annotations, function.start_va)
+                .unwrap_or(&function.name)
+                .to_owned(),
+            size: function.size,
+            instruction_count: function.instruction_count,
+        })
+        .collect::<Vec<_>>();
+    let debug_info = report
+        .analysis
+        .pdb_records
+        .first()
+        .map(|record| ProjectDebugInfo {
+            pe_pdb_path: Some(record.path.clone()),
+            pe_pdb_guid: record.guid.clone(),
+            pe_pdb_age: record.age,
+            loaded_pdb_path: None,
+            loaded_pdb_guid: None,
+            loaded_pdb_age: None,
+            matched: None,
+        });
+    let symbols = report
+        .analysis
+        .pdb_symbols
+        .iter()
+        .map(|symbol| ProjectSymbol {
+            address: symbol.address,
+            rva: symbol.rva,
+            name: symbol.name.clone(),
+            original_name: symbol.original_name.clone(),
+            kind: symbol.kind.clone(),
+            source: symbol.source.clone(),
+        })
+        .collect::<Vec<_>>();
+    let types = report
+        .type_library
+        .types
+        .iter()
+        .map(|type_item| {
+            ProjectType::simple(
+                type_item.name.clone(),
+                type_item.kind.clone(),
+                type_item.source.clone(),
+            )
+        })
+        .collect::<Vec<_>>();
+    let source_files = Vec::<ProjectSourceFile>::new();
+    let type_applications = Vec::<ProjectTypeApplication>::new();
+
+    Ok(ProjectDocument::new(
+        &report.version,
+        ProjectInput {
+            path: report.input.path.clone(),
+            size_bytes: report.input.size_bytes,
+            sha256: report.input.sha256.clone(),
+            kind,
+        },
+        functions,
+        debug_info,
+        symbols,
+        types,
+        type_applications,
+        source_files,
+        report.annotations.clone(),
+    ))
+}
+
+fn annotation_name_for(annotations: &UserAnnotations, address: u64) -> Option<&str> {
+    annotations
+        .names
+        .iter()
+        .find(|name| name.address == address)
+        .map(|name| name.name.as_str())
+}
+
 fn load_cli_types(cli: &Cli) -> Result<CliTypeLoad, String> {
     let mut types = fyida_core::builtin_type_library();
     let mut messages = Vec::new();
@@ -2465,10 +2940,7 @@ fn load_cli_types(cli: &Cli) -> Result<CliTypeLoad, String> {
     Ok(CliTypeLoad { types, messages })
 }
 
-fn merge_types(
-    target: &mut Vec<fyida_core::ProjectType>,
-    incoming: impl IntoIterator<Item = fyida_core::ProjectType>,
-) {
+fn merge_types(target: &mut Vec<ProjectType>, incoming: impl IntoIterator<Item = ProjectType>) {
     let mut by_name = target
         .drain(..)
         .map(|type_item| (type_item.name.clone(), type_item))
@@ -2648,6 +3120,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_save_project_path() {
+        let cli = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--save-project",
+            "sample.fyida.json",
+            "sample.exe",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.save_project, Some(PathBuf::from("sample.fyida.json")));
+    }
+
+    #[test]
     fn search_report_finds_pseudocode_ir_runtime_and_types() {
         let input = sample_input_report();
         let analysis = sample_analysis_report();
@@ -2719,12 +3205,66 @@ mod tests {
         let json = serde_json::to_string(&report).unwrap();
 
         assert!(text.contains("AutomationRuns: 1"));
-        assert!(csv.starts_with("label,kind,id,name,version,status,exit_code,elapsed_ms,script,stdout,stderr,stdout_truncated,stderr_truncated\n"));
+        assert!(text.contains("AutomationActions: 1"));
+        assert!(csv.starts_with("record,label,kind,id,name,version,status,exit_code,elapsed_ms,script,stdout,stderr,stdout_truncated,stderr_truncated,action,address,function_start,text\n"));
         assert!(csv.contains(
-            "plugin:import-summary:0.1.0,plugin,import-summary,Import Summary,0.1.0,ok,0,7,examples/plugins/import-summary/import_summary.py,\"imports, 3\",,false,false"
+            "run,plugin:import-summary:0.1.0,plugin,import-summary,Import Summary,0.1.0,ok,0,7,examples/plugins/import-summary/import_summary.py,\"imports, 3\",,false,false"
+        ));
+        assert!(csv.contains(
+            "action,plugin:import-summary:0.1.0,,,renamed_func,,applied,,,,,,,,rename,0000000140001000,,"
         ));
         assert!(json.contains("\"automation\""));
+        assert!(json.contains("\"annotations\""));
         assert!(json.contains("\"stdout\":\"imports, 3\""));
+    }
+
+    #[test]
+    fn parses_and_applies_python_annotation_actions() {
+        let value = serde_json::json!([
+            {"action": "rename", "address": "0x140001000", "name": "entry_main"},
+            {"action": "comment", "address": 5368713220_u64, "text": "calls MessageBoxW"},
+            {"action": "function_comment", "function_start": "140001000", "text": "entry wrapper"},
+            {"action": "bookmark", "address": "0x140001004"},
+            {"action": "mark_code", "address": "0x140001004"}
+        ]);
+        let actions = match value {
+            serde_json::Value::Array(items) => items
+                .into_iter()
+                .enumerate()
+                .map(|(index, value)| parse_automation_action("script", index, value))
+                .collect::<Result<Vec<_>, _>>()
+                .unwrap(),
+            _ => unreachable!(),
+        };
+        let mut annotations = UserAnnotations::default();
+        for action in &actions {
+            apply_automation_action(&mut annotations, action);
+        }
+
+        assert_eq!(annotations.names[0].name, "entry_main");
+        assert_eq!(annotations.comments[0].text, "calls MessageBoxW");
+        assert_eq!(annotations.function_comments[0].text, "entry wrapper");
+        assert_eq!(annotations.bookmarks[0].address, 0x0000_0001_4000_1004);
+        assert_eq!(
+            annotations.manual_definitions[0].kind,
+            ManualDefinitionKind::Code
+        );
+    }
+
+    #[test]
+    fn project_document_from_report_includes_python_annotations() {
+        let report = sample_headless_report_with_automation();
+
+        let document = project_document_from_report(&report).unwrap();
+
+        assert_eq!(document.app_version, "0.22.0-alpha.1");
+        assert_eq!(document.functions[0].name, "renamed_func");
+        assert_eq!(document.annotations.names[0].name, "renamed_func");
+        assert_eq!(document.annotations.comments[0].text, "automation note");
+        assert_eq!(
+            document.annotations.bookmarks[0].address,
+            0x0000_0001_4000_1004
+        );
     }
 
     #[test]
@@ -2870,13 +3410,14 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.20.0-alpha.1".to_owned(),
+            version: "0.22.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),
             search: None,
             automation: AutomationReport {
                 run_count: 1,
+                action_count: 1,
                 runs: vec![AutomationRunRecord {
                     label: "plugin:import-summary:0.1.0".to_owned(),
                     kind: "plugin".to_owned(),
@@ -2892,6 +3433,30 @@ mod tests {
                     stdout_truncated: false,
                     stderr_truncated: false,
                 }],
+                actions: vec![AutomationActionRecord {
+                    source_label: "plugin:import-summary:0.1.0".to_owned(),
+                    action: "rename".to_owned(),
+                    address: Some(0x0000_0001_4000_1000),
+                    function_start: None,
+                    name: Some("renamed_func".to_owned()),
+                    text: None,
+                    kind: None,
+                }],
+            },
+            annotations: UserAnnotations {
+                names: vec![UserName {
+                    address: 0x0000_0001_4000_1000,
+                    name: "renamed_func".to_owned(),
+                }],
+                comments: vec![UserComment {
+                    address: 0x0000_0001_4000_1004,
+                    text: "automation note".to_owned(),
+                }],
+                function_comments: Vec::new(),
+                bookmarks: vec![Bookmark {
+                    address: 0x0000_0001_4000_1004,
+                }],
+                manual_definitions: Vec::new(),
             },
             messages: Vec::new(),
             elapsed_ms: 11,

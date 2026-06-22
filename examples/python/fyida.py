@@ -31,6 +31,7 @@ class Project:
         self.type_library = report.get("type_library", {})
         self.search = report.get("search")
         self.automation = report.get("automation", {})
+        self.actions_path = os.environ.get("FYIDA_ACTIONS_JSON")
 
     def functions(self):
         return self._records("functions")
@@ -89,6 +90,34 @@ class Project:
                 matches.append(item)
         return matches
 
+    def set_name(self, address, name):
+        self._append_action({"action": "rename", "address": parse_address(address), "name": name})
+
+    def set_comment(self, address, text):
+        self._append_action({"action": "comment", "address": parse_address(address), "text": text})
+
+    def set_function_comment(self, function_start, text):
+        self._append_action(
+            {
+                "action": "function_comment",
+                "function_start": parse_address(function_start),
+                "text": text,
+            }
+        )
+
+    def add_bookmark(self, address):
+        self._append_action({"action": "bookmark", "address": parse_address(address)})
+
+    def mark_code(self, address):
+        self._append_action(
+            {"action": "manual_definition", "address": parse_address(address), "kind": "code"}
+        )
+
+    def mark_data(self, address):
+        self._append_action(
+            {"action": "manual_definition", "address": parse_address(address), "kind": "data"}
+        )
+
     def _records(self, key):
         return [Record(item) for item in self.analysis.get(key, [])]
 
@@ -102,6 +131,30 @@ class Project:
             for item in records
             if needle in " ".join(str(item.get(field, "")) for field in fields).casefold()
         ]
+
+    def _append_action(self, action):
+        if not self.actions_path:
+            raise RuntimeError("FYIDA_ACTIONS_JSON is not set; this run cannot write actions")
+        path = Path(self.actions_path)
+        if path.exists() and path.read_text(encoding="utf-8").strip():
+            actions = json.loads(path.read_text(encoding="utf-8"))
+            if isinstance(actions, dict):
+                actions = actions.get("actions", [])
+        else:
+            actions = []
+        actions.append(action)
+        path.write_text(json.dumps(actions, indent=2), encoding="utf-8")
+
+
+def safe_name(text):
+    cleaned = []
+    for character in str(text):
+        if character.isalnum() or character == "_":
+            cleaned.append(character)
+        else:
+            cleaned.append("_")
+    result = "".join(cleaned).strip("_")
+    return result or "item"
 
 
 def current_project(path=None):
