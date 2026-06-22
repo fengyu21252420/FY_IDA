@@ -7,8 +7,9 @@ use eframe::egui::{
     Visuals, Window,
 };
 use fyida_analysis::{
-    empty_workspace_disassembly, file_error_log_lines, pe_entry_disassembly, pe_loaded_log_lines,
-    startup_log_lines, DisassemblyRow,
+    analyze_pe, empty_workspace_disassembly, file_error_log_lines, pe_entry_disassembly,
+    pe_loaded_log_lines, startup_log_lines, static_analysis_log_lines, DisassemblyRow,
+    StaticAnalysis,
 };
 use fyida_core::{format_address, FileSelection, ProjectState, APP_NAME};
 use fyida_loader::{load_file_metadata, load_pe_from_selection_with_bytes};
@@ -57,6 +58,7 @@ struct FyIdaApp {
     logs: Vec<String>,
     search_results: Vec<String>,
     disassembly_rows: Vec<DisassemblyRow>,
+    analysis: Option<StaticAnalysis>,
     recent_files: VecDeque<PathBuf>,
 }
 
@@ -79,6 +81,7 @@ impl FyIdaApp {
             logs: startup_log_lines(),
             search_results: vec!["尚未执行搜索。".to_owned()],
             disassembly_rows: empty_workspace_disassembly(),
+            analysis: None,
             recent_files: VecDeque::new(),
         };
 
@@ -107,6 +110,7 @@ impl FyIdaApp {
                 let message = error.to_string();
                 self.project.set_error(message.clone());
                 self.disassembly_rows = file_error_disassembly_row(&message);
+                self.analysis = None;
                 self.logs.push(message);
                 self.right_tab = 1;
                 self.bottom_tab = 0;
@@ -124,10 +128,13 @@ impl FyIdaApp {
     }
 
     fn apply_pe_image(&mut self, image: fyida_core::PeImage, bytes: &[u8]) {
+        let analysis = analyze_pe(&image, bytes);
         let disassembly = pe_entry_disassembly(&image, bytes);
         self.logs.extend(pe_loaded_log_lines(&image));
+        self.logs.extend(static_analysis_log_lines(&analysis));
         self.logs.extend(disassembly.log_lines);
         self.disassembly_rows = disassembly.rows;
+        self.analysis = Some(analysis);
         self.project.load_pe(image);
         self.center_tab = 0;
         self.right_tab = 1;
@@ -139,6 +146,7 @@ impl FyIdaApp {
         self.project.set_file_error(selection, message);
         self.disassembly_rows =
             file_error_disassembly_row("不是有效的 PE 文件，无法进行 x64 反汇编。");
+        self.analysis = None;
         self.center_tab = 0;
         self.right_tab = 1;
         self.bottom_tab = 0;
@@ -278,8 +286,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.3.0-alpha.1");
-                        ui.label("x64 入口点反汇编 MVP。");
+                        ui.label("FY_IDA v0.4.0-alpha.1");
+                        ui.label("基础静态分析索引 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -404,23 +412,32 @@ impl FyIdaApp {
     fn left_content(&mut self, ui: &mut Ui) {
         ScrollArea::vertical().show(ui, |ui| match LEFT_TABS[self.left_tab] {
             "函数" => self.function_list(ui),
-            "名称" => placeholder_list(ui, &["入口占位", "导入表占位", "字符串表占位"]),
-            "字符串" => placeholder_list(ui, &["尚未扫描字符串", "打开文件后等待分析"]),
-            "导入" => placeholder_list(ui, &["尚未解析导入表"]),
-            "导出" => placeholder_list(ui, &["尚未解析导出表"]),
+            "名称" => self.name_list(ui),
+            "字符串" => self.string_list(ui),
+            "导入" => self.import_list(ui),
+            "导出" => self.export_list(ui),
             "段" => self.section_list(ui),
             _ => placeholder_list(ui, &["暂无书签"]),
         });
     }
 
     fn function_list(&mut self, ui: &mut Ui) {
-        let rows = if let Some(image) = self.project.pe_image() {
-            vec![(
-                image.entry_point_va(),
-                format!("{:016X}", image.entry_point_va()),
-                "入口点".to_owned(),
-                "PE Header".to_owned(),
-            )]
+        let rows = if let Some(analysis) = &self.analysis {
+            analysis
+                .functions
+                .iter()
+                .map(|function| {
+                    (
+                        function.start_va,
+                        format!("{:016X}", function.start_va),
+                        function.name.clone(),
+                        format!(
+                            "{} 条指令 / {} 次调用",
+                            function.instruction_count, function.call_count
+                        ),
+                    )
+                })
+                .collect::<Vec<_>>()
         } else if self.project.selected_file().is_some() {
             vec![(
                 0,
@@ -455,6 +472,173 @@ impl FyIdaApp {
                         self.logs.push(format!("跳转到函数：{name}"));
                     }
                     ui.label(status);
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn name_list(&mut self, ui: &mut Ui) {
+        let Some(analysis) = &self.analysis else {
+            placeholder_list(ui, &["尚未建立名称索引"]);
+            return;
+        };
+
+        let mut rows = analysis
+            .functions
+            .iter()
+            .map(|function| (function.start_va, function.name.clone(), "函数".to_owned()))
+            .collect::<Vec<_>>();
+        rows.extend(
+            analysis
+                .exports
+                .iter()
+                .map(|export| (export.va, export.name.clone(), "导出".to_owned())),
+        );
+        rows.extend(
+            analysis
+                .imports
+                .iter()
+                .map(|import| (import.thunk_va, import.display_name(), "导入".to_owned())),
+        );
+
+        if rows.is_empty() {
+            placeholder_list(ui, &["当前文件没有可显示名称"]);
+            return;
+        }
+
+        Grid::new("name_list_grid")
+            .num_columns(3)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("地址");
+                ui.strong("名称");
+                ui.strong("类型");
+                ui.end_row();
+
+                for (va, name, kind) in rows {
+                    if ui.selectable_label(false, format!("{va:016X}")).clicked() {
+                        self.project.jump_to(va, Some(name.clone()));
+                    }
+                    if ui.selectable_label(false, &name).clicked() {
+                        self.project.jump_to(va, Some(name.clone()));
+                    }
+                    ui.label(kind);
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn string_list(&mut self, ui: &mut Ui) {
+        let Some(analysis) = &self.analysis else {
+            placeholder_list(ui, &["尚未扫描字符串", "打开 PE 后等待分析"]);
+            return;
+        };
+        if analysis.strings.is_empty() {
+            placeholder_list(ui, &["未发现长度足够的 ASCII 或 UTF-16LE 字符串"]);
+            return;
+        }
+
+        let strings = analysis.strings.clone();
+        Grid::new("string_list_grid")
+            .num_columns(3)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("地址");
+                ui.strong("编码");
+                ui.strong("内容");
+                ui.end_row();
+
+                for string in strings {
+                    if ui
+                        .selectable_label(false, format!("{:016X}", string.address))
+                        .clicked()
+                    {
+                        self.project
+                            .jump_to(string.address, Some("字符串".to_owned()));
+                    }
+                    ui.label(string.encoding.label());
+                    if ui.selectable_label(false, &string.value).clicked() {
+                        self.project
+                            .jump_to(string.address, Some("字符串".to_owned()));
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn import_list(&mut self, ui: &mut Ui) {
+        let Some(analysis) = &self.analysis else {
+            placeholder_list(ui, &["尚未解析导入表"]);
+            return;
+        };
+        if analysis.imports.is_empty() {
+            placeholder_list(ui, &["当前 PE 没有导入符号或导入表不可用"]);
+            return;
+        }
+
+        let imports = analysis.imports.clone();
+        Grid::new("import_list_grid")
+            .num_columns(3)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("IAT VA");
+                ui.strong("DLL");
+                ui.strong("API");
+                ui.end_row();
+
+                for import in imports {
+                    if ui
+                        .selectable_label(false, format!("{:016X}", import.thunk_va))
+                        .clicked()
+                    {
+                        self.project
+                            .jump_to(import.thunk_va, Some(import.display_name()));
+                    }
+                    ui.label(&import.dll);
+                    if ui.selectable_label(false, import.display_name()).clicked() {
+                        self.project
+                            .jump_to(import.thunk_va, Some(import.display_name()));
+                    }
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn export_list(&mut self, ui: &mut Ui) {
+        let Some(analysis) = &self.analysis else {
+            placeholder_list(ui, &["尚未解析导出表"]);
+            return;
+        };
+        if analysis.exports.is_empty() {
+            placeholder_list(ui, &["当前 PE 没有导出符号或导出表不可用"]);
+            return;
+        }
+
+        let exports = analysis.exports.clone();
+        Grid::new("export_list_grid")
+            .num_columns(3)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("VA");
+                ui.strong("名称");
+                ui.strong("序号");
+                ui.end_row();
+
+                for export in exports {
+                    if ui
+                        .selectable_label(false, format!("{:016X}", export.va))
+                        .clicked()
+                    {
+                        self.project.jump_to(export.va, Some(export.name.clone()));
+                    }
+                    if ui.selectable_label(false, &export.name).clicked() {
+                        self.project.jump_to(export.va, Some(export.name.clone()));
+                    }
+                    ui.label(export.ordinal.to_string());
                     ui.end_row();
                 }
             });
@@ -503,8 +687,32 @@ impl FyIdaApp {
     fn right_content(&self, ui: &mut Ui) {
         match RIGHT_TABS[self.right_tab] {
             "交叉引用" => {
-                ui.label("当前地址的交叉引用将在分析完成后显示。");
-                ui.label("状态：暂未分析");
+                if let Some(analysis) = &self.analysis {
+                    if analysis.xrefs.is_empty() {
+                        ui.label("暂未发现 direct call / jump 交叉引用。");
+                    } else {
+                        Grid::new("xref_grid")
+                            .num_columns(3)
+                            .striped(true)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("来源");
+                                ui.strong("目标");
+                                ui.strong("类型");
+                                ui.end_row();
+
+                                for xref in &analysis.xrefs {
+                                    ui.label(format!("{:016X}", xref.from_va));
+                                    ui.label(format!("{:016X}", xref.to_va));
+                                    ui.label(xref.kind.label());
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                } else {
+                    ui.label("当前地址的交叉引用将在分析完成后显示。");
+                    ui.label("状态：暂未分析");
+                }
             }
             "属性" => {
                 Grid::new("property_grid")
@@ -790,10 +998,7 @@ impl FyIdaApp {
                 ui.label("搜索文本、字符串、函数名、导入 API、注释、字节序列或地址。");
                 ui.add(TextEdit::singleline(&mut self.search_text).hint_text("CreateFileW"));
                 if ui.button("搜索").clicked() {
-                    self.search_results = vec![
-                        format!("搜索请求：{}", self.search_text),
-                        "当前版本尚未建立索引，暂无真实结果。".to_owned(),
-                    ];
+                    self.search_results = self.run_search();
                     self.bottom_tab = 1;
                     self.search_open = false;
                 }
@@ -818,6 +1023,81 @@ impl FyIdaApp {
 
         let va = parse_number(text)?;
         Some((va, format!("VA 0x{va:016X}")))
+    }
+
+    fn run_search(&self) -> Vec<String> {
+        let query = self.search_text.trim();
+        if query.is_empty() {
+            return vec!["请输入搜索内容。".to_owned()];
+        }
+
+        let Some(analysis) = &self.analysis else {
+            return vec![
+                format!("搜索请求：{query}"),
+                "尚未打开可分析的 PE 文件。".to_owned(),
+            ];
+        };
+
+        let query_lower = query.to_lowercase();
+        let mut results = Vec::new();
+        results.push(format!("搜索请求：{query}"));
+
+        for function in &analysis.functions {
+            if function.name.to_lowercase().contains(&query_lower)
+                || format!("{:016X}", function.start_va).contains(query)
+            {
+                results.push(format!(
+                    "函数 0x{:016X} {}",
+                    function.start_va, function.name
+                ));
+            }
+        }
+
+        for string in &analysis.strings {
+            if string.value.to_lowercase().contains(&query_lower)
+                || format!("{:016X}", string.address).contains(query)
+            {
+                results.push(format!(
+                    "字符串 0x{:016X} [{}] {}",
+                    string.address,
+                    string.encoding.label(),
+                    string.value
+                ));
+            }
+        }
+
+        for import in &analysis.imports {
+            let name = import.display_name();
+            if name.to_lowercase().contains(&query_lower)
+                || format!("{:016X}", import.thunk_va).contains(query)
+            {
+                results.push(format!("导入 0x{:016X} {}", import.thunk_va, name));
+            }
+        }
+
+        for export in &analysis.exports {
+            if export.name.to_lowercase().contains(&query_lower)
+                || format!("{:016X}", export.va).contains(query)
+            {
+                results.push(format!(
+                    "导出 0x{:016X} {} ordinal {}",
+                    export.va, export.name, export.ordinal
+                ));
+            }
+        }
+
+        for xref in &analysis.xrefs {
+            let from = format!("{:016X}", xref.from_va);
+            let to = format!("{:016X}", xref.to_va);
+            if from.contains(query) || to.contains(query) || xref.kind.label().contains(query) {
+                results.push(format!("交叉引用 {from} -> {to} {}", xref.kind.label()));
+            }
+        }
+
+        if results.len() == 1 {
+            results.push("没有匹配结果。".to_owned());
+        }
+        results
     }
 }
 

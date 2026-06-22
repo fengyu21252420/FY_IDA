@@ -17,7 +17,7 @@ The project intentionally does not copy IDA code, icons, database formats, or pr
 
 ## Current Status
 
-`v0.3.0-alpha.1` contains the first x64 disassembly MVP. It can start `fy_ida.exe`, open a Windows x64 PE, parse core PE headers and sections, and show real EntryPoint-near instructions in the Chinese GUI and headless output.
+`v0.4.0-alpha.1` contains the first basic static analysis checkpoint. It can start `fy_ida.exe`, open a Windows x64 PE, parse core PE headers and sections, show real EntryPoint-near instructions, and list discovered functions, ASCII/UTF-16LE strings, imports, exports, relocations, and direct code xrefs in the Chinese GUI and headless output.
 
 ## Recovery Strategy
 

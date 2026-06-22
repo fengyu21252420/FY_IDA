@@ -1,6 +1,10 @@
 use std::path::{Path, PathBuf};
 
 pub const APP_NAME: &str = "FY_IDA";
+pub const PE_DIRECTORY_EXPORT: usize = 0;
+pub const PE_DIRECTORY_IMPORT: usize = 1;
+pub const PE_DIRECTORY_BASERELOC: usize = 5;
+pub const PE_DIRECTORY_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSelection {
@@ -84,6 +88,18 @@ impl CoffFileHeader {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PeDataDirectory {
+    pub virtual_address: u32,
+    pub size: u32,
+}
+
+impl PeDataDirectory {
+    pub fn is_present(&self) -> bool {
+        self.virtual_address != 0 && self.size != 0
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeOptionalHeader {
     pub magic: u16,
     pub kind: PeKind,
@@ -95,6 +111,8 @@ pub struct PeOptionalHeader {
     pub size_of_headers: u32,
     pub subsystem: u16,
     pub dll_characteristics: u16,
+    pub number_of_rva_and_sizes: u32,
+    pub data_directories: Vec<PeDataDirectory>,
 }
 
 impl PeOptionalHeader {
@@ -254,6 +272,35 @@ impl PeImage {
     pub fn file_offset_to_va(&self, file_offset: u64) -> Option<u64> {
         self.file_offset_to_rva(file_offset)
             .map(|rva| self.rva_to_va(rva))
+    }
+
+    pub fn data_directory(&self, index: usize) -> Option<&PeDataDirectory> {
+        self.nt_headers.optional_header.data_directories.get(index)
+    }
+
+    pub fn section_containing_rva(&self, rva: u64) -> Option<&PeSection> {
+        self.sections.iter().find(|section| {
+            let start = u64::from(section.virtual_address);
+            let end = start.saturating_add(u64::from(section.mapped_size()));
+            rva >= start && rva < end
+        })
+    }
+
+    pub fn section_containing_va(&self, va: u64) -> Option<&PeSection> {
+        let rva = self.va_to_rva(va)?;
+        self.section_containing_rva(rva)
+    }
+
+    pub fn is_executable_rva(&self, rva: u64) -> bool {
+        self.section_containing_rva(rva)
+            .map(|section| section.characteristics & 0x2000_0000 != 0)
+            .unwrap_or(false)
+    }
+
+    pub fn is_executable_va(&self, va: u64) -> bool {
+        self.va_to_rva(va)
+            .map(|rva| self.is_executable_rva(rva))
+            .unwrap_or(false)
     }
 }
 
@@ -517,6 +564,14 @@ mod tests {
                 size_of_headers: 0x200,
                 subsystem: 3,
                 dll_characteristics: 0x8160,
+                number_of_rva_and_sizes: 16,
+                data_directories: vec![
+                    PeDataDirectory {
+                        virtual_address: 0,
+                        size: 0,
+                    };
+                    16
+                ],
             },
         };
         let sections = vec![PeSection {

@@ -2,8 +2,8 @@ use std::fmt;
 use std::path::{Path, PathBuf};
 
 use fyida_core::{
-    CoffFileHeader, DosHeader, FileSelection, NtHeaders, PeImage, PeKind, PeOptionalHeader,
-    PeSection,
+    CoffFileHeader, DosHeader, FileSelection, NtHeaders, PeDataDirectory, PeImage, PeKind,
+    PeOptionalHeader, PeSection, PE_DIRECTORY_LIMIT,
 };
 
 #[derive(Debug)]
@@ -205,6 +205,44 @@ pub fn parse_pe_bytes(selection: FileSelection, bytes: &[u8]) -> Result<PeImage,
         )?,
     };
 
+    let number_of_rva_and_sizes_offset = optional_header_offset
+        + match kind {
+            PeKind::Pe32 => 92,
+            PeKind::Pe32Plus => 108,
+        };
+    let data_directory_offset = optional_header_offset
+        + match kind {
+            PeKind::Pe32 => 96,
+            PeKind::Pe32Plus => 112,
+        };
+    let number_of_rva_and_sizes =
+        if number_of_rva_and_sizes_offset + 4 <= optional_header_offset + optional_header_size {
+            read_u32(
+                bytes,
+                number_of_rva_and_sizes_offset,
+                "Optional Header NumberOfRvaAndSizes",
+            )?
+        } else {
+            0
+        };
+    let available_directory_count = optional_header_offset
+        .checked_add(optional_header_size)
+        .and_then(|end| end.checked_sub(data_directory_offset))
+        .map(|available| available / 8)
+        .unwrap_or(0);
+    let directory_count = usize::try_from(number_of_rva_and_sizes)
+        .unwrap_or(usize::MAX)
+        .min(available_directory_count)
+        .min(PE_DIRECTORY_LIMIT);
+    let mut data_directories = Vec::with_capacity(directory_count);
+    for index in 0..directory_count {
+        let directory_offset = data_directory_offset + index * 8;
+        data_directories.push(PeDataDirectory {
+            virtual_address: read_u32(bytes, directory_offset, "Data Directory RVA")?,
+            size: read_u32(bytes, directory_offset + 4, "Data Directory Size")?,
+        });
+    }
+
     let optional_header = PeOptionalHeader {
         magic,
         kind,
@@ -244,6 +282,8 @@ pub fn parse_pe_bytes(selection: FileSelection, bytes: &[u8]) -> Result<PeImage,
             optional_header_offset + 70,
             "Optional Header DllCharacteristics",
         )?,
+        number_of_rva_and_sizes,
+        data_directories,
     };
 
     let section_table_offset = optional_header_offset + optional_header_size;
@@ -350,6 +390,9 @@ mod tests {
         write_u32(&mut bytes, optional_header_offset + 60, 0x200);
         write_u16(&mut bytes, optional_header_offset + 68, 3);
         write_u16(&mut bytes, optional_header_offset + 70, 0x8160);
+        write_u32(&mut bytes, optional_header_offset + 108, 16);
+        write_u32(&mut bytes, optional_header_offset + 112, 0x2000);
+        write_u32(&mut bytes, optional_header_offset + 116, 0x40);
 
         bytes[section_offset..section_offset + 5].copy_from_slice(b".text");
         write_u32(&mut bytes, section_offset + 8, 0x300);
@@ -387,6 +430,14 @@ mod tests {
         assert_eq!(image.entry_point_rva(), 0x1010);
         assert_eq!(image.entry_point_va(), 0x1400_01010);
         assert_eq!(image.nt_headers.optional_header.subsystem, 3);
+        assert_eq!(image.nt_headers.optional_header.number_of_rva_and_sizes, 16);
+        assert_eq!(
+            image.data_directory(0),
+            Some(&PeDataDirectory {
+                virtual_address: 0x2000,
+                size: 0x40,
+            })
+        );
         assert_eq!(image.sections[0].name, ".text");
         assert_eq!(image.sections[0].virtual_address, 0x1000);
         assert_eq!(image.sections[0].pointer_to_raw_data, 0x200);

@@ -1,10 +1,23 @@
 use std::fmt;
 
 use fyida_core::{PeImage, PeKind};
-use iced_x86::{Code, Decoder, DecoderOptions, Formatter, IntelFormatter};
+use iced_x86::{
+    Code, Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter,
+};
 
 const DEFAULT_MAX_BYTES: usize = 256;
 pub const DEFAULT_MAX_INSTRUCTIONS: usize = 64;
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum InstructionFlow {
+    Next,
+    DirectCall,
+    IndirectCall,
+    UnconditionalBranch,
+    ConditionalBranch,
+    Return,
+    Other,
+}
 
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct DecodedInstruction {
@@ -13,6 +26,8 @@ pub struct DecodedInstruction {
     pub mnemonic: String,
     pub operands: String,
     pub invalid: bool,
+    pub flow: InstructionFlow,
+    pub near_branch_target: Option<u64>,
 }
 
 impl DecodedInstruction {
@@ -158,6 +173,8 @@ pub fn disassemble_x64(
                 mnemonic: "db".to_owned(),
                 operands: format!("0x{byte:02X}"),
                 invalid,
+                flow: InstructionFlow::Other,
+                near_branch_target: None,
             });
             continue;
         }
@@ -165,6 +182,8 @@ pub fn disassemble_x64(
         let mut formatted = String::new();
         formatter.format(&instruction, &mut formatted);
         let (mnemonic, operands) = split_instruction_text(&formatted);
+        let flow = classify_flow(&instruction);
+        let near_branch_target = direct_branch_target(&instruction, &flow);
 
         rows.push(DecodedInstruction {
             address: instruction.ip(),
@@ -172,10 +191,34 @@ pub fn disassemble_x64(
             mnemonic,
             operands,
             invalid,
+            flow,
+            near_branch_target,
         });
     }
 
     rows
+}
+
+fn classify_flow(instruction: &Instruction) -> InstructionFlow {
+    match instruction.flow_control() {
+        FlowControl::Next => InstructionFlow::Next,
+        FlowControl::Call => InstructionFlow::DirectCall,
+        FlowControl::IndirectCall => InstructionFlow::IndirectCall,
+        FlowControl::UnconditionalBranch => InstructionFlow::UnconditionalBranch,
+        FlowControl::ConditionalBranch => InstructionFlow::ConditionalBranch,
+        FlowControl::Return => InstructionFlow::Return,
+        _ => InstructionFlow::Other,
+    }
+}
+
+fn direct_branch_target(instruction: &Instruction, flow: &InstructionFlow) -> Option<u64> {
+    match flow {
+        InstructionFlow::DirectCall
+        | InstructionFlow::UnconditionalBranch
+        | InstructionFlow::ConditionalBranch => Some(instruction.near_branch_target()),
+        _ => None,
+    }
+    .filter(|target| *target != 0)
 }
 
 fn split_instruction_text(text: &str) -> (String, String) {
@@ -228,6 +271,8 @@ mod tests {
                 size_of_headers: 0x200,
                 subsystem: 3,
                 dll_characteristics: 0x8160,
+                number_of_rva_and_sizes: 16,
+                data_directories: Vec::new(),
             },
         };
         let sections = vec![PeSection {
@@ -264,6 +309,7 @@ mod tests {
         assert_eq!(rows[1].mnemonic, "push");
         assert_eq!(rows[2].mnemonic, "sub");
         assert_eq!(rows[3].mnemonic, "ret");
+        assert_eq!(rows[3].flow, InstructionFlow::Return);
     }
 
     #[test]

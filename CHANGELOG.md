@@ -4,6 +4,40 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.4.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added PE Data Directory parsing for export, import, and base relocation analysis entry points.
+- Added a `StaticAnalysis` model with discovered function summaries, ASCII/UTF-16LE strings, imports, exports, relocations, and direct code xrefs.
+- Added basic recursive function discovery from the x64 EntryPoint through direct call targets.
+- Added direct call/jump target metadata to decoded x64 instructions.
+- Added GUI lists for real functions, names, strings, imports, exports, and basic xrefs.
+- Added GUI search across functions, strings, imports, exports, and direct code xrefs.
+- Added headless static-analysis summary output for command-line verification.
+- Added unit coverage for functions, strings, imports, exports, relocations, and xrefs from a synthetic PE image.
+
+### Changed
+
+- Updated the workspace version to `0.4.0-alpha.1`.
+- Updated GUI, CLI, and README status text for the basic static analysis checkpoint.
+- Limited first-pass string extraction to NUL-terminated strings in non-executable sections to reduce false positives.
+
+### Fixed
+
+- Headless and GUI analysis now share one structured analysis path instead of displaying independent placeholder data.
+
+### Known Issues
+
+- Function discovery is still intentionally conservative and only follows direct call targets from x64 code.
+- Data xrefs for strings/imports are not yet recovered from RIP-relative memory operands.
+- Raw Binary loading, project database save/load, CFG graph rendering, and call graph rendering remain future milestones.
+
+### Recovery
+
+- Source tag: `v0.4.0-alpha.1`.
+- Roll back with: `git checkout v0.4.0-alpha.1`.
+
 ## v0.3.0-alpha.1 - 2026-06-23
 
 ### Added
