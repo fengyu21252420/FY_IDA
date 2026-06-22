@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.19.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added `--search <QUERY>` for headless single-file and batch analysis.
+- Added `--export search` for text and CSV search-result output.
+- Added JSON `search` reports with query, result count, category, optional address, label, and bounded snippet fields.
+- Added report-level search coverage for functions, strings, imports, exports, relocations, xrefs, runtime signatures, PDB records/symbols/types, type libraries, pseudocode, IR, sections, direct addresses, and byte patterns.
+- Added batch `search_results` counts when headless batch analysis is run with `--search`.
+- Added unit coverage for search argument parsing, IR/runtime/type search matches, byte-pattern VA mapping, and CSV search escaping.
+
+### Changed
+
+- Updated the workspace version to `0.19.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the headless-search checkpoint.
+- Python scripts and plugins now receive the search report in `FYIDA_REPORT_JSON` when `--search` is provided.
+
+### Known Issues
+
+- Headless search results are report rows, not interactive jump targets; GUI search remains the interactive navigation path.
+- Byte-pattern search reports at most the first 64 byte hits and the total exported search result set is bounded to avoid oversized reports.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.19.0-alpha.1`.
+- Roll back with: `git checkout v0.19.0-alpha.1`.
+
 ## v0.18.0-alpha.1 - 2026-06-23
 
 ### Added

@@ -17,7 +17,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.18.0-alpha.1 已提供伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.19.0-alpha.1 已提供 headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -65,6 +65,13 @@ pub struct Cli {
         help = "CSV/text 输出的数据范围"
     )]
     pub export: ExportKind,
+
+    #[arg(
+        long,
+        value_name = "QUERY",
+        help = "在 headless 报告中搜索函数、字符串、导入导出、xref、伪代码、IR、类型和字节序列"
+    )]
+    pub search: Option<String>,
 
     #[arg(long, value_name = "OUTPUT", help = "将 headless 报告写入文件")]
     pub output: Option<PathBuf>,
@@ -156,6 +163,7 @@ pub enum ExportKind {
     RuntimeSignatures,
     Pseudocode,
     Ir,
+    Search,
     Types,
 }
 
@@ -165,6 +173,7 @@ struct HeadlessReport {
     input: InputReport,
     analysis: AnalysisReport,
     type_library: TypeLibraryReport,
+    search: Option<SearchReport>,
     messages: Vec<String>,
     elapsed_ms: u128,
 }
@@ -329,6 +338,21 @@ struct TypeLibraryReport {
 }
 
 #[derive(Debug, Serialize)]
+struct SearchReport {
+    query: String,
+    result_count: usize,
+    results: Vec<SearchRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct SearchRecord {
+    category: String,
+    address: Option<u64>,
+    label: String,
+    snippet: String,
+}
+
+#[derive(Debug, Serialize)]
 struct TypeRecord {
     name: String,
     kind: String,
@@ -356,6 +380,7 @@ struct BatchFileReport {
     imports: usize,
     exports: usize,
     xrefs: usize,
+    search_results: usize,
     pdb_symbols: usize,
     pdb_types: usize,
     error: Option<String>,
@@ -499,6 +524,7 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                         imports: 0,
                         exports: 0,
                         xrefs: 0,
+                        search_results: 0,
                         pdb_symbols: 0,
                         pdb_types: 0,
                         error: Some(message),
@@ -527,6 +553,7 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                     imports: 0,
                     exports: 0,
                     xrefs: 0,
+                    search_results: 0,
                     pdb_symbols: 0,
                     pdb_types: 0,
                     error: Some(message),
@@ -568,6 +595,11 @@ fn batch_success(path: String, elapsed_ms: u128, report: HeadlessReport) -> Batc
         imports: report.analysis.imports.len(),
         exports: report.analysis.exports.len(),
         xrefs: report.analysis.xrefs.len(),
+        search_results: report
+            .search
+            .as_ref()
+            .map(|search| search.result_count)
+            .unwrap_or(0),
         pdb_symbols: report.analysis.pdb_symbols.len(),
         pdb_types: report.analysis.pdb_types.len(),
         error: None,
@@ -584,11 +616,22 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
         let mut analysis = fyida_analysis::analyze_raw(&loaded.image, &loaded.bytes);
         let mut messages = type_load.messages.clone();
         apply_signature_libraries(cli, &mut analysis, &mut messages);
+        let input = raw_input_report(&loaded.image, &loaded.bytes);
+        let analysis = analysis_report(&analysis);
+        let type_library = type_library_report(&type_load.types);
+        let search = build_search_report(
+            cli.search.as_deref(),
+            &input,
+            &loaded.bytes,
+            &analysis,
+            &type_library,
+        );
         let mut report = HeadlessReport {
             version: env!("CARGO_PKG_VERSION").to_owned(),
-            input: raw_input_report(&loaded.image, &loaded.bytes),
-            analysis: analysis_report(&analysis),
-            type_library: type_library_report(&type_load.types),
+            input,
+            analysis,
+            type_library,
+            search,
             messages,
             elapsed_ms: started.elapsed().as_millis(),
         };
@@ -620,11 +663,22 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
 
     apply_signature_libraries(cli, &mut analysis, &mut messages);
 
+    let input = pe_input_report(&loaded.image, &loaded.bytes);
+    let analysis = analysis_report(&analysis);
+    let type_library = type_library_report(&type_load.types);
+    let search = build_search_report(
+        cli.search.as_deref(),
+        &input,
+        &loaded.bytes,
+        &analysis,
+        &type_library,
+    );
     let mut report = HeadlessReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
-        input: pe_input_report(&loaded.image, &loaded.bytes),
-        analysis: analysis_report(&analysis),
-        type_library: type_library_report(&type_load.types),
+        input,
+        analysis,
+        type_library,
+        search,
         messages,
         elapsed_ms: started.elapsed().as_millis(),
     };
@@ -988,6 +1042,393 @@ fn type_library_report(types: &[fyida_core::ProjectType]) -> TypeLibraryReport {
     }
 }
 
+const MAX_SEARCH_RESULTS: usize = 512;
+const MAX_BYTE_PATTERN_RESULTS: usize = 64;
+
+fn build_search_report(
+    query: Option<&str>,
+    input: &InputReport,
+    bytes: &[u8],
+    analysis: &AnalysisReport,
+    type_library: &TypeLibraryReport,
+) -> Option<SearchReport> {
+    let query = query?.trim();
+    let mut results = Vec::new();
+    if query.is_empty() {
+        return Some(SearchReport {
+            query: String::new(),
+            result_count: 0,
+            results,
+        });
+    }
+
+    if let Some(address) = parse_number(query) {
+        push_search(
+            &mut results,
+            "address",
+            Some(address),
+            format!("VA 0x{address:016X}"),
+            format!("address query `{query}`"),
+        );
+    }
+
+    if let Some(pattern) = parse_byte_pattern(query) {
+        for file_offset in find_byte_pattern(bytes, &pattern)
+            .into_iter()
+            .take(MAX_BYTE_PATTERN_RESULTS)
+        {
+            let address = file_offset_to_va(input, file_offset);
+            push_search(
+                &mut results,
+                "bytes",
+                address,
+                format!("FO 0x{file_offset:08X}"),
+                format_byte_pattern(&pattern),
+            );
+        }
+    }
+
+    for section in &input.sections {
+        let label = format!(
+            "{} RVA 0x{:08X} FO 0x{:08X} {}",
+            section.name, section.rva, section.file_offset, section.permissions
+        );
+        if matches_text(query, [&section.name, &section.permissions])
+            || address_matches(section.va, query)
+            || address_matches(u64::from(section.rva), query)
+            || address_matches(u64::from(section.file_offset), query)
+        {
+            push_search(&mut results, "section", Some(section.va), label, "section");
+        }
+    }
+
+    for function in &analysis.functions {
+        if matches_text(query, [&function.name]) || address_matches(function.start_va, query) {
+            push_search(
+                &mut results,
+                "function",
+                Some(function.start_va),
+                function.name.clone(),
+                format!(
+                    "size 0x{:X}, instructions {}, calls {}",
+                    function.size, function.instruction_count, function.call_count
+                ),
+            );
+        }
+    }
+
+    for string in &analysis.strings {
+        if matches_text(query, [&string.value, &string.encoding])
+            || address_matches(string.address, query)
+            || address_matches(string.file_offset, query)
+        {
+            push_search(
+                &mut results,
+                "string",
+                Some(string.address),
+                format!("{} string", string.encoding),
+                string.value.clone(),
+            );
+        }
+    }
+
+    for import in &analysis.imports {
+        let name = import.name.as_deref().unwrap_or("");
+        if matches_text(query, [&import.display_name, &import.dll, name])
+            || address_matches(import.thunk_va, query)
+            || address_matches(u64::from(import.thunk_rva), query)
+        {
+            push_search(
+                &mut results,
+                "import",
+                Some(import.thunk_va),
+                import.display_name.clone(),
+                format!("{} hint {:?}", import.dll, import.hint),
+            );
+        }
+    }
+
+    for export in &analysis.exports {
+        if matches_text(query, [&export.name])
+            || address_matches(export.va, query)
+            || address_matches(u64::from(export.rva), query)
+        {
+            push_search(
+                &mut results,
+                "export",
+                Some(export.va),
+                export.name.clone(),
+                format!("ordinal {}", export.ordinal),
+            );
+        }
+    }
+
+    for relocation in &analysis.relocations {
+        if matches_text(query, [&relocation.kind])
+            || address_matches(relocation.va, query)
+            || address_matches(u64::from(relocation.rva), query)
+        {
+            push_search(
+                &mut results,
+                "relocation",
+                Some(relocation.va),
+                relocation.kind.clone(),
+                format!("page RVA 0x{:08X}", relocation.page_rva),
+            );
+        }
+    }
+
+    for xref in &analysis.xrefs {
+        if matches_text(query, [&xref.kind, &xref.label])
+            || address_matches(xref.from_va, query)
+            || address_matches(xref.to_va, query)
+        {
+            push_search(
+                &mut results,
+                "xref",
+                Some(xref.from_va),
+                format!("{:016X} -> {:016X}", xref.from_va, xref.to_va),
+                format!("{} {}", xref.kind, xref.label),
+            );
+        }
+    }
+
+    for signature in &analysis.runtime_signatures {
+        if matches_text(
+            query,
+            [
+                &signature.name,
+                &signature.kind,
+                &signature.target,
+                &signature.library,
+                &signature.evidence,
+            ],
+        ) || address_matches(signature.address, query)
+        {
+            push_search(
+                &mut results,
+                "runtime_signature",
+                Some(signature.address),
+                signature.name.clone(),
+                format!(
+                    "{} / {} / confidence {} / {}",
+                    signature.kind, signature.library, signature.confidence, signature.evidence
+                ),
+            );
+        }
+    }
+
+    for function in &analysis.pseudocode_functions {
+        if matches_text(query, [&function.name]) || address_matches(function.function_start, query)
+        {
+            push_search(
+                &mut results,
+                "pseudocode_function",
+                Some(function.function_start),
+                function.name.clone(),
+                "generated pseudocode function",
+            );
+        }
+        for (index, line) in function.lines.iter().enumerate() {
+            let address = function.line_addresses.get(index).copied().flatten();
+            if matches_text(query, [line.as_str()])
+                || address
+                    .map(|address| address_matches(address, query))
+                    .unwrap_or(false)
+            {
+                push_search(
+                    &mut results,
+                    "pseudocode",
+                    address,
+                    function.name.clone(),
+                    line.clone(),
+                );
+            }
+        }
+
+        for instruction in &function.ir {
+            let text = ir_search_text(&instruction.op, &instruction.args, &instruction.comment);
+            if matches_text(query, [text.as_str()]) || address_matches(instruction.address, query) {
+                push_search(
+                    &mut results,
+                    "ir",
+                    Some(instruction.address),
+                    function.name.clone(),
+                    text,
+                );
+            }
+        }
+    }
+
+    for record in &analysis.pdb_records {
+        if matches_text(query, [&record.format, &record.path])
+            || address_matches(u64::from(record.debug_rva), query)
+            || address_matches(u64::from(record.debug_file_offset), query)
+        {
+            push_search(
+                &mut results,
+                "pdb_record",
+                None,
+                record.format.clone(),
+                record.path.clone(),
+            );
+        }
+    }
+
+    for symbol in &analysis.pdb_symbols {
+        if matches_text(
+            query,
+            [
+                &symbol.kind,
+                &symbol.name,
+                &symbol.original_name,
+                &symbol.source,
+            ],
+        ) || symbol
+            .address
+            .map(|address| address_matches(address, query))
+            .unwrap_or(false)
+            || symbol
+                .rva
+                .map(|rva| address_matches(u64::from(rva), query))
+                .unwrap_or(false)
+        {
+            push_search(
+                &mut results,
+                "pdb_symbol",
+                symbol.address,
+                symbol.name.clone(),
+                format!("{} {}", symbol.kind, symbol.source),
+            );
+        }
+    }
+
+    for type_item in &analysis.pdb_types {
+        if matches_text(query, [&type_item.name, &type_item.kind, &type_item.source]) {
+            push_search(
+                &mut results,
+                "pdb_type",
+                None,
+                type_item.name.clone(),
+                format!("{} {}", type_item.kind, type_item.source),
+            );
+        }
+    }
+
+    for type_item in &type_library.types {
+        if matches_text(
+            query,
+            [
+                &type_item.name,
+                &type_item.kind,
+                &type_item.source,
+                &type_item.signature,
+            ],
+        ) {
+            push_search(
+                &mut results,
+                "type",
+                None,
+                type_item.name.clone(),
+                type_item.signature.clone(),
+            );
+        }
+    }
+
+    Some(SearchReport {
+        query: query.to_owned(),
+        result_count: results.len(),
+        results,
+    })
+}
+
+fn push_search(
+    results: &mut Vec<SearchRecord>,
+    category: &str,
+    address: Option<u64>,
+    label: impl Into<String>,
+    snippet: impl Into<String>,
+) {
+    if results.len() >= MAX_SEARCH_RESULTS {
+        return;
+    }
+    results.push(SearchRecord {
+        category: category.to_owned(),
+        address,
+        label: label.into(),
+        snippet: search_snippet(&snippet.into()),
+    });
+}
+
+fn matches_text<T>(query: &str, fields: impl IntoIterator<Item = T>) -> bool
+where
+    T: AsRef<str>,
+{
+    let query = query.to_lowercase();
+    fields
+        .into_iter()
+        .any(|field| field.as_ref().to_lowercase().contains(&query))
+}
+
+fn address_matches(address: u64, query: &str) -> bool {
+    let query = query
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+    format!("{address:016X}").to_lowercase().contains(&query)
+}
+
+fn file_offset_to_va(input: &InputReport, file_offset: u64) -> Option<u64> {
+    if input.kind.starts_with("Raw") {
+        return input
+            .base_address
+            .and_then(|base| base.checked_add(file_offset));
+    }
+
+    if let Some(first_section_offset) = input
+        .sections
+        .iter()
+        .map(|section| u64::from(section.file_offset))
+        .min()
+    {
+        if file_offset < first_section_offset {
+            return input
+                .image_base
+                .and_then(|base| base.checked_add(file_offset));
+        }
+    }
+
+    input.sections.iter().find_map(|section| {
+        let start = u64::from(section.file_offset);
+        let delta = file_offset.checked_sub(start)?;
+        (delta < u64::from(section.raw_size)).then_some(section.va + delta)
+    })
+}
+
+fn ir_search_text(op: &str, args: &[String], comment: &str) -> String {
+    let args = args.join(", ");
+    if comment.trim().is_empty() {
+        format!("{op} {args}")
+    } else {
+        format!("{op} {args} ; {comment}")
+    }
+}
+
+fn search_snippet(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let snippet = chars.by_ref().take(96).collect::<String>();
+    if chars.next().is_some() {
+        format!("{snippet}...")
+    } else {
+        snippet
+    }
+}
+
 fn emit_single_report(cli: &Cli, report: &HeadlessReport) -> Result<(), String> {
     let encoded = match cli.export_format {
         ExportFormat::Text => text_report(report, cli.export),
@@ -1044,6 +1485,7 @@ fn text_report(report: &HeadlessReport, kind: ExportKind) -> String {
         }
         ExportKind::Pseudocode => text_pseudocode(&report.analysis.pseudocode_functions),
         ExportKind::Ir => text_ir(&report.analysis.pseudocode_functions),
+        ExportKind::Search => text_search(report.search.as_ref()),
         ExportKind::Types => text_types(&report.type_library.types),
     }
 }
@@ -1102,6 +1544,13 @@ fn text_full_report(report: &HeadlessReport) -> String {
         "  RuntimeSignatures: {}",
         report.analysis.runtime_signatures.len()
     );
+    if let Some(search) = &report.search {
+        let _ = writeln!(
+            text,
+            "  Search: {} matches for `{}`",
+            search.result_count, search.query
+        );
+    }
     for signature in report.analysis.runtime_signatures.iter().take(32) {
         let _ = writeln!(
             text,
@@ -1147,6 +1596,9 @@ fn text_summary_report(report: &HeadlessReport) -> String {
         "RuntimeSignatures: {}",
         report.analysis.runtime_signatures.len()
     );
+    if let Some(search) = &report.search {
+        let _ = writeln!(text, "SearchResults: {}", search.result_count);
+    }
     let _ = writeln!(text, "TypeLibrary: {}", report.type_library.count);
     text
 }
@@ -1287,6 +1739,35 @@ fn text_types(types: &[TypeRecord]) -> String {
     text
 }
 
+fn text_search(search: Option<&SearchReport>) -> String {
+    let mut text = String::from("Search\n");
+    let Some(search) = search else {
+        let _ = writeln!(text, "No search query.");
+        return text;
+    };
+    let _ = writeln!(
+        text,
+        "Query: {}\nResults: {}",
+        search.query, search.result_count
+    );
+    if search.results.is_empty() {
+        let _ = writeln!(text, "No matches.");
+        return text;
+    }
+    for result in &search.results {
+        let address = result
+            .address
+            .map(format_va)
+            .unwrap_or_else(|| "-".to_owned());
+        let _ = writeln!(
+            text,
+            "{}\t{}\t{}\t{}",
+            result.category, address, result.label, result.snippet
+        );
+    }
+    text
+}
+
 fn text_batch_report(report: &BatchReport) -> String {
     let mut text = String::new();
     let ok_count = report
@@ -1304,13 +1785,14 @@ fn text_batch_report(report: &BatchReport) -> String {
     for entry in &report.files {
         let _ = writeln!(
             text,
-            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\t{}",
+            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\tsearch {}\t{}",
             entry.status,
             entry.path,
             entry.functions,
             entry.strings,
             entry.imports,
             entry.xrefs,
+            entry.search_results,
             entry.error.as_deref().unwrap_or("")
         );
     }
@@ -1330,6 +1812,7 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
         }
         ExportKind::Pseudocode => csv_pseudocode(&report.analysis.pseudocode_functions),
         ExportKind::Ir => csv_ir(&report.analysis.pseudocode_functions),
+        ExportKind::Search => csv_search(report.search.as_ref()),
         ExportKind::Types => csv_types(&report.type_library.types),
         ExportKind::All => {
             let mut csv = String::new();
@@ -1380,6 +1863,16 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
                     &report.analysis.runtime_signatures.len().to_string(),
                 ],
             );
+            if let Some(search) = &report.search {
+                push_csv_row(
+                    &mut csv,
+                    &[
+                        "summary",
+                        "search_results",
+                        &search.result_count.to_string(),
+                    ],
+                );
+            }
             push_csv_row(
                 &mut csv,
                 &[
@@ -1427,6 +1920,12 @@ fn csv_summary(report: &HeadlessReport) -> String {
             &report.analysis.runtime_signatures.len().to_string(),
         ],
     );
+    if let Some(search) = &report.search {
+        push_csv_row(
+            &mut csv,
+            &["search_results", &search.result_count.to_string()],
+        );
+    }
     push_csv_row(
         &mut csv,
         &["type_library", &report.type_library.count.to_string()],
@@ -1604,9 +2103,30 @@ fn csv_types(types: &[TypeRecord]) -> String {
     csv
 }
 
+fn csv_search(search: Option<&SearchReport>) -> String {
+    let mut csv = String::from("query,category,address,label,snippet\n");
+    let Some(search) = search else {
+        return csv;
+    };
+    for result in &search.results {
+        let address = result.address.map(format_va).unwrap_or_default();
+        push_csv_row(
+            &mut csv,
+            &[
+                &search.query,
+                &result.category,
+                &address,
+                &result.label,
+                &result.snippet,
+            ],
+        );
+    }
+    csv
+}
+
 fn csv_batch_report(report: &BatchReport) -> String {
     let mut csv = String::from(
-        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,pdb_symbols,pdb_types,error\n",
+        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,pdb_symbols,pdb_types,error\n",
     );
     for entry in &report.files {
         push_csv_row(
@@ -1620,6 +2140,7 @@ fn csv_batch_report(report: &BatchReport) -> String {
                 &entry.imports.to_string(),
                 &entry.exports.to_string(),
                 &entry.xrefs.to_string(),
+                &entry.search_results.to_string(),
                 &entry.pdb_symbols.to_string(),
                 &entry.pdb_types.to_string(),
                 entry.error.as_deref().unwrap_or(""),
@@ -1754,6 +2275,54 @@ fn parse_number(text: &str) -> Option<u64> {
         .or_else(|| text.parse::<u64>().ok())
 }
 
+fn parse_byte_pattern(text: &str) -> Option<Vec<u8>> {
+    let normalized = text
+        .replace("\\x", " ")
+        .replace("\\X", " ")
+        .replace(',', " ")
+        .replace('-', " ");
+    let tokens = normalized
+        .split_whitespace()
+        .filter(|token| !token.is_empty())
+        .collect::<Vec<_>>();
+    if tokens.is_empty() {
+        return None;
+    }
+
+    let mut bytes = Vec::new();
+    for token in tokens {
+        let token = token
+            .strip_prefix("0x")
+            .or_else(|| token.strip_prefix("0X"))
+            .unwrap_or(token);
+        if token.len() > 2 || token.is_empty() || !token.chars().all(|ch| ch.is_ascii_hexdigit()) {
+            return None;
+        }
+        let value = u8::from_str_radix(token, 16).ok()?;
+        bytes.push(value);
+    }
+    Some(bytes)
+}
+
+fn find_byte_pattern(bytes: &[u8], pattern: &[u8]) -> Vec<u64> {
+    if pattern.is_empty() || pattern.len() > bytes.len() {
+        return Vec::new();
+    }
+    bytes
+        .windows(pattern.len())
+        .enumerate()
+        .filter_map(|(offset, window)| (window == pattern).then_some(offset as u64))
+        .collect()
+}
+
+fn format_byte_pattern(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1815,6 +2384,86 @@ mod tests {
     }
 
     #[test]
+    fn parses_search_query_and_export_kind() {
+        let cli = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--search",
+            "MessageBoxW",
+            "--export",
+            "search",
+            "sample.exe",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.search.as_deref(), Some("MessageBoxW"));
+        assert_eq!(cli.export, ExportKind::Search);
+    }
+
+    #[test]
+    fn search_report_finds_pseudocode_ir_runtime_and_types() {
+        let input = sample_input_report();
+        let analysis = sample_analysis_report();
+        let types = sample_type_library_report();
+
+        let search =
+            build_search_report(Some("quoted"), &input, b"MZ\x90\x00", &analysis, &types).unwrap();
+
+        assert!(
+            search
+                .results
+                .iter()
+                .any(|result| result.category == "ir"
+                    && result.address == Some(0x0000_0001_4000_1004))
+        );
+        assert!(search
+            .results
+            .iter()
+            .any(|result| result.category == "runtime_signature"));
+        assert!(search
+            .results
+            .iter()
+            .any(|result| result.category == "type" && result.label == "QUOTED_TYPE"));
+    }
+
+    #[test]
+    fn search_report_maps_byte_pattern_offsets_to_va() {
+        let input = sample_input_report();
+        let analysis = sample_analysis_report();
+        let types = sample_type_library_report();
+
+        let search =
+            build_search_report(Some("4D 5A"), &input, b"MZ\x90\x00", &analysis, &types).unwrap();
+
+        assert!(search.results.iter().any(|result| {
+            result.category == "bytes"
+                && result.address == Some(0x0000_0001_4000_1000)
+                && result.label == "FO 0x00000000"
+        }));
+    }
+
+    #[test]
+    fn csv_search_export_includes_category_address_label_and_snippet() {
+        let search = SearchReport {
+            query: "quoted".to_owned(),
+            result_count: 1,
+            results: vec![SearchRecord {
+                category: "ir".to_owned(),
+                address: Some(0x0000_0001_4000_1004),
+                label: "sub_test".to_owned(),
+                snippet: "ret rax ; returns, quoted \"value\"".to_owned(),
+            }],
+        };
+
+        let csv = csv_search(Some(&search));
+
+        assert!(csv.starts_with("query,category,address,label,snippet\n"));
+        assert!(csv.contains(
+            "quoted,ir,0000000140001004,sub_test,\"ret rax ; returns, quoted \"\"value\"\"\""
+        ));
+    }
+
+    #[test]
     fn csv_pseudocode_export_includes_function_line_and_address() {
         let functions = vec![sample_pseudocode_record()];
 
@@ -1862,6 +2511,94 @@ mod tests {
                 op: "ret".to_owned(),
                 args: vec!["rax".to_owned()],
                 comment: "returns, quoted \"value\"".to_owned(),
+            }],
+        }
+    }
+
+    fn sample_input_report() -> InputReport {
+        InputReport {
+            path: "sample.exe".to_owned(),
+            kind: "PE".to_owned(),
+            size_bytes: 4,
+            sha256: "test".to_owned(),
+            arch: Some("x64".to_owned()),
+            base_address: Some(0x0000_0001_4000_0000),
+            entry_va: Some(0x0000_0001_4000_1000),
+            entry_rva_or_offset: Some(0x1000),
+            image_base: Some(0x0000_0001_4000_0000),
+            machine: Some("x64".to_owned()),
+            subsystem: Some("console".to_owned()),
+            sections: vec![SectionReport {
+                name: ".text".to_owned(),
+                rva: 0x1000,
+                va: 0x0000_0001_4000_1000,
+                file_offset: 0,
+                virtual_size: 4,
+                raw_size: 4,
+                permissions: "R-X".to_owned(),
+            }],
+        }
+    }
+
+    fn sample_analysis_report() -> AnalysisReport {
+        AnalysisReport {
+            functions: vec![FunctionRecord {
+                start_va: 0x0000_0001_4000_1000,
+                name: "sub_test".to_owned(),
+                size: 0x10,
+                instruction_count: 3,
+                call_count: 1,
+            }],
+            strings: vec![StringRecord {
+                address: 0x0000_0001_4000_2000,
+                file_offset: 0x200,
+                encoding: "ASCII".to_owned(),
+                value: "MessageBoxW quoted".to_owned(),
+            }],
+            imports: vec![ImportRecord {
+                thunk_va: 0x0000_0001_4000_3000,
+                thunk_rva: 0x3000,
+                dll: "USER32.dll".to_owned(),
+                name: Some("MessageBoxW".to_owned()),
+                ordinal: None,
+                hint: Some(1),
+                display_name: "USER32.dll!MessageBoxW".to_owned(),
+            }],
+            exports: Vec::new(),
+            relocations: Vec::new(),
+            xrefs: vec![XrefRecord {
+                from_va: 0x0000_0001_4000_1004,
+                to_va: 0x0000_0001_4000_3000,
+                kind: "call".to_owned(),
+                label: "quoted import".to_owned(),
+            }],
+            cfg_count: 1,
+            call_graph_nodes: 1,
+            call_graph_edges: 1,
+            pseudocode_functions: vec![sample_pseudocode_record()],
+            runtime_signatures: vec![RuntimeSignatureRecord {
+                address: 0x0000_0001_4000_1000,
+                name: "sub_test".to_owned(),
+                kind: "user signature".to_owned(),
+                target: "function".to_owned(),
+                library: "test".to_owned(),
+                evidence: "quoted evidence".to_owned(),
+                confidence: 80,
+            }],
+            pdb_records: Vec::new(),
+            pdb_symbols: Vec::new(),
+            pdb_types: Vec::new(),
+        }
+    }
+
+    fn sample_type_library_report() -> TypeLibraryReport {
+        TypeLibraryReport {
+            count: 1,
+            types: vec![TypeRecord {
+                name: "QUOTED_TYPE".to_owned(),
+                kind: "typedef".to_owned(),
+                source: "test".to_owned(),
+                signature: "typedef int QUOTED_TYPE;".to_owned(),
             }],
         }
     }
