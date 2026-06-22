@@ -23,6 +23,7 @@ const MAX_PDB_SYMBOLS: usize = 8192;
 const MAX_PDB_TYPES: usize = 2048;
 const MAX_PDB_SOURCES: usize = 1024;
 const MAX_DEBUG_DIRECTORY_ENTRIES: usize = 128;
+const MAX_RUNTIME_SIGNATURES: usize = 2048;
 const MIN_STRING_CHARS: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -51,6 +52,7 @@ pub struct StaticAnalysis {
     pub function_cfgs: Vec<FunctionCfg>,
     pub call_graph: CallGraph,
     pub pseudocode_functions: Vec<PseudocodeFunction>,
+    pub runtime_signatures: Vec<RuntimeSignature>,
     pub pe_pdb_records: Vec<PePdbRecord>,
     pub loaded_pdb: Option<LoadedPdbInfo>,
     pub pdb_symbols: Vec<PdbSymbol>,
@@ -161,6 +163,57 @@ pub struct IrInstruction {
     pub op: String,
     pub args: Vec<String>,
     pub comment: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuntimeSignatureKind {
+    CrtStartup,
+    SecurityCookie,
+    ExceptionHandling,
+    MemoryRoutine,
+    RuntimeImport,
+    Pattern,
+}
+
+impl RuntimeSignatureKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::CrtStartup => "CRT startup",
+            Self::SecurityCookie => "security cookie",
+            Self::ExceptionHandling => "exception handling",
+            Self::MemoryRoutine => "memory routine",
+            Self::RuntimeImport => "runtime import",
+            Self::Pattern => "runtime pattern",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum RuntimeSignatureTarget {
+    Function,
+    Import,
+    Pattern,
+}
+
+impl RuntimeSignatureTarget {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Function => "function",
+            Self::Import => "import",
+            Self::Pattern => "pattern",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RuntimeSignature {
+    pub address: u64,
+    pub name: String,
+    pub kind: RuntimeSignatureKind,
+    pub target: RuntimeSignatureTarget,
+    pub library: String,
+    pub evidence: String,
+    pub confidence: u8,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -393,6 +446,7 @@ pub fn analyze_pe(image: &PeImage, bytes: &[u8]) -> StaticAnalysis {
         &analysis.function_cfgs,
         &analysis.call_graph,
     );
+    analysis.runtime_signatures = build_runtime_signatures(&analysis);
     analysis
 }
 
@@ -414,6 +468,7 @@ pub fn analyze_raw(image: &RawImage, bytes: &[u8]) -> StaticAnalysis {
         &analysis.function_cfgs,
         &analysis.call_graph,
     );
+    analysis.runtime_signatures = build_runtime_signatures(&analysis);
     analysis
 }
 
@@ -429,6 +484,10 @@ pub fn static_analysis_log_lines(analysis: &StaticAnalysis) -> Vec<String> {
         format!(
             "伪 C/IR 生成：{} 个函数。",
             analysis.pseudocode_functions.len()
+        ),
+        format!(
+            "Runtime signatures: {} matches",
+            analysis.runtime_signatures.len()
         ),
         format!(
             "调用图：{} 个节点 / {} 条边。",
@@ -555,7 +614,7 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.12.0-alpha.1，基础 x64 伪 C/IR 输出已接入。".to_owned(),
+        "当前版本：v0.13.0-alpha.1，Runtime 签名识别和基础 x64 伪 C/IR 已接入。".to_owned(),
         "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串、基础引用和图数据。"
             .to_owned(),
     ]
@@ -671,6 +730,7 @@ pub fn apply_pdb_file(
     analysis.pdb_sources = sources;
     overlay_pdb_function_names(image, analysis);
     refresh_pseudocode(analysis);
+    refresh_runtime_signatures(analysis);
 
     Ok(PdbLoadSummary {
         loaded,
@@ -693,6 +753,7 @@ pub fn apply_pdb_snapshot(
     analysis.pdb_sources = sources;
     overlay_pdb_names_only(analysis);
     refresh_pseudocode(analysis);
+    refresh_runtime_signatures(analysis);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1106,6 +1167,279 @@ fn refresh_pseudocode(analysis: &mut StaticAnalysis) {
         &analysis.function_cfgs,
         &analysis.call_graph,
     );
+}
+
+fn refresh_runtime_signatures(analysis: &mut StaticAnalysis) {
+    analysis.runtime_signatures = build_runtime_signatures(analysis);
+}
+
+fn build_runtime_signatures(analysis: &StaticAnalysis) -> Vec<RuntimeSignature> {
+    let mut signatures = Vec::new();
+
+    for import in &analysis.imports {
+        let display_name = import.display_name();
+        let import_name = import.name.as_deref().unwrap_or(&display_name);
+        if let Some((kind, library, confidence)) = classify_runtime_name(import_name) {
+            push_runtime_signature(
+                &mut signatures,
+                RuntimeSignature {
+                    address: import.thunk_va,
+                    name: display_name.clone(),
+                    kind,
+                    target: RuntimeSignatureTarget::Import,
+                    library: runtime_library_label(&import.dll)
+                        .unwrap_or(library)
+                        .to_owned(),
+                    evidence: format!("import name matched `{import_name}`"),
+                    confidence,
+                },
+            );
+        } else if let Some(library) = runtime_library_label(&import.dll) {
+            push_runtime_signature(
+                &mut signatures,
+                RuntimeSignature {
+                    address: import.thunk_va,
+                    name: display_name,
+                    kind: RuntimeSignatureKind::RuntimeImport,
+                    target: RuntimeSignatureTarget::Import,
+                    library: library.to_owned(),
+                    evidence: format!("runtime DLL `{}`", import.dll),
+                    confidence: 70,
+                },
+            );
+        }
+    }
+
+    for function in &analysis.functions {
+        if let Some((kind, library, confidence)) = classify_runtime_name(&function.name) {
+            push_runtime_signature(
+                &mut signatures,
+                RuntimeSignature {
+                    address: function.start_va,
+                    name: function.name.clone(),
+                    kind,
+                    target: RuntimeSignatureTarget::Function,
+                    library: library.to_owned(),
+                    evidence: format!("function name matched `{}`", function.name),
+                    confidence,
+                },
+            );
+        }
+    }
+
+    if let Some(entry) = detect_crt_startup_function(analysis, &signatures) {
+        push_runtime_signature(
+            &mut signatures,
+            RuntimeSignature {
+                address: entry.start_va,
+                name: entry.name.clone(),
+                kind: RuntimeSignatureKind::CrtStartup,
+                target: RuntimeSignatureTarget::Function,
+                library: "MSVC CRT".to_owned(),
+                evidence: "entry function has multiple CRT startup imports".to_owned(),
+                confidence: 78,
+            },
+        );
+    }
+
+    for cfg in &analysis.function_cfgs {
+        if has_memory_routine_pattern(cfg) {
+            let name = analysis
+                .functions
+                .iter()
+                .find(|function| function.start_va == cfg.function_start)
+                .map(|function| function.name.clone())
+                .unwrap_or_else(|| format!("sub_{:016X}", cfg.function_start));
+            push_runtime_signature(
+                &mut signatures,
+                RuntimeSignature {
+                    address: cfg.function_start,
+                    name,
+                    kind: RuntimeSignatureKind::MemoryRoutine,
+                    target: RuntimeSignatureTarget::Pattern,
+                    library: "CRT".to_owned(),
+                    evidence: "function contains repeated movs/stos memory instruction pattern"
+                        .to_owned(),
+                    confidence: 62,
+                },
+            );
+        }
+    }
+
+    signatures.sort_by_key(|signature| {
+        (
+            signature.address,
+            signature.target,
+            signature.kind,
+            std::cmp::Reverse(signature.confidence),
+        )
+    });
+    let mut seen = BTreeSet::new();
+    signatures
+        .retain(|signature| seen.insert((signature.address, signature.target, signature.kind)));
+    signatures.truncate(MAX_RUNTIME_SIGNATURES);
+    signatures
+}
+
+fn push_runtime_signature(signatures: &mut Vec<RuntimeSignature>, signature: RuntimeSignature) {
+    if signatures.len() < MAX_RUNTIME_SIGNATURES {
+        signatures.push(signature);
+    }
+}
+
+fn classify_runtime_name(name: &str) -> Option<(RuntimeSignatureKind, &'static str, u8)> {
+    let normalized = normalize_runtime_name(name);
+    let stripped = normalized
+        .trim_start_matches('_')
+        .trim_start_matches('@')
+        .to_owned();
+
+    if normalized.contains("security_check_cookie")
+        || normalized.contains("security_cookie")
+        || normalized.contains("gsfailure")
+    {
+        return Some((RuntimeSignatureKind::SecurityCookie, "MSVC Runtime", 96));
+    }
+
+    if contains_any(
+        &normalized,
+        &[
+            "__c_specific_handler",
+            "c_specific_handler",
+            "rtlvirtualunwind",
+            "rtlcapturecontext",
+            "rtllookupfunctionentry",
+            "unhandledexceptionfilter",
+            "setunhandledexceptionfilter",
+            "__current_exception",
+            "__current_exception_context",
+            "_seh_filter_exe",
+            "seh_filter_exe",
+            "cxxframehandler",
+            "cxxthrowexception",
+        ],
+    ) {
+        return Some((RuntimeSignatureKind::ExceptionHandling, "MSVC Runtime", 92));
+    }
+
+    if matches!(
+        stripped.as_str(),
+        "memcpy"
+            | "memmove"
+            | "memset"
+            | "memcmp"
+            | "memchr"
+            | "memcpy_s"
+            | "memmove_s"
+            | "memset_s"
+    ) || contains_any(&normalized, &["__movsb", "__stosb", "__movsd", "__stosd"])
+    {
+        return Some((RuntimeSignatureKind::MemoryRoutine, "CRT", 90));
+    }
+
+    if is_crt_startup_name(&normalized, &stripped) {
+        return Some((RuntimeSignatureKind::CrtStartup, "MSVC CRT", 88));
+    }
+
+    None
+}
+
+fn normalize_runtime_name(name: &str) -> String {
+    let without_module = name.rsplit('!').next().unwrap_or(name);
+    without_module
+        .trim()
+        .trim_matches('`')
+        .trim_matches('"')
+        .to_ascii_lowercase()
+}
+
+fn contains_any(value: &str, needles: &[&str]) -> bool {
+    needles.iter().any(|needle| value.contains(needle))
+}
+
+fn is_crt_startup_name(normalized: &str, stripped: &str) -> bool {
+    const CRT_SUBSTRINGS: &[&str] = &[
+        "_configure_narrow_argv",
+        "_get_narrow_winmain_command_line",
+        "_initialize_narrow_environment",
+        "_initialize_onexit_table",
+        "_register_onexit_function",
+        "_register_thread_local_exe_atexit_callback",
+        "_initterm",
+        "_initterm_e",
+        "_set_app_type",
+        "_set_new_mode",
+        "_set_fmode",
+        "_c_exit",
+        "_cexit",
+        "maincrtstartup",
+        "winmaincrtstartup",
+        "__scrt_",
+        "__vcrt_",
+        "__acrt_",
+    ];
+    contains_any(normalized, CRT_SUBSTRINGS)
+        || matches!(
+            stripped,
+            "exit" | "terminate" | "abort" | "atexit" | "getmainargs" | "wgetmainargs"
+        )
+}
+
+fn runtime_library_label(dll: &str) -> Option<&'static str> {
+    let lower = dll.to_ascii_lowercase();
+    if lower.contains("api-ms-win-crt") || lower.contains("ucrt") {
+        Some("Universal CRT")
+    } else if lower.contains("vcruntime") {
+        Some("MSVC Runtime")
+    } else if lower.contains("msvcp") {
+        Some("MSVC C++ Runtime")
+    } else if lower == "msvcrt.dll" || lower.contains("msvcrt") {
+        Some("MSVCRT")
+    } else if lower.contains("concrt") {
+        Some("Concurrency Runtime")
+    } else {
+        None
+    }
+}
+
+fn detect_crt_startup_function<'a>(
+    analysis: &'a StaticAnalysis,
+    signatures: &[RuntimeSignature],
+) -> Option<&'a FunctionSummary> {
+    let crt_imports = signatures
+        .iter()
+        .filter(|signature| {
+            signature.target == RuntimeSignatureTarget::Import
+                && matches!(
+                    signature.kind,
+                    RuntimeSignatureKind::CrtStartup | RuntimeSignatureKind::RuntimeImport
+                )
+        })
+        .count();
+    if crt_imports < 3 {
+        return None;
+    }
+
+    analysis
+        .functions
+        .iter()
+        .find(|function| {
+            let name = function.name.to_ascii_lowercase();
+            name.contains("entry") || name.contains("crtstartup")
+        })
+        .or_else(|| analysis.functions.first())
+}
+
+fn has_memory_routine_pattern(cfg: &FunctionCfg) -> bool {
+    cfg.blocks.iter().any(|block| {
+        block.instructions.iter().any(|instruction| {
+            let mnemonic = instruction.mnemonic.to_ascii_lowercase();
+            mnemonic.contains("movs")
+                || mnemonic.contains("stos")
+                || mnemonic.contains("rep movs")
+                || mnemonic.contains("rep stos")
+        })
+    })
 }
 
 fn build_pseudocode_functions(
@@ -2622,6 +2956,26 @@ mod tests {
                 && edge.to_va == 0x1800_00003
                 && edge.kind == CfgEdgeKind::Fallthrough
         }));
+    }
+
+    #[test]
+    fn classifies_common_msvc_runtime_names() {
+        assert_eq!(
+            classify_runtime_name("__security_check_cookie").map(|(kind, _, _)| kind),
+            Some(RuntimeSignatureKind::SecurityCookie)
+        );
+        assert_eq!(
+            classify_runtime_name("__C_specific_handler").map(|(kind, _, _)| kind),
+            Some(RuntimeSignatureKind::ExceptionHandling)
+        );
+        assert_eq!(
+            classify_runtime_name("memcpy").map(|(kind, _, _)| kind),
+            Some(RuntimeSignatureKind::MemoryRoutine)
+        );
+        assert_eq!(
+            classify_runtime_name("_initialize_onexit_table").map(|(kind, _, _)| kind),
+            Some(RuntimeSignatureKind::CrtStartup)
+        );
     }
 
     #[test]

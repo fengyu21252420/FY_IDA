@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.13.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a runtime signature model to `StaticAnalysis` with kind, target, library, evidence, and confidence metadata.
+- Added conservative MSVC/CRT runtime recognition for security-cookie helpers, CRT startup helpers, exception-handling helpers, memory routines, and runtime DLL imports.
+- Added a small instruction-pattern heuristic for memcpy/memset-style memory routines.
+- Added runtime-signature output to headless JSON, text, CSV summary, and dedicated CSV exports.
+- Added runtime-signature labels to the GUI function list, names list, property panel, disassembly row comments, and global search.
+- Added unit coverage for common MSVC runtime-name classification.
+
+### Changed
+
+- Updated the workspace version to `0.13.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the runtime-signature checkpoint.
+- PDB function-name overlays now refresh runtime signatures in addition to pseudo-C/IR names.
+
+### Known Issues
+
+- Runtime recognition is rule-based and intentionally conservative; it does not yet import external user signature libraries.
+- Pattern matching can only flag simple movs/stos-style memory routines and does not yet hash or compare full function bodies.
+- Library filtering/folding in graph views remains future work; current UI labels expose the classification but do not hide runtime functions.
+
+### Recovery
+
+- Source tag: `v0.13.0-alpha.1`.
+- Roll back with: `git checkout v0.13.0-alpha.1`.
+
 ## v0.12.0-alpha.1 - 2026-06-23
 
 ### Added

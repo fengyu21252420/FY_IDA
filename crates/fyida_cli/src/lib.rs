@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.12.0-alpha.1 已提供基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.13.0-alpha.1 已提供运行库签名识别、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -110,6 +110,7 @@ pub enum ExportKind {
     Imports,
     Exports,
     Xrefs,
+    RuntimeSignatures,
     Types,
 }
 
@@ -162,6 +163,7 @@ struct AnalysisReport {
     call_graph_nodes: usize,
     call_graph_edges: usize,
     pseudocode_functions: Vec<PseudocodeRecord>,
+    runtime_signatures: Vec<RuntimeSignatureRecord>,
     pdb_records: Vec<PdbRecord>,
     pdb_symbols: Vec<PdbSymbolRecord>,
     pdb_types: Vec<PdbTypeRecord>,
@@ -233,6 +235,17 @@ struct IrRecord {
     op: String,
     args: Vec<String>,
     comment: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RuntimeSignatureRecord {
+    address: u64,
+    name: String,
+    kind: String,
+    target: String,
+    library: String,
+    evidence: String,
+    confidence: u8,
 }
 
 #[derive(Debug, Serialize)]
@@ -827,6 +840,19 @@ fn analysis_report(analysis: &StaticAnalysis) -> AnalysisReport {
                     .collect(),
             })
             .collect(),
+        runtime_signatures: analysis
+            .runtime_signatures
+            .iter()
+            .map(|signature| RuntimeSignatureRecord {
+                address: signature.address,
+                name: signature.name.clone(),
+                kind: signature.kind.label().to_owned(),
+                target: signature.target.label().to_owned(),
+                library: signature.library.clone(),
+                evidence: signature.evidence.clone(),
+                confidence: signature.confidence,
+            })
+            .collect(),
         pdb_records: analysis
             .pe_pdb_records
             .iter()
@@ -970,6 +996,23 @@ fn text_report(report: &HeadlessReport) -> String {
         "  Pseudocode：{} functions",
         report.analysis.pseudocode_functions.len()
     );
+    let _ = writeln!(
+        text,
+        "  RuntimeSignatures: {}",
+        report.analysis.runtime_signatures.len()
+    );
+    for signature in report.analysis.runtime_signatures.iter().take(32) {
+        let _ = writeln!(
+            text,
+            "    {:016X} [{}:{}] {} {} confidence {}",
+            signature.address,
+            signature.target,
+            signature.kind,
+            signature.library,
+            signature.name,
+            signature.confidence
+        );
+    }
     let _ = writeln!(text, "  PDBRecords：{}", report.analysis.pdb_records.len());
     let _ = writeln!(text, "  PDBSymbols：{}", report.analysis.pdb_symbols.len());
     let _ = writeln!(text, "  PDBTypes：{}", report.analysis.pdb_types.len());
@@ -1022,6 +1065,9 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Imports => csv_imports(&report.analysis.imports),
         ExportKind::Exports => csv_exports(&report.analysis.exports),
         ExportKind::Xrefs => csv_xrefs(&report.analysis.xrefs),
+        ExportKind::RuntimeSignatures => {
+            csv_runtime_signatures(&report.analysis.runtime_signatures)
+        }
         ExportKind::Types => csv_types(&report.type_library.types),
         ExportKind::All => {
             let mut csv = String::new();
@@ -1060,6 +1106,14 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
                 &mut csv,
                 &[
                     "summary",
+                    "runtime_signatures",
+                    &report.analysis.runtime_signatures.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
                     "type_library",
                     &report.type_library.count.to_string(),
                 ],
@@ -1088,6 +1142,13 @@ fn csv_summary(report: &HeadlessReport) -> String {
     push_csv_row(
         &mut csv,
         &["xrefs", &report.analysis.xrefs.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "runtime_signatures",
+            &report.analysis.runtime_signatures.len().to_string(),
+        ],
     );
     push_csv_row(
         &mut csv,
@@ -1179,6 +1240,25 @@ fn csv_xrefs(xrefs: &[XrefRecord]) -> String {
                 &format!("{:016X}", xref.to_va),
                 &xref.kind,
                 &xref.label,
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_runtime_signatures(signatures: &[RuntimeSignatureRecord]) -> String {
+    let mut csv = String::from("address,name,kind,target,library,evidence,confidence\n");
+    for signature in signatures {
+        push_csv_row(
+            &mut csv,
+            &[
+                &format!("{:016X}", signature.address),
+                &signature.name,
+                &signature.kind,
+                &signature.target,
+                &signature.library,
+                &signature.evidence,
+                &signature.confidence.to_string(),
             ],
         );
     }

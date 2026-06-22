@@ -12,7 +12,7 @@ use fyida_analysis::{
     file_error_log_lines, pdb_candidate_paths, pe_entry_disassembly, pe_loaded_log_lines,
     raw_entry_disassembly, raw_loaded_log_lines, startup_log_lines, static_analysis_log_lines,
     DisassemblyRow, LoadedPdbInfo, PdbSourceFile as AnalysisPdbSourceFile, PdbSymbol,
-    PdbSymbolKind, PdbTypeSummary, StaticAnalysis,
+    PdbSymbolKind, PdbTypeSummary, RuntimeSignature, StaticAnalysis,
 };
 use fyida_core::{
     export_c_header_types, format_address, import_c_header_types, sha256_hex, EnumVariant,
@@ -1368,8 +1368,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.12.0-alpha.1");
-                        ui.label("基础 x64 伪 C 与 IR 输出 MVP。");
+                        ui.label("FY_IDA v0.13.0-alpha.1");
+                        ui.label("Runtime 签名识别与基础 x64 伪 C/IR MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -1544,6 +1544,12 @@ impl FyIdaApp {
                         .find(|cfg| cfg.function_start == function.start_va)
                         .map(|cfg| cfg.blocks.len())
                         .unwrap_or(0);
+                    let runtime_label = analysis
+                        .runtime_signatures
+                        .iter()
+                        .find(|signature| signature.address == function.start_va)
+                        .map(|signature| format!(" / runtime {}", signature.kind.label()))
+                        .unwrap_or_default();
                     (
                         function.start_va,
                         format!("{:016X}", function.start_va),
@@ -1554,7 +1560,7 @@ impl FyIdaApp {
                         format!(
                             "{} 条指令 / {} 个块 / {} 次调用",
                             function.instruction_count, block_count, function.call_count
-                        ),
+                        ) + &runtime_label,
                     )
                 })
                 .collect::<Vec<_>>()
@@ -1629,6 +1635,14 @@ impl FyIdaApp {
                 .iter()
                 .map(|import| (import.thunk_va, import.display_name(), "导入".to_owned())),
         );
+
+        rows.extend(analysis.runtime_signatures.iter().map(|signature| {
+            (
+                signature.address,
+                signature.name.clone(),
+                format!("runtime {}", signature.kind.label()),
+            )
+        }));
 
         rows.extend(analysis.pdb_symbols.iter().filter_map(|symbol| {
             Some((
@@ -1970,6 +1984,17 @@ impl FyIdaApp {
                             ui.label("地址类型");
                             ui.label(self.project.applied_address_type(address).unwrap_or("-"));
                             ui.end_row();
+
+                            if let Some(signature) = self.runtime_signature_at(address) {
+                                ui.label("Runtime");
+                                ui.label(format!(
+                                    "{} / {} / {}%",
+                                    signature.kind.label(),
+                                    signature.library,
+                                    signature.confidence
+                                ));
+                                ui.end_row();
+                            }
                         }
 
                         if let Some(function_start) = self.current_function_start() {
@@ -2759,6 +2784,13 @@ impl FyIdaApp {
         if let Some(symbol) = self.pdb_symbol_at(row.address) {
             parts.push(format!("PDB: {}", symbol.display_name()));
         }
+        if let Some(signature) = self.runtime_signature_at(row.address) {
+            parts.push(format!(
+                "runtime: {} {}%",
+                signature.kind.label(),
+                signature.confidence
+            ));
+        }
         if let Some(type_name) = self.project.applied_address_type(row.address) {
             parts.push(format!("type: {type_name}"));
         }
@@ -3413,6 +3445,27 @@ impl FyIdaApp {
             }
         }
 
+        for signature in &analysis.runtime_signatures {
+            if signature.name.to_lowercase().contains(&query_lower)
+                || signature.kind.label().to_lowercase().contains(&query_lower)
+                || signature.library.to_lowercase().contains(&query_lower)
+                || signature.evidence.to_lowercase().contains(&query_lower)
+                || address_matches(signature.address, query)
+            {
+                results.push(SearchResult::jump(
+                    format!(
+                        "Runtime 0x{:016X} [{}] {} {}%",
+                        signature.address,
+                        signature.kind.label(),
+                        signature.name,
+                        signature.confidence
+                    ),
+                    signature.address,
+                    signature.kind.label(),
+                ));
+            }
+        }
+
         for export in &analysis.exports {
             if export.name.to_lowercase().contains(&query_lower)
                 || address_matches(export.va, query)
@@ -3492,6 +3545,14 @@ impl FyIdaApp {
             results.push(SearchResult::plain("没有匹配结果。"));
         }
         results
+    }
+
+    fn runtime_signature_at(&self, address: u64) -> Option<&RuntimeSignature> {
+        self.analysis
+            .as_ref()?
+            .runtime_signatures
+            .iter()
+            .find(|signature| signature.address == address)
     }
 
     fn pdb_symbol_at(&self, address: u64) -> Option<&PdbSymbol> {
