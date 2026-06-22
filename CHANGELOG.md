@@ -4,6 +4,38 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.27.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added flat `instruction_records` to headless JSON reports with function, basic-block, address, bytes, mnemonic, operands, flow, and branch-target context.
+- Added `--export instructions` for text and CSV decoded-instruction output.
+- Added flat instruction coverage to headless search results through the `instruction` category.
+- Updated `examples/python/fyida.py` so `project.instructions()` prefers flat instruction records and falls back to CFG-nested instructions for older reports.
+- Added `examples/scripts/list_instructions.py` for instruction traversal scripting examples.
+- Added CLI unit coverage for instruction export parsing, text/CSV output, and instruction search hits.
+
+### Changed
+
+- Updated the workspace version to `0.27.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the headless instruction export checkpoint.
+- Headless summaries now include flat instruction counts alongside CFG, call graph, pseudocode, automation, and type counts.
+
+### Fixed
+
+- Python scripts no longer need to walk nested CFG blocks just to traverse decoded instructions in new headless reports.
+
+### Known Issues
+
+- Flat instruction records reflect the current discovered CFG/function model; undiscovered code remains outside the export.
+- Instruction export is analysis output only and does not yet include user-applied type or stack-variable annotations.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.27.0-alpha.1`.
+- Roll back with: `git checkout v0.27.0-alpha.1`.
+
 ## v0.26.0-alpha.1 - 2026-06-23
 
 ### Added

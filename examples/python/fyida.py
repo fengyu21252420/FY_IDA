@@ -113,15 +113,26 @@ class Project:
         ]
 
     def instructions(self, function_start=None, query=None):
-        instructions = []
-        for cfg in self._selected_cfgs(function_start):
-            for block in cfg.get("blocks", []):
-                for instruction in block.get("instructions", []):
-                    item = dict(instruction)
-                    item["function_start"] = cfg.get("function_start")
-                    item["block_start"] = block.get("start_va")
-                    item["block_end"] = block.get("end_va")
-                    instructions.append(Record(item))
+        instructions = self._records("instruction_records")
+        if function_start is not None:
+            target = parse_address(function_start)
+            instructions = [
+                item
+                for item in instructions
+                if item.get("function_start") == target
+                or item.get("block_start") == target
+                or item.get("address") == target
+            ]
+        if not instructions:
+            instructions = []
+            for cfg in self._selected_cfgs(function_start):
+                for block in cfg.get("blocks", []):
+                    for instruction in block.get("instructions", []):
+                        item = dict(instruction)
+                        item["function_start"] = cfg.get("function_start")
+                        item["block_start"] = block.get("start_va")
+                        item["block_end"] = block.get("end_va")
+                        instructions.append(Record(item))
         if not query:
             return instructions
         needle = query.casefold()
