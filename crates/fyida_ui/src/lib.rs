@@ -1444,8 +1444,10 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.15.0-alpha.1");
-                        ui.label("运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。");
+                        ui.label("FY_IDA v0.16.0-alpha.1");
+                        ui.label(
+                            "正式 headless analyze 入口、运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。",
+                        );
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });

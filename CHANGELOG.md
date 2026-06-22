@@ -4,6 +4,30 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.16.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added the formal `fy_ida.exe --headless analyze <FILE>` entry form requested by the development plan.
+- Added CLI parsing helpers that distinguish GUI preselected files, legacy headless file input, and the new `analyze` command shape.
+- Added CLI unit coverage for legacy `--headless <FILE>`, new `--headless analyze <FILE>`, batch `--headless analyze --batch-dir <DIR>`, and invalid command-like input.
+
+### Changed
+
+- Updated the workspace version to `0.16.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the formal-headless-analyze checkpoint.
+- Kept the older `fy_ida.exe --headless <FILE>` form working for existing scripts while documenting the planned `analyze <FILE>` form.
+
+### Known Issues
+
+- The CLI still uses top-level options rather than a full nested clap subcommand tree, so `analyze` is parsed as a compatibility command token.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.16.0-alpha.1`.
+- Roll back with: `git checkout v0.16.0-alpha.1`.
+
 ## v0.15.0-alpha.1 - 2026-06-23
 
 ### Added

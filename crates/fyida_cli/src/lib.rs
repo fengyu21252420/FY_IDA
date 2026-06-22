@@ -10,12 +10,14 @@ use fyida_core::{sha256_hex, RawArch};
 use fyida_loader::RawLoadOptions;
 use serde::{Deserialize, Serialize};
 
+const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
+
 #[derive(Debug, Parser)]
 #[command(
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.15.0-alpha.1 已提供本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.16.0-alpha.1 已提供 `--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -96,8 +98,43 @@ pub struct Cli {
     #[arg(long = "plugin", value_name = "ID", help = "运行指定插件 ID；可重复")]
     pub plugins: Vec<String>,
 
-    #[arg(value_name = "FILE", help = "启动 GUI 时预选的输入文件路径")]
-    pub file: Option<PathBuf>,
+    #[arg(
+        value_name = "COMMAND_OR_FILE",
+        num_args = 0..=2,
+        help = "GUI 预选文件；headless 可使用 analyze <FILE> 或直接 <FILE>"
+    )]
+    pub positionals: Vec<PathBuf>,
+}
+
+impl Cli {
+    pub fn gui_file(&self) -> Option<PathBuf> {
+        if self.uses_analyze_command() {
+            self.positionals.get(1).cloned()
+        } else {
+            self.positionals.first().cloned()
+        }
+    }
+
+    pub fn headless_input_file(&self) -> Result<Option<&Path>, String> {
+        if self.uses_analyze_command() {
+            return Ok(self.positionals.get(1).map(PathBuf::as_path));
+        }
+        if self.positionals.len() > 1 {
+            return Err(format!(
+                "未知 headless 命令 `{}`；请使用 `analyze <FILE>` 或直接提供 `<FILE>`。",
+                self.positionals[0].display()
+            ));
+        }
+        Ok(self.positionals.first().map(PathBuf::as_path))
+    }
+
+    fn uses_analyze_command(&self) -> bool {
+        self.positionals
+            .first()
+            .and_then(|value| value.to_str())
+            .map(|value| value.eq_ignore_ascii_case(HEADLESS_ANALYZE_COMMAND))
+            .unwrap_or(false)
+    }
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
@@ -344,6 +381,21 @@ struct PluginManifest {
 }
 
 pub fn run_headless(cli: &Cli) -> i32 {
+    let input_file = match cli.headless_input_file() {
+        Ok(file) => file,
+        Err(message) => {
+            let _ = write_errors(
+                cli,
+                &[BatchError {
+                    path: "-".to_owned(),
+                    message: message.clone(),
+                }],
+            );
+            eprintln!("{message}");
+            return 2;
+        }
+    };
+
     let type_load = match load_cli_types(cli) {
         Ok(types) => types,
         Err(message) => {
@@ -363,7 +415,7 @@ pub fn run_headless(cli: &Cli) -> i32 {
         return run_batch(cli, batch_dir, &type_load);
     }
 
-    let Some(file) = &cli.file else {
+    let Some(file) = input_file else {
         let message = "FY_IDA headless 模式需要提供输入文件，或使用 --batch-dir。".to_owned();
         let _ = write_errors(
             cli,
@@ -1452,4 +1504,48 @@ fn parse_number(text: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16)
         .ok()
         .or_else(|| text.parse::<u64>().ok())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn parses_legacy_headless_file_argument() {
+        let cli = Cli::try_parse_from(["fy_ida", "--headless", "sample.exe"]).unwrap();
+
+        assert_eq!(
+            cli.headless_input_file().unwrap(),
+            Some(Path::new("sample.exe"))
+        );
+        assert_eq!(cli.gui_file(), Some(PathBuf::from("sample.exe")));
+    }
+
+    #[test]
+    fn parses_headless_analyze_command() {
+        let cli = Cli::try_parse_from(["fy_ida", "--headless", "analyze", "sample.exe"]).unwrap();
+
+        assert_eq!(
+            cli.headless_input_file().unwrap(),
+            Some(Path::new("sample.exe"))
+        );
+        assert_eq!(cli.gui_file(), Some(PathBuf::from("sample.exe")));
+    }
+
+    #[test]
+    fn allows_analyze_command_with_batch_dir() {
+        let cli =
+            Cli::try_parse_from(["fy_ida", "--headless", "analyze", "--batch-dir", "samples"])
+                .unwrap();
+
+        assert_eq!(cli.headless_input_file().unwrap(), None);
+        assert_eq!(cli.batch_dir, Some(PathBuf::from("samples")));
+    }
+
+    #[test]
+    fn rejects_unknown_headless_command_shape() {
+        let cli = Cli::try_parse_from(["fy_ida", "--headless", "inspect", "sample.exe"]).unwrap();
+
+        assert!(cli.headless_input_file().is_err());
+    }
 }
