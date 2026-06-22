@@ -17,7 +17,7 @@ The project intentionally does not copy IDA code, icons, database formats, or pr
 
 ## Current Status
 
-`v0.1.0-alpha.2` contains the first runnable Rust workspace and a Chinese GUI shell. It can start `fy_ida.exe`, display the FY Classic layout, and select a file while marking it as not yet analyzed.
+`v0.3.0-alpha.1` contains the first x64 disassembly MVP. It can start `fy_ida.exe`, open a Windows x64 PE, parse core PE headers and sections, and show real EntryPoint-near instructions in the Chinese GUI and headless output.
 
 ## Recovery Strategy
 

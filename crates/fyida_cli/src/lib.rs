@@ -7,7 +7,7 @@ use clap::Parser;
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.2.0-alpha.1 已提供 PE Header 解析 MVP。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.3.0-alpha.1 已提供 x64 入口点反汇编 MVP。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -23,8 +23,9 @@ pub fn run_headless(cli: &Cli) -> i32 {
         return 2;
     };
 
-    match fyida_loader::load_pe_file(file) {
-        Ok(image) => {
+    match fyida_loader::load_pe_file_with_bytes(file) {
+        Ok(loaded) => {
+            let image = loaded.image;
             println!("PE 加载完成：{}", image.file().path().display());
             println!(
                 "Machine：{} (0x{:04X})",
@@ -50,6 +51,30 @@ pub fn run_headless(cli: &Cli) -> i32 {
                     section.size_of_raw_data,
                     section.permissions()
                 );
+            }
+
+            match fyida_disasm::disassemble_entry_point(&image, &loaded.bytes) {
+                Ok(instructions) => {
+                    println!("入口点反汇编：");
+                    for instruction in instructions {
+                        let comment = if instruction.invalid {
+                            " ; 无效 x64 指令占位"
+                        } else {
+                            ""
+                        };
+                        println!(
+                            "  {:016X}  {:<24} {:<8} {}{}",
+                            instruction.address,
+                            instruction.bytes_text(),
+                            instruction.mnemonic,
+                            instruction.operands,
+                            comment
+                        );
+                    }
+                }
+                Err(error) => {
+                    println!("反汇编提示：{error}");
+                }
             }
             0
         }

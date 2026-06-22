@@ -78,6 +78,12 @@ impl fmt::Display for PeParseError {
 
 impl std::error::Error for PeParseError {}
 
+#[derive(Debug, Clone)]
+pub struct LoadedPeFile {
+    pub image: PeImage,
+    pub bytes: Vec<u8>,
+}
+
 pub fn load_file_metadata(path: impl AsRef<Path>) -> Result<FileSelection, LoaderError> {
     let path = path.as_ref().to_path_buf();
     let metadata = std::fs::metadata(&path).map_err(|source| LoaderError::Metadata {
@@ -93,18 +99,31 @@ pub fn load_file_metadata(path: impl AsRef<Path>) -> Result<FileSelection, Loade
 }
 
 pub fn load_pe_from_selection(selection: FileSelection) -> Result<PeImage, LoaderError> {
+    load_pe_from_selection_with_bytes(selection).map(|loaded| loaded.image)
+}
+
+pub fn load_pe_from_selection_with_bytes(
+    selection: FileSelection,
+) -> Result<LoadedPeFile, LoaderError> {
     let path = selection.path().to_path_buf();
     let bytes = std::fs::read(&path).map_err(|source| LoaderError::Read {
         path: path.clone(),
         source,
     })?;
 
-    parse_pe_bytes(selection, &bytes).map_err(|source| LoaderError::InvalidPe { path, source })
+    let image = parse_pe_bytes(selection, &bytes)
+        .map_err(|source| LoaderError::InvalidPe { path, source })?;
+    Ok(LoadedPeFile { image, bytes })
 }
 
 pub fn load_pe_file(path: impl AsRef<Path>) -> Result<PeImage, LoaderError> {
     let selection = load_file_metadata(path)?;
     load_pe_from_selection(selection)
+}
+
+pub fn load_pe_file_with_bytes(path: impl AsRef<Path>) -> Result<LoadedPeFile, LoaderError> {
+    let selection = load_file_metadata(path)?;
+    load_pe_from_selection_with_bytes(selection)
 }
 
 pub fn parse_pe_bytes(selection: FileSelection, bytes: &[u8]) -> Result<PeImage, PeParseError> {

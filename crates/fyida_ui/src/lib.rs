@@ -7,10 +7,11 @@ use eframe::egui::{
     Visuals, Window,
 };
 use fyida_analysis::{
-    file_error_log_lines, pe_loaded_log_lines, placeholder_disassembly, startup_log_lines,
+    empty_workspace_disassembly, file_error_log_lines, pe_entry_disassembly, pe_loaded_log_lines,
+    startup_log_lines, DisassemblyRow,
 };
 use fyida_core::{format_address, FileSelection, ProjectState, APP_NAME};
-use fyida_loader::{load_file_metadata, load_pe_from_selection};
+use fyida_loader::{load_file_metadata, load_pe_from_selection_with_bytes};
 use rfd::FileDialog;
 
 const LEFT_TABS: [&str; 7] = ["函数", "名称", "字符串", "导入", "导出", "段", "书签"];
@@ -55,6 +56,7 @@ struct FyIdaApp {
     search_text: String,
     logs: Vec<String>,
     search_results: Vec<String>,
+    disassembly_rows: Vec<DisassemblyRow>,
     recent_files: VecDeque<PathBuf>,
 }
 
@@ -76,6 +78,7 @@ impl FyIdaApp {
             search_text: String::new(),
             logs: startup_log_lines(),
             search_results: vec!["尚未执行搜索。".to_owned()],
+            disassembly_rows: empty_workspace_disassembly(),
             recent_files: VecDeque::new(),
         };
 
@@ -103,6 +106,7 @@ impl FyIdaApp {
             Err(error) => {
                 let message = error.to_string();
                 self.project.set_error(message.clone());
+                self.disassembly_rows = file_error_disassembly_row(&message);
                 self.logs.push(message);
                 self.right_tab = 1;
                 self.bottom_tab = 0;
@@ -113,14 +117,17 @@ impl FyIdaApp {
     fn load_selected_file(&mut self, selection: FileSelection) {
         self.add_recent_file(selection.path().to_path_buf());
 
-        match load_pe_from_selection(selection.clone()) {
-            Ok(image) => self.apply_pe_image(image),
+        match load_pe_from_selection_with_bytes(selection.clone()) {
+            Ok(loaded) => self.apply_pe_image(loaded.image, &loaded.bytes),
             Err(error) => self.apply_file_error(selection, error.to_string()),
         }
     }
 
-    fn apply_pe_image(&mut self, image: fyida_core::PeImage) {
+    fn apply_pe_image(&mut self, image: fyida_core::PeImage, bytes: &[u8]) {
+        let disassembly = pe_entry_disassembly(&image, bytes);
         self.logs.extend(pe_loaded_log_lines(&image));
+        self.logs.extend(disassembly.log_lines);
+        self.disassembly_rows = disassembly.rows;
         self.project.load_pe(image);
         self.center_tab = 0;
         self.right_tab = 1;
@@ -130,6 +137,8 @@ impl FyIdaApp {
     fn apply_file_error(&mut self, selection: FileSelection, message: String) {
         self.logs.extend(file_error_log_lines(&selection, &message));
         self.project.set_file_error(selection, message);
+        self.disassembly_rows =
+            file_error_disassembly_row("不是有效的 PE 文件，无法进行 x64 反汇编。");
         self.center_tab = 0;
         self.right_tab = 1;
         self.bottom_tab = 0;
@@ -269,8 +278,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.2.0-alpha.1");
-                        ui.label("PE Loader MVP。");
+                        ui.label("FY_IDA v0.3.0-alpha.1");
+                        ui.label("x64 入口点反汇编 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -636,7 +645,7 @@ impl FyIdaApp {
                     ui.strong("注释");
                     ui.end_row();
 
-                    for row in placeholder_disassembly(self.project.pe_image()) {
+                    for row in self.disassembly_rows.clone() {
                         let address = format!("{:08X}", row.address);
                         if ui
                             .selectable_label(false, RichText::new(address).color(address_color()))
@@ -930,6 +939,16 @@ fn placeholder_list(ui: &mut Ui, rows: &[&str]) {
     for row in rows {
         ui.label(*row);
     }
+}
+
+fn file_error_disassembly_row(message: &str) -> Vec<DisassemblyRow> {
+    vec![DisassemblyRow {
+        address: 0,
+        bytes: "--".to_owned(),
+        mnemonic: "错误".to_owned(),
+        operands: String::new(),
+        comment: message.to_owned(),
+    }]
 }
 
 fn log_view(ui: &mut Ui, logs: &[String]) {

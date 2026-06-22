@@ -1,5 +1,5 @@
 [package]
-name = "fyida_analysis"
+name = "fyida_disasm"
 version.workspace = true
 edition.workspace = true
 rust-version.workspace = true
@@ -7,7 +7,7 @@ publish = false
 
 [dependencies]
 fyida_core.workspace = true
-fyida_disasm.workspace = true
+iced-x86.workspace = true
 
 [lib]
 path = "src/lib.rs"

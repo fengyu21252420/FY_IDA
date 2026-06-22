@@ -4,6 +4,38 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.3.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a `fyida_disasm` crate backed by `iced-x86` for x64 instruction decoding.
+- Added PE EntryPoint disassembly from mapped `.text` bytes with address, machine-code bytes, mnemonic, and operands.
+- Added GUI disassembly rows that show real x64 EntryPoint instructions after opening a supported PE.
+- Added headless EntryPoint disassembly output for command-line verification.
+- Added unit tests for x64 decoding, invalid-instruction placeholder rows, and non-x64 PE error messaging.
+
+### Changed
+
+- Updated the workspace version to `0.3.0-alpha.1`.
+- Updated GUI and CLI version text for the x64 disassembly MVP.
+- Extended the loader API so callers can receive parsed PE metadata and original file bytes from one read.
+
+### Fixed
+
+- Invalid x64 instruction bytes now render as clear `db` placeholder rows instead of stopping analysis.
+- Loading a failed/non-PE file no longer leaves the previous disassembly rows visible in the GUI.
+
+### Known Issues
+
+- Function discovery, imports, exports, relocations, strings, and xrefs are still future milestones.
+- Disassembly is linear near the PE EntryPoint and does not yet follow control flow.
+- Non-x64 PE files are loaded at the PE Header level but are not disassembled.
+
+### Recovery
+
+- Source tag: `v0.3.0-alpha.1`.
+- Roll back with: `git checkout v0.3.0-alpha.1`.
+
 ## v0.2.0-alpha.1 - 2026-06-23
 
 ### Added
