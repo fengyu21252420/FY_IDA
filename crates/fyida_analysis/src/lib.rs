@@ -10,6 +10,7 @@ use fyida_disasm::{
     InstructionFlow,
 };
 use pdb::FallibleIterator;
+use serde::{Deserialize, Serialize};
 
 const MAX_FUNCTIONS: usize = 256;
 const MAX_FUNCTION_BYTES: usize = 4096;
@@ -173,6 +174,7 @@ pub enum RuntimeSignatureKind {
     MemoryRoutine,
     RuntimeImport,
     Pattern,
+    UserSignature,
 }
 
 impl RuntimeSignatureKind {
@@ -184,6 +186,7 @@ impl RuntimeSignatureKind {
             Self::MemoryRoutine => "memory routine",
             Self::RuntimeImport => "runtime import",
             Self::Pattern => "runtime pattern",
+            Self::UserSignature => "user signature",
         }
     }
 }
@@ -214,6 +217,31 @@ pub struct RuntimeSignature {
     pub library: String,
     pub evidence: String,
     pub confidence: u8,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureLibrary {
+    pub name: String,
+    pub version: Option<String>,
+    #[serde(default, alias = "signatures")]
+    pub rules: Vec<SignatureRule>,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct SignatureRule {
+    pub id: Option<String>,
+    pub name: String,
+    pub kind: Option<String>,
+    pub library: Option<String>,
+    pub target: Option<String>,
+    pub evidence: Option<String>,
+    pub confidence: Option<u8>,
+    #[serde(default)]
+    pub import_name_contains: Vec<String>,
+    #[serde(default)]
+    pub import_dll_contains: Vec<String>,
+    #[serde(default)]
+    pub function_name_contains: Vec<String>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -614,7 +642,7 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.13.0-alpha.1，Runtime 签名识别和基础 x64 伪 C/IR 已接入。".to_owned(),
+        "当前版本：v0.14.0-alpha.1，本地签名库、Runtime 识别和基础 x64 伪 C/IR 已接入。".to_owned(),
         "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串、基础引用和图数据。"
             .to_owned(),
     ]
@@ -754,6 +782,24 @@ pub fn apply_pdb_snapshot(
     overlay_pdb_names_only(analysis);
     refresh_pseudocode(analysis);
     refresh_runtime_signatures(analysis);
+}
+
+pub fn load_signature_library_file(path: impl AsRef<Path>) -> Result<SignatureLibrary, String> {
+    let path = path.as_ref();
+    let text = std::fs::read_to_string(path)
+        .map_err(|source| format!("无法读取签名库 {}：{source}", path.display()))?;
+    let library: SignatureLibrary = serde_json::from_str(&text)
+        .map_err(|source| format!("签名库 JSON 格式无效 {}：{source}", path.display()))?;
+    validate_signature_library(&library)?;
+    Ok(library)
+}
+
+pub fn apply_signature_library(analysis: &mut StaticAnalysis, library: &SignatureLibrary) -> usize {
+    let mut matches = build_signature_library_matches(analysis, library);
+    let count = matches.len();
+    analysis.runtime_signatures.append(&mut matches);
+    sort_and_dedup_runtime_signatures(&mut analysis.runtime_signatures);
+    count
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1173,6 +1219,163 @@ fn refresh_runtime_signatures(analysis: &mut StaticAnalysis) {
     analysis.runtime_signatures = build_runtime_signatures(analysis);
 }
 
+fn validate_signature_library(library: &SignatureLibrary) -> Result<(), String> {
+    if library.name.trim().is_empty() {
+        return Err("签名库 name 不能为空。".to_owned());
+    }
+    if library.rules.is_empty() {
+        return Err("签名库 rules 不能为空。".to_owned());
+    }
+    for rule in &library.rules {
+        if rule.name.trim().is_empty() {
+            return Err("签名规则 name 不能为空。".to_owned());
+        }
+        if rule.import_name_contains.is_empty()
+            && rule.import_dll_contains.is_empty()
+            && rule.function_name_contains.is_empty()
+        {
+            return Err(format!(
+                "签名规则 `{}` 至少需要一个 import_name_contains、import_dll_contains 或 function_name_contains 条件。",
+                rule.name
+            ));
+        }
+    }
+    Ok(())
+}
+
+fn build_signature_library_matches(
+    analysis: &StaticAnalysis,
+    library: &SignatureLibrary,
+) -> Vec<RuntimeSignature> {
+    let mut signatures = Vec::new();
+    for rule in &library.rules {
+        if rule_targets_import(rule) {
+            for import in &analysis.imports {
+                if rule_matches_import(rule, import) {
+                    push_runtime_signature(
+                        &mut signatures,
+                        RuntimeSignature {
+                            address: import.thunk_va,
+                            name: format!("{} ({})", rule.name, import.display_name()),
+                            kind: signature_rule_kind(rule),
+                            target: RuntimeSignatureTarget::Import,
+                            library: signature_rule_library(library, rule),
+                            evidence: signature_rule_evidence(library, rule, import.display_name()),
+                            confidence: signature_rule_confidence(rule),
+                        },
+                    );
+                }
+            }
+        }
+
+        if rule_targets_function(rule) {
+            for function in &analysis.functions {
+                if rule_matches_function(rule, function) {
+                    push_runtime_signature(
+                        &mut signatures,
+                        RuntimeSignature {
+                            address: function.start_va,
+                            name: format!("{} ({})", rule.name, function.name),
+                            kind: signature_rule_kind(rule),
+                            target: RuntimeSignatureTarget::Function,
+                            library: signature_rule_library(library, rule),
+                            evidence: signature_rule_evidence(library, rule, function.name.clone()),
+                            confidence: signature_rule_confidence(rule),
+                        },
+                    );
+                }
+            }
+        }
+    }
+    sort_and_dedup_runtime_signatures(&mut signatures);
+    signatures
+}
+
+fn rule_targets_import(rule: &SignatureRule) -> bool {
+    rule.target
+        .as_deref()
+        .map(|target| target.eq_ignore_ascii_case("import"))
+        .unwrap_or(true)
+        && (!rule.import_name_contains.is_empty() || !rule.import_dll_contains.is_empty())
+}
+
+fn rule_targets_function(rule: &SignatureRule) -> bool {
+    rule.target
+        .as_deref()
+        .map(|target| target.eq_ignore_ascii_case("function"))
+        .unwrap_or(true)
+        && !rule.function_name_contains.is_empty()
+}
+
+fn rule_matches_import(rule: &SignatureRule, import: &ImportSymbol) -> bool {
+    all_needles_match(&rule.import_name_contains, &import.display_name())
+        && all_needles_match(&rule.import_dll_contains, &import.dll)
+}
+
+fn rule_matches_function(rule: &SignatureRule, function: &FunctionSummary) -> bool {
+    all_needles_match(&rule.function_name_contains, &function.name)
+}
+
+fn all_needles_match(needles: &[String], haystack: &str) -> bool {
+    let haystack = haystack.to_ascii_lowercase();
+    needles
+        .iter()
+        .all(|needle| haystack.contains(&needle.to_ascii_lowercase()))
+}
+
+fn signature_rule_kind(rule: &SignatureRule) -> RuntimeSignatureKind {
+    match rule
+        .kind
+        .as_deref()
+        .unwrap_or_default()
+        .trim()
+        .to_ascii_lowercase()
+        .as_str()
+    {
+        "crt" | "crt_startup" | "crt-startup" | "startup" => RuntimeSignatureKind::CrtStartup,
+        "security" | "security_cookie" | "security-cookie" => RuntimeSignatureKind::SecurityCookie,
+        "exception" | "exception_handling" | "exception-handling" => {
+            RuntimeSignatureKind::ExceptionHandling
+        }
+        "memory" | "memory_routine" | "memory-routine" => RuntimeSignatureKind::MemoryRoutine,
+        "runtime" | "runtime_import" | "runtime-import" => RuntimeSignatureKind::RuntimeImport,
+        "pattern" => RuntimeSignatureKind::Pattern,
+        _ => RuntimeSignatureKind::UserSignature,
+    }
+}
+
+fn signature_rule_library(library: &SignatureLibrary, rule: &SignatureRule) -> String {
+    rule.library
+        .as_deref()
+        .filter(|value| !value.trim().is_empty())
+        .unwrap_or(&library.name)
+        .to_owned()
+}
+
+fn signature_rule_evidence(
+    library: &SignatureLibrary,
+    rule: &SignatureRule,
+    matched_name: String,
+) -> String {
+    let rule_id = rule.id.as_deref().unwrap_or(&rule.name);
+    match &rule.evidence {
+        Some(evidence) if !evidence.trim().is_empty() => {
+            format!(
+                "{evidence}; library `{}` rule `{rule_id}` matched `{matched_name}`",
+                library.name
+            )
+        }
+        _ => format!(
+            "signature library `{}` rule `{rule_id}` matched `{matched_name}`",
+            library.name
+        ),
+    }
+}
+
+fn signature_rule_confidence(rule: &SignatureRule) -> u8 {
+    rule.confidence.unwrap_or(75).clamp(1, 100)
+}
+
 fn build_runtime_signatures(analysis: &StaticAnalysis) -> Vec<RuntimeSignature> {
     let mut signatures = Vec::new();
 
@@ -1266,6 +1469,11 @@ fn build_runtime_signatures(analysis: &StaticAnalysis) -> Vec<RuntimeSignature> 
         }
     }
 
+    sort_and_dedup_runtime_signatures(&mut signatures);
+    signatures
+}
+
+fn sort_and_dedup_runtime_signatures(signatures: &mut Vec<RuntimeSignature>) {
     signatures.sort_by_key(|signature| {
         (
             signature.address,
@@ -1275,10 +1483,15 @@ fn build_runtime_signatures(analysis: &StaticAnalysis) -> Vec<RuntimeSignature> 
         )
     });
     let mut seen = BTreeSet::new();
-    signatures
-        .retain(|signature| seen.insert((signature.address, signature.target, signature.kind)));
+    signatures.retain(|signature| {
+        seen.insert((
+            signature.address,
+            signature.target,
+            signature.kind,
+            signature.name.clone(),
+        ))
+    });
     signatures.truncate(MAX_RUNTIME_SIGNATURES);
-    signatures
 }
 
 fn push_runtime_signature(signatures: &mut Vec<RuntimeSignature>, signature: RuntimeSignature) {
@@ -2976,6 +3189,39 @@ mod tests {
             classify_runtime_name("_initialize_onexit_table").map(|(kind, _, _)| kind),
             Some(RuntimeSignatureKind::CrtStartup)
         );
+    }
+
+    #[test]
+    fn applies_local_signature_library_rules() {
+        let image = sample_image();
+        let bytes = sample_bytes();
+        let mut analysis = analyze_pe(&image, &bytes);
+        let library = SignatureLibrary {
+            name: "local triage".to_owned(),
+            version: Some("0.1".to_owned()),
+            rules: vec![SignatureRule {
+                id: Some("create-file".to_owned()),
+                name: "Create File Import".to_owned(),
+                kind: Some("user".to_owned()),
+                library: Some("Windows API".to_owned()),
+                target: Some("import".to_owned()),
+                evidence: Some("test rule".to_owned()),
+                confidence: Some(81),
+                import_name_contains: vec!["CreateFileW".to_owned()],
+                import_dll_contains: Vec::new(),
+                function_name_contains: Vec::new(),
+            }],
+        };
+
+        let count = apply_signature_library(&mut analysis, &library);
+
+        assert_eq!(count, 1);
+        assert!(analysis.runtime_signatures.iter().any(|signature| {
+            signature.kind == RuntimeSignatureKind::UserSignature
+                && signature.name.contains("Create File Import")
+                && signature.evidence.contains("create-file")
+                && signature.confidence == 81
+        }));
     }
 
     #[test]

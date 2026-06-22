@@ -1092,18 +1092,20 @@ dependencies = [
 
 [[package]]
 name = "fyida_analysis"
-version = "0.13.0-alpha.1"
+version = "0.14.0-alpha.1"
 dependencies = [
  "fyida_core",
  "fyida_disasm",
  "msvc-demangler",
  "pdb",
  "rustc-demangle",
+ "serde",
+ "serde_json",
 ]
 
 [[package]]
 name = "fyida_app"
-version = "0.13.0-alpha.1"
+version = "0.14.0-alpha.1"
 dependencies = [
  "clap",
  "fyida_cli",
@@ -1112,7 +1114,7 @@ dependencies = [
 
 [[package]]
 name = "fyida_cli"
-version = "0.13.0-alpha.1"
+version = "0.14.0-alpha.1"
 dependencies = [
  "clap",
  "fyida_analysis",
@@ -1125,7 +1127,7 @@ dependencies = [
 
 [[package]]
 name = "fyida_core"
-version = "0.13.0-alpha.1"
+version = "0.14.0-alpha.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -1134,7 +1136,7 @@ dependencies = [
 
 [[package]]
 name = "fyida_disasm"
-version = "0.13.0-alpha.1"
+version = "0.14.0-alpha.1"
 dependencies = [
  "fyida_core",
  "iced-x86",
@@ -1142,14 +1144,14 @@ dependencies = [
 
 [[package]]
 name = "fyida_loader"
-version = "0.13.0-alpha.1"
+version = "0.14.0-alpha.1"
 dependencies = [
  "fyida_core",
 ]
 
 [[package]]
 name = "fyida_ui"
-version = "0.13.0-alpha.1"
+version = "0.14.0-alpha.1"
 dependencies = [
  "eframe",
  "fyida_analysis",

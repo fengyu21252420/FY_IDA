@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.14.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a FY_IDA-owned JSON signature-library format with local rules for import-name, import-DLL, and function-name matching.
+- Added signature-library validation and application APIs in `fyida_analysis`.
+- Added `--signature-library <JSON>` to headless analysis, supporting repeated local library imports.
+- Added GUI signature-library import through the Analysis menu, with immediate application to the current analysis and reuse for newly opened files in the same session.
+- Added a sample signature library at `examples/signatures/runtime_triage.json`.
+- Added `docs/SIGNATURE_LIBRARY.md` with format and usage notes.
+
+### Changed
+
+- Updated the workspace version to `0.14.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the local-signature-library checkpoint.
+- User signature matches are exported through the existing runtime-signature JSON/text/CSV report fields.
+
+### Known Issues
+
+- Local signature rules currently support exact contains-style metadata matching; byte-pattern and function-body hash signatures remain future work.
+- GUI-loaded signature libraries are session-local and are not yet persisted into FY_IDA project files.
+- Signature rules can annotate and search matches, but graph folding/filtering of library functions remains future work.
+
+### Recovery
+
+- Source tag: `v0.14.0-alpha.1`.
+- Roll back with: `git checkout v0.14.0-alpha.1`.
+
 ## v0.13.0-alpha.1 - 2026-06-23
 
 ### Added

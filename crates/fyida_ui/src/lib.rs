@@ -8,11 +8,12 @@ use eframe::egui::{
     Ui, Visuals, Window,
 };
 use fyida_analysis::{
-    analyze_pe, analyze_raw, apply_pdb_file, apply_pdb_snapshot, empty_workspace_disassembly,
-    file_error_log_lines, pdb_candidate_paths, pe_entry_disassembly, pe_loaded_log_lines,
-    raw_entry_disassembly, raw_loaded_log_lines, startup_log_lines, static_analysis_log_lines,
-    DisassemblyRow, LoadedPdbInfo, PdbSourceFile as AnalysisPdbSourceFile, PdbSymbol,
-    PdbSymbolKind, PdbTypeSummary, RuntimeSignature, StaticAnalysis,
+    analyze_pe, analyze_raw, apply_pdb_file, apply_pdb_snapshot, apply_signature_library,
+    empty_workspace_disassembly, file_error_log_lines, load_signature_library_file,
+    pdb_candidate_paths, pe_entry_disassembly, pe_loaded_log_lines, raw_entry_disassembly,
+    raw_loaded_log_lines, startup_log_lines, static_analysis_log_lines, DisassemblyRow,
+    LoadedPdbInfo, PdbSourceFile as AnalysisPdbSourceFile, PdbSymbol, PdbSymbolKind,
+    PdbTypeSummary, RuntimeSignature, SignatureLibrary, StaticAnalysis,
 };
 use fyida_core::{
     export_c_header_types, format_address, import_c_header_types, sha256_hex, EnumVariant,
@@ -96,6 +97,7 @@ struct FyIdaApp {
     search_results: Vec<SearchResult>,
     disassembly_rows: Vec<DisassemblyRow>,
     analysis: Option<StaticAnalysis>,
+    signature_libraries: Vec<SignatureLibrary>,
     recent_files: VecDeque<PathBuf>,
 }
 
@@ -199,6 +201,7 @@ impl FyIdaApp {
             search_results: vec![SearchResult::plain("尚未执行搜索。")],
             disassembly_rows: empty_workspace_disassembly(),
             analysis: None,
+            signature_libraries: Vec::new(),
             recent_files: VecDeque::new(),
         };
 
@@ -263,6 +266,38 @@ impl FyIdaApp {
             .pick_file()
         {
             self.apply_pdb_path(path);
+        }
+    }
+
+    fn open_signature_library_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .set_title("导入签名库")
+            .add_filter("FY_IDA 签名库", &["json"])
+            .add_filter("所有文件", &["*"])
+            .pick_file()
+        {
+            match load_signature_library_file(&path) {
+                Ok(library) => {
+                    let mut applied = 0usize;
+                    if let Some(analysis) = self.analysis.as_mut() {
+                        applied = apply_signature_library(analysis, &library);
+                    }
+                    self.logs.push(format!(
+                        "签名库已导入：{}（规则 {}，当前命中 {}）",
+                        library.name,
+                        library.rules.len(),
+                        applied
+                    ));
+                    self.signature_libraries.push(library);
+                    self.left_tab = 1;
+                    self.bottom_tab = 0;
+                }
+                Err(error) => {
+                    self.logs
+                        .push(format!("签名库导入失败：{} ({error})", path.display()));
+                    self.bottom_tab = 0;
+                }
+            }
         }
     }
 
@@ -627,9 +662,25 @@ impl FyIdaApp {
         }
     }
 
+    fn apply_loaded_signature_libraries(&self, analysis: &mut StaticAnalysis) -> Vec<String> {
+        self.signature_libraries
+            .iter()
+            .map(|library| {
+                let count = apply_signature_library(analysis, library);
+                format!(
+                    "签名库应用：{}（规则 {}，命中 {}）",
+                    library.name,
+                    library.rules.len(),
+                    count
+                )
+            })
+            .collect()
+    }
+
     fn apply_pe_image(&mut self, image: fyida_core::PeImage, bytes: &[u8]) {
         let mut analysis = analyze_pe(&image, bytes);
         let pdb_logs = self.try_autoload_pdb(&image, &mut analysis);
+        let signature_logs = self.apply_loaded_signature_libraries(&mut analysis);
         let disassembly = pe_entry_disassembly(&image, bytes);
         self.source_hash = Some(sha256_hex(bytes));
         self.input_bytes = bytes.to_vec();
@@ -637,6 +688,7 @@ impl FyIdaApp {
         self.logs.extend(pe_loaded_log_lines(&image));
         self.logs.extend(static_analysis_log_lines(&analysis));
         self.logs.extend(pdb_logs);
+        self.logs.extend(signature_logs);
         self.logs.extend(disassembly.log_lines);
         self.disassembly_rows = disassembly.rows;
         self.analysis = Some(analysis);
@@ -708,6 +760,15 @@ impl FyIdaApp {
                         None => "未知",
                     }
                 ));
+                for library in &self.signature_libraries {
+                    let count = apply_signature_library(analysis, library);
+                    self.logs.push(format!(
+                        "签名库应用：{}（规则 {}，命中 {}）",
+                        library.name,
+                        library.rules.len(),
+                        count
+                    ));
+                }
                 self.sync_pdb_types_to_project();
                 self.left_tab = 1;
                 self.right_tab = 2;
@@ -721,13 +782,15 @@ impl FyIdaApp {
     }
 
     fn apply_raw_image(&mut self, image: RawImage, bytes: &[u8]) {
-        let analysis = analyze_raw(&image, bytes);
+        let mut analysis = analyze_raw(&image, bytes);
+        let signature_logs = self.apply_loaded_signature_libraries(&mut analysis);
         let disassembly = raw_entry_disassembly(&image, bytes);
         self.source_hash = Some(sha256_hex(bytes));
         self.input_bytes = bytes.to_vec();
         self.project_path = None;
         self.logs.extend(raw_loaded_log_lines(&image));
         self.logs.extend(static_analysis_log_lines(&analysis));
+        self.logs.extend(signature_logs);
         self.logs.extend(disassembly.log_lines);
         self.disassembly_rows = disassembly.rows;
         self.analysis = Some(analysis);
@@ -1288,9 +1351,13 @@ impl FyIdaApp {
                                 "提取字符串",
                                 "重建交叉引用",
                                 "识别 switch",
-                                "应用签名库",
                             ],
                         );
+                        ui.separator();
+                        if ui.button("应用签名库...").clicked() {
+                            self.open_signature_library_dialog();
+                            ui.close_menu();
+                        }
                     });
 
                     ui.menu_button("类型", |ui| {
@@ -1368,8 +1435,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.13.0-alpha.1");
-                        ui.label("Runtime 签名识别与基础 x64 伪 C/IR MVP。");
+                        ui.label("FY_IDA v0.14.0-alpha.1");
+                        ui.label("本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });

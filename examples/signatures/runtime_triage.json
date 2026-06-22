@@ -1,0 +1,56 @@
+{
+  "name": "FY_IDA Runtime Triage",
+  "version": "0.1.0",
+  "rules": [
+    {
+      "id": "win-process-create",
+      "name": "Process Creation API",
+      "kind": "user",
+      "library": "Windows API",
+      "target": "import",
+      "import_name_contains": ["CreateProcess"],
+      "confidence": 85,
+      "evidence": "Local triage rule for process-spawning imports"
+    },
+    {
+      "id": "win-shell-execute",
+      "name": "Shell Execution API",
+      "kind": "user",
+      "library": "Windows API",
+      "target": "import",
+      "import_name_contains": ["ShellExecute"],
+      "confidence": 82,
+      "evidence": "Local triage rule for shell execution imports"
+    },
+    {
+      "id": "msvc-security-cookie",
+      "name": "MSVC Security Cookie",
+      "kind": "security-cookie",
+      "library": "MSVC Runtime",
+      "target": "import",
+      "import_name_contains": ["__security_check_cookie"],
+      "confidence": 96,
+      "evidence": "Local signature for MSVC stack-cookie helper"
+    },
+    {
+      "id": "crt-memcpy",
+      "name": "CRT memcpy Import",
+      "kind": "memory-routine",
+      "library": "CRT",
+      "target": "import",
+      "import_name_contains": ["memcpy"],
+      "confidence": 90,
+      "evidence": "Local signature for CRT memory-copy helper"
+    },
+    {
+      "id": "entry-name",
+      "name": "Entry Function Name",
+      "kind": "user",
+      "library": "FY_IDA Example",
+      "target": "function",
+      "function_name_contains": ["entry"],
+      "confidence": 70,
+      "evidence": "Example function-name rule"
+    }
+  ]
+}

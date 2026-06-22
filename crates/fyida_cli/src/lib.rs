@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.13.0-alpha.1 已提供运行库签名识别、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.14.0-alpha.1 已提供本地 JSON 签名库导入、运行库签名识别、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -35,6 +35,12 @@ pub struct Cli {
 
     #[arg(long, value_name = "PDB", help = "为 PE 手动加载外部 PDB 符号文件")]
     pub pdb: Option<PathBuf>,
+    #[arg(
+        long,
+        value_name = "JSON",
+        help = "导入本地 FY_IDA JSON 签名库；可重复指定"
+    )]
+    pub signature_library: Vec<PathBuf>,
 
     #[arg(long, value_name = "HEADER", help = "导入 C Header 类型定义")]
     pub type_header: Option<PathBuf>,
@@ -520,13 +526,15 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
         let options = raw_options(cli)?;
         let loaded = fyida_loader::load_raw_file_with_bytes(file, options)
             .map_err(|error| format!("Raw Binary 加载失败：{error}"))?;
-        let analysis = fyida_analysis::analyze_raw(&loaded.image, &loaded.bytes);
+        let mut analysis = fyida_analysis::analyze_raw(&loaded.image, &loaded.bytes);
+        let mut messages = type_load.messages.clone();
+        apply_signature_libraries(cli, &mut analysis, &mut messages);
         let mut report = HeadlessReport {
             version: env!("CARGO_PKG_VERSION").to_owned(),
             input: raw_input_report(&loaded.image, &loaded.bytes),
             analysis: analysis_report(&analysis),
             type_library: type_library_report(&type_load.types),
-            messages: type_load.messages.clone(),
+            messages,
             elapsed_ms: started.elapsed().as_millis(),
         };
         run_python_automation(cli, &mut report)?;
@@ -555,6 +563,8 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
         }
     }
 
+    apply_signature_libraries(cli, &mut analysis, &mut messages);
+
     let mut report = HeadlessReport {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         input: pe_input_report(&loaded.image, &loaded.bytes),
@@ -565,6 +575,23 @@ fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<Headle
     };
     run_python_automation(cli, &mut report)?;
     timeout_checked(cli, started, report)
+}
+
+fn apply_signature_libraries(cli: &Cli, analysis: &mut StaticAnalysis, messages: &mut Vec<String>) {
+    for path in &cli.signature_library {
+        match fyida_analysis::load_signature_library_file(path) {
+            Ok(library) => {
+                let count = fyida_analysis::apply_signature_library(analysis, &library);
+                messages.push(format!(
+                    "签名库已导入：{} / rules {} / matches {}",
+                    library.name,
+                    library.rules.len(),
+                    count
+                ));
+            }
+            Err(error) => messages.push(format!("签名库导入失败：{} ({error})", path.display())),
+        }
+    }
 }
 
 fn run_python_automation(cli: &Cli, report: &mut HeadlessReport) -> Result<(), String> {
