@@ -664,7 +664,7 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.27.0-alpha.1，headless 指令/CFG/调用图明细导出、IAT 间接调用/import thunk 调用图、x64 RIP-relative/absolute 内存 xref、Python 指令/CFG/报告辅助 API 示例、Python 标注动作写入、headless 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、本地签名库、Runtime 识别、运行库过滤和基础 x64 伪 C/IR 已接入。".to_owned(),
+        "当前版本：v0.28.0-alpha.1，headless sections/relocations/指令/CFG/调用图明细导出、IAT 间接调用/import thunk 调用图、x64 RIP-relative/absolute 内存 xref、Python sections/指令/CFG/报告辅助 API 示例、Python 标注动作写入、headless 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、本地签名库、Runtime 识别、运行库过滤和基础 x64 伪 C/IR 已接入。".to_owned(),
         "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串、基础引用和图数据。"
             .to_owned(),
     ]

@@ -23,7 +23,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.27.0-alpha.1 已支持 headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python 指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.28.0-alpha.1 已支持 headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -168,10 +168,12 @@ pub enum ExportFormat {
 pub enum ExportKind {
     All,
     Summary,
+    Sections,
     Functions,
     Strings,
     Imports,
     Exports,
+    Relocations,
     Xrefs,
     Cfg,
     Instructions,
@@ -2245,10 +2247,12 @@ fn text_report(report: &HeadlessReport, kind: ExportKind) -> String {
     match kind {
         ExportKind::All => text_full_report(report),
         ExportKind::Summary => text_summary_report(report),
+        ExportKind::Sections => text_sections(&report.input.sections),
         ExportKind::Functions => text_functions(&report.analysis.functions),
         ExportKind::Strings => text_strings(&report.analysis.strings),
         ExportKind::Imports => text_imports(&report.analysis.imports),
         ExportKind::Exports => text_exports(&report.analysis.exports),
+        ExportKind::Relocations => text_relocations(&report.analysis.relocations),
         ExportKind::Xrefs => text_xrefs(&report.analysis.xrefs),
         ExportKind::Cfg => text_cfg(&report.analysis.cfg_records),
         ExportKind::Instructions => text_instructions(&report.analysis.instruction_records),
@@ -2288,6 +2292,19 @@ fn text_full_report(report: &HeadlessReport) -> String {
         let _ = writeln!(text, "{message}");
     }
     let _ = writeln!(text, "基础静态分析：");
+    let _ = writeln!(text, "  Sections：{}", report.input.sections.len());
+    for section in report.input.sections.iter().take(32) {
+        let _ = writeln!(
+            text,
+            "    {} VA {:016X} RVA {:08X} FO {:08X} raw 0x{:X} {}",
+            section.name,
+            section.va,
+            section.rva,
+            section.file_offset,
+            section.raw_size,
+            section.permissions
+        );
+    }
     let _ = writeln!(text, "  Functions：{}", report.analysis.functions.len());
     for function in report.analysis.functions.iter().take(64) {
         let _ = writeln!(
@@ -2389,10 +2406,12 @@ fn text_summary_report(report: &HeadlessReport) -> String {
     let mut text = String::new();
     let _ = writeln!(text, "Path: {}", report.input.path);
     let _ = writeln!(text, "Kind: {}", report.input.kind);
+    let _ = writeln!(text, "Sections: {}", report.input.sections.len());
     let _ = writeln!(text, "Functions: {}", report.analysis.functions.len());
     let _ = writeln!(text, "Strings: {}", report.analysis.strings.len());
     let _ = writeln!(text, "Imports: {}", report.analysis.imports.len());
     let _ = writeln!(text, "Exports: {}", report.analysis.exports.len());
+    let _ = writeln!(text, "Relocations: {}", report.analysis.relocations.len());
     let _ = writeln!(text, "Xrefs: {}", report.analysis.xrefs.len());
     let _ = writeln!(text, "CFGs: {}", report.analysis.cfg_count);
     let _ = writeln!(
@@ -2425,6 +2444,24 @@ fn text_summary_report(report: &HeadlessReport) -> String {
         report.automation.action_count
     );
     let _ = writeln!(text, "TypeLibrary: {}", report.type_library.count);
+    text
+}
+
+fn text_sections(sections: &[SectionReport]) -> String {
+    let mut text = String::from("Sections\n");
+    for section in sections {
+        let _ = writeln!(
+            text,
+            "{}\tVA {:016X}\tRVA {:08X}\tFO {:08X}\tvsize 0x{:X}\traw 0x{:X}\t{}",
+            section.name,
+            section.va,
+            section.rva,
+            section.file_offset,
+            section.virtual_size,
+            section.raw_size,
+            section.permissions
+        );
+    }
     text
 }
 
@@ -2475,6 +2512,18 @@ fn text_exports(exports: &[ExportRecord]) -> String {
             text,
             "{:016X}\t{:08X}\t{}\t{}",
             export.va, export.rva, export.ordinal, export.name
+        );
+    }
+    text
+}
+
+fn text_relocations(relocations: &[RelocationRecord]) -> String {
+    let mut text = String::from("Relocations\n");
+    for relocation in relocations {
+        let _ = writeln!(
+            text,
+            "{:016X}\t{:08X}\t{:08X}\t{}",
+            relocation.va, relocation.rva, relocation.page_rva, relocation.kind
         );
     }
     text
@@ -2765,10 +2814,12 @@ fn text_batch_report(report: &BatchReport) -> String {
 fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
     match kind {
         ExportKind::Summary => csv_summary(report),
+        ExportKind::Sections => csv_sections(&report.input.sections),
         ExportKind::Functions => csv_functions(&report.analysis.functions),
         ExportKind::Strings => csv_strings(&report.analysis.strings),
         ExportKind::Imports => csv_imports(&report.analysis.imports),
         ExportKind::Exports => csv_exports(&report.analysis.exports),
+        ExportKind::Relocations => csv_relocations(&report.analysis.relocations),
         ExportKind::Xrefs => csv_xrefs(&report.analysis.xrefs),
         ExportKind::Cfg => csv_cfg(&report.analysis.cfg_records),
         ExportKind::Instructions => csv_instructions(&report.analysis.instruction_records),
@@ -2793,6 +2844,14 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
                 &mut csv,
                 &[
                     "summary",
+                    "sections",
+                    &report.input.sections.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
                     "functions",
                     &report.analysis.functions.len().to_string(),
                 ],
@@ -2811,6 +2870,22 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
                     "summary",
                     "imports",
                     &report.analysis.imports.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "exports",
+                    &report.analysis.exports.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "relocations",
+                    &report.analysis.relocations.len().to_string(),
                 ],
             );
             push_csv_row(
@@ -2906,6 +2981,10 @@ fn csv_summary(report: &HeadlessReport) -> String {
     push_csv_row(&mut csv, &["kind", &report.input.kind]);
     push_csv_row(
         &mut csv,
+        &["sections", &report.input.sections.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
         &["functions", &report.analysis.functions.len().to_string()],
     );
     push_csv_row(
@@ -2915,6 +2994,17 @@ fn csv_summary(report: &HeadlessReport) -> String {
     push_csv_row(
         &mut csv,
         &["imports", &report.analysis.imports.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &["exports", &report.analysis.exports.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "relocations",
+            &report.analysis.relocations.len().to_string(),
+        ],
     );
     push_csv_row(
         &mut csv,
@@ -2977,6 +3067,25 @@ fn csv_summary(report: &HeadlessReport) -> String {
         &mut csv,
         &["type_library", &report.type_library.count.to_string()],
     );
+    csv
+}
+
+fn csv_sections(sections: &[SectionReport]) -> String {
+    let mut csv = String::from("name,va,rva,file_offset,virtual_size,raw_size,permissions\n");
+    for section in sections {
+        push_csv_row(
+            &mut csv,
+            &[
+                &section.name,
+                &format_va(section.va),
+                &format!("{:08X}", section.rva),
+                &format!("{:08X}", section.file_offset),
+                &format!("0x{:X}", section.virtual_size),
+                &format!("0x{:X}", section.raw_size),
+                &section.permissions,
+            ],
+        );
+    }
     csv
 }
 
@@ -3047,6 +3156,22 @@ fn csv_exports(exports: &[ExportRecord]) -> String {
                 &format!("{:08X}", export.rva),
                 &export.ordinal.to_string(),
                 &export.name,
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_relocations(relocations: &[RelocationRecord]) -> String {
+    let mut csv = String::from("va,rva,page_rva,kind\n");
+    for relocation in relocations {
+        push_csv_row(
+            &mut csv,
+            &[
+                &format_va(relocation.va),
+                &format!("{:08X}", relocation.rva),
+                &format!("{:08X}", relocation.page_rva),
+                &relocation.kind,
             ],
         );
     }
@@ -3799,6 +3924,24 @@ mod tests {
     }
 
     #[test]
+    fn parses_sections_and_relocations_export_kinds() {
+        let sections =
+            Cli::try_parse_from(["fy_ida", "--headless", "--export", "sections", "sample.exe"])
+                .unwrap();
+        let relocations = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--export",
+            "relocations",
+            "sample.exe",
+        ])
+        .unwrap();
+
+        assert_eq!(sections.export, ExportKind::Sections);
+        assert_eq!(relocations.export, ExportKind::Relocations);
+    }
+
+    #[test]
     fn parses_search_query_and_export_kind() {
         let cli = Cli::try_parse_from([
             "fy_ida",
@@ -4010,7 +4153,7 @@ mod tests {
 
         let document = project_document_from_report(&report).unwrap();
 
-        assert_eq!(document.app_version, "0.27.0-alpha.1");
+        assert_eq!(document.app_version, "0.28.0-alpha.1");
         assert_eq!(document.functions[0].name, "renamed_func");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         assert_eq!(document.annotations.comments[0].text, "automation note");
@@ -4194,6 +4337,33 @@ mod tests {
         assert!(csv.contains("48 8B C1,mov,\"rax, rcx\",next"));
     }
 
+    #[test]
+    fn sections_and_relocations_text_csv_exports_are_structured() {
+        let input = sample_input_report();
+        let relocations = vec![RelocationRecord {
+            va: 0x0000_0001_4000_3000,
+            rva: 0x3000,
+            page_rva: 0x3000,
+            kind: "DIR64".to_owned(),
+        }];
+
+        let sections_text = text_sections(&input.sections);
+        let sections_csv = csv_sections(&input.sections);
+        let relocations_text = text_relocations(&relocations);
+        let relocations_csv = csv_relocations(&relocations);
+
+        assert!(sections_text.starts_with("Sections\n"));
+        assert!(sections_text.contains(".text\tVA 0000000140001000"));
+        assert!(
+            sections_csv.starts_with("name,va,rva,file_offset,virtual_size,raw_size,permissions\n")
+        );
+        assert!(sections_csv.contains(".text,0000000140001000,00001000"));
+        assert!(relocations_text.starts_with("Relocations\n"));
+        assert!(relocations_text.contains("0000000140003000\t00003000\t00003000\tDIR64"));
+        assert!(relocations_csv.starts_with("va,rva,page_rva,kind\n"));
+        assert!(relocations_csv.contains("0000000140003000,00003000,00003000,DIR64"));
+    }
+
     fn sample_pseudocode_record() -> PseudocodeRecord {
         PseudocodeRecord {
             function_start: 0x0000_0001_4000_1000,
@@ -4215,7 +4385,7 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.27.0-alpha.1".to_owned(),
+            version: "0.28.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),

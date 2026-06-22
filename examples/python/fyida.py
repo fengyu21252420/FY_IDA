@@ -36,6 +36,21 @@ class Project:
     def functions(self):
         return self._records("functions")
 
+    def sections(self, query=None):
+        records = [Record(item) for item in self.input.get("sections", [])]
+        if not query:
+            return records
+        needle = query.casefold()
+        return [
+            item
+            for item in records
+            if needle
+            in " ".join(
+                str(item.get(field, ""))
+                for field in ("name", "permissions", "rva", "va", "file_offset")
+            ).casefold()
+        ]
+
     def strings(self, query=None):
         return self._filter_records("strings", query, "value", "encoding")
 

@@ -4,6 +4,38 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.28.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added `--export sections` for dedicated text and CSV loader-section output.
+- Added `--export relocations` for dedicated text and CSV relocation-record output.
+- Added section and relocation counts to text/CSV summary output.
+- Added `sections(query=None)` to `examples/python/fyida.py`.
+- Added `examples/scripts/list_sections.py` for section metadata scripting examples.
+- Added CLI unit coverage for section/relocation export parsing and text/CSV output.
+
+### Changed
+
+- Updated the workspace version to `0.28.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the headless sections/relocations export checkpoint.
+- Headless `--export all --export-format csv` now includes section, export, and relocation counts in its summary rows.
+
+### Fixed
+
+- Analysts no longer need to consume full JSON reports just to export PE section metadata or relocation records as text/CSV.
+
+### Known Issues
+
+- Raw Binary inputs still have no section or relocation records because their layout is user supplied.
+- Section exports cover loader section metadata, not editable GUI section-management state.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.28.0-alpha.1`.
+- Roll back with: `git checkout v0.28.0-alpha.1`.
+
 ## v0.27.0-alpha.1 - 2026-06-23
 
 ### Added
