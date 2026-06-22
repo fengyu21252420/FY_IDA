@@ -1,4 +1,4 @@
-use std::collections::VecDeque;
+use std::collections::{BTreeSet, VecDeque};
 use std::path::PathBuf;
 use std::process::Command;
 
@@ -13,7 +13,7 @@ use fyida_analysis::{
     pdb_candidate_paths, pe_entry_disassembly, pe_loaded_log_lines, raw_entry_disassembly,
     raw_loaded_log_lines, startup_log_lines, static_analysis_log_lines, DisassemblyRow,
     LoadedPdbInfo, PdbSourceFile as AnalysisPdbSourceFile, PdbSymbol, PdbSymbolKind,
-    PdbTypeSummary, RuntimeSignature, SignatureLibrary, StaticAnalysis,
+    PdbTypeSummary, RuntimeSignature, RuntimeSignatureTarget, SignatureLibrary, StaticAnalysis,
 };
 use fyida_core::{
     export_c_header_types, format_address, import_c_header_types, sha256_hex, EnumVariant,
@@ -98,6 +98,7 @@ struct FyIdaApp {
     disassembly_rows: Vec<DisassemblyRow>,
     analysis: Option<StaticAnalysis>,
     signature_libraries: Vec<SignatureLibrary>,
+    hide_runtime_library_functions: bool,
     recent_files: VecDeque<PathBuf>,
 }
 
@@ -202,6 +203,7 @@ impl FyIdaApp {
             disassembly_rows: empty_workspace_disassembly(),
             analysis: None,
             signature_libraries: Vec::new(),
+            hide_runtime_library_functions: false,
             recent_files: VecDeque::new(),
         };
 
@@ -1337,6 +1339,13 @@ impl FyIdaApp {
                             }
                         }
                         ui.separator();
+                        if ui
+                            .checkbox(&mut self.hide_runtime_library_functions, "隐藏运行库函数")
+                            .clicked()
+                        {
+                            ui.close_menu();
+                        }
+                        ui.separator();
                         ui.add_enabled(false, egui::Button::new("重置布局"));
                     });
 
@@ -1435,8 +1444,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.14.0-alpha.1");
-                        ui.label("本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。");
+                        ui.label("FY_IDA v0.15.0-alpha.1");
+                        ui.label("运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -1532,6 +1541,7 @@ impl FyIdaApp {
                 tab_strip(ui, &LEFT_TABS, &mut self.left_tab);
                 ui.add_space(6.0);
                 ui.add(TextEdit::singleline(&mut self.left_filter).hint_text("过滤"));
+                ui.checkbox(&mut self.hide_runtime_library_functions, "隐藏运行库函数");
                 ui.separator();
                 self.left_content(ui);
             });
@@ -1600,37 +1610,42 @@ impl FyIdaApp {
     }
 
     fn function_list(&mut self, ui: &mut Ui) {
+        let filter = normalized_filter(&self.left_filter);
+        let mut hidden_runtime_count = 0usize;
         let rows = if let Some(analysis) = &self.analysis {
-            analysis
-                .functions
-                .iter()
-                .map(|function| {
-                    let block_count = analysis
-                        .function_cfgs
-                        .iter()
-                        .find(|cfg| cfg.function_start == function.start_va)
-                        .map(|cfg| cfg.blocks.len())
-                        .unwrap_or(0);
-                    let runtime_label = analysis
-                        .runtime_signatures
-                        .iter()
-                        .find(|signature| signature.address == function.start_va)
-                        .map(|signature| format!(" / runtime {}", signature.kind.label()))
-                        .unwrap_or_default();
-                    (
-                        function.start_va,
-                        format!("{:016X}", function.start_va),
-                        self.project
-                            .name_for(function.start_va)
-                            .unwrap_or(&function.name)
-                            .to_owned(),
-                        format!(
-                            "{} 条指令 / {} 个块 / {} 次调用",
-                            function.instruction_count, block_count, function.call_count
-                        ) + &runtime_label,
-                    )
-                })
-                .collect::<Vec<_>>()
+            let mut rows = Vec::new();
+            for function in &analysis.functions {
+                let runtime_signature =
+                    runtime_function_signature_in(&analysis.runtime_signatures, function.start_va);
+                if self.hide_runtime_library_functions && runtime_signature.is_some() {
+                    hidden_runtime_count += 1;
+                    continue;
+                }
+
+                let block_count = analysis
+                    .function_cfgs
+                    .iter()
+                    .find(|cfg| cfg.function_start == function.start_va)
+                    .map(|cfg| cfg.blocks.len())
+                    .unwrap_or(0);
+                let runtime_label = runtime_signature
+                    .map(|signature| format!(" / runtime {}", signature.kind.label()))
+                    .unwrap_or_default();
+                let address = format!("{:016X}", function.start_va);
+                let name = self
+                    .project
+                    .name_for(function.start_va)
+                    .unwrap_or(&function.name)
+                    .to_owned();
+                let status = format!(
+                    "{} 条指令 / {} 个块 / {} 次调用",
+                    function.instruction_count, block_count, function.call_count
+                ) + &runtime_label;
+                if row_matches_filter(&filter, &[&address, &name, &status]) {
+                    rows.push((function.start_va, address, name, status));
+                }
+            }
+            rows
         } else if self.project.selected_file().is_some() {
             vec![(
                 0,
@@ -1646,6 +1661,21 @@ impl FyIdaApp {
                 "占位".to_owned(),
             )]
         };
+
+        if self.analysis.is_some() {
+            ui.horizontal(|ui| {
+                if self.hide_runtime_library_functions {
+                    ui.label(format!("已隐藏运行库函数：{}", hidden_runtime_count));
+                }
+                if !filter.is_empty() {
+                    ui.label(format!("过滤：{}", self.left_filter.trim()));
+                }
+            });
+            if rows.is_empty() {
+                placeholder_list(ui, &["当前过滤条件下没有可显示函数"]);
+                return;
+            }
+        }
 
         Grid::new("function_list_grid")
             .num_columns(3)
@@ -1676,53 +1706,82 @@ impl FyIdaApp {
             return;
         };
 
-        let mut rows = analysis
-            .functions
-            .iter()
-            .map(|function| {
-                (
-                    function.start_va,
-                    self.project
-                        .name_for(function.start_va)
-                        .unwrap_or(&function.name)
-                        .to_owned(),
-                    "函数".to_owned(),
-                )
-            })
-            .collect::<Vec<_>>();
-        rows.extend(
-            analysis
-                .exports
-                .iter()
-                .map(|export| (export.va, export.name.clone(), "导出".to_owned())),
-        );
-        rows.extend(
-            analysis
-                .imports
-                .iter()
-                .map(|import| (import.thunk_va, import.display_name(), "导入".to_owned())),
-        );
+        let filter = normalized_filter(&self.left_filter);
+        let mut hidden_runtime_count = 0usize;
+        let mut rows = Vec::new();
+        for function in &analysis.functions {
+            if self.hide_runtime_library_functions
+                && runtime_function_signature_in(&analysis.runtime_signatures, function.start_va)
+                    .is_some()
+            {
+                hidden_runtime_count += 1;
+                continue;
+            }
+            let address = format!("{:016X}", function.start_va);
+            let name = self
+                .project
+                .name_for(function.start_va)
+                .unwrap_or(&function.name)
+                .to_owned();
+            let kind = "函数".to_owned();
+            if row_matches_filter(&filter, &[&address, &name, &kind]) {
+                rows.push((function.start_va, name, kind));
+            }
+        }
 
-        rows.extend(analysis.runtime_signatures.iter().map(|signature| {
-            (
-                signature.address,
-                signature.name.clone(),
-                format!("runtime {}", signature.kind.label()),
-            )
-        }));
+        for export in &analysis.exports {
+            let address = format!("{:016X}", export.va);
+            let kind = "导出".to_owned();
+            if row_matches_filter(&filter, &[&address, &export.name, &kind]) {
+                rows.push((export.va, export.name.clone(), kind));
+            }
+        }
 
-        rows.extend(analysis.pdb_symbols.iter().filter_map(|symbol| {
-            Some((
-                symbol.address?,
-                symbol.display_name().to_owned(),
-                symbol.kind.label().to_owned(),
-            ))
-        }));
+        for import in &analysis.imports {
+            let address = format!("{:016X}", import.thunk_va);
+            let name = import.display_name();
+            let kind = "导入".to_owned();
+            if row_matches_filter(&filter, &[&address, &name, &kind]) {
+                rows.push((import.thunk_va, name, kind));
+            }
+        }
+
+        for signature in &analysis.runtime_signatures {
+            if self.hide_runtime_library_functions && is_runtime_function_signature(signature) {
+                continue;
+            }
+            let address = format!("{:016X}", signature.address);
+            let kind = format!("runtime {}", signature.kind.label());
+            if row_matches_filter(&filter, &[&address, &signature.name, &kind]) {
+                rows.push((signature.address, signature.name.clone(), kind));
+            }
+        }
+
+        for symbol in &analysis.pdb_symbols {
+            let Some(address_value) = symbol.address else {
+                continue;
+            };
+            let address = format!("{:016X}", address_value);
+            let name = symbol.display_name().to_owned();
+            let kind = symbol.kind.label().to_owned();
+            if row_matches_filter(&filter, &[&address, &name, &kind]) {
+                rows.push((address_value, name, kind));
+            }
+        }
 
         if rows.is_empty() {
-            placeholder_list(ui, &["当前文件没有可显示名称"]);
+            placeholder_list(ui, &["当前过滤条件下没有可显示名称"]);
             return;
         }
+
+        ui.horizontal(|ui| {
+            if self.hide_runtime_library_functions {
+                ui.label(format!("已隐藏运行库函数：{}", hidden_runtime_count));
+            }
+            if !filter.is_empty() {
+                ui.label(format!("过滤：{}", self.left_filter.trim()));
+            }
+        });
 
         Grid::new("name_list_grid")
             .num_columns(3)
@@ -2541,6 +2600,15 @@ impl FyIdaApp {
             ui.separator();
             ui.label(format!("Basic blocks：{}", cfg.blocks.len()));
             ui.label(format!("Edges：{}", cfg.edges.len()));
+            if let Some(signature) =
+                runtime_function_signature_in(&analysis.runtime_signatures, function_start)
+            {
+                ui.label(format!(
+                    "运行库：{} {}%",
+                    signature.kind.label(),
+                    signature.confidence
+                ));
+            }
         });
         self.graph_controls(ui);
         ui.separator();
@@ -2650,12 +2718,52 @@ impl FyIdaApp {
             return;
         };
         let call_graph = analysis.call_graph.clone();
+        let runtime_signatures = analysis.runtime_signatures.clone();
+        let mut hidden_addresses = BTreeSet::new();
+        if self.hide_runtime_library_functions {
+            hidden_addresses.extend(
+                call_graph
+                    .nodes
+                    .iter()
+                    .filter(|node| {
+                        runtime_function_signature_in(&runtime_signatures, node.start_va).is_some()
+                    })
+                    .map(|node| node.start_va),
+            );
+        }
+        let visible_nodes = call_graph
+            .nodes
+            .iter()
+            .filter(|node| !hidden_addresses.contains(&node.start_va))
+            .collect::<Vec<_>>();
+        let visible_edges = call_graph
+            .edges
+            .iter()
+            .filter(|edge| {
+                !hidden_addresses.contains(&edge.caller_va)
+                    && !hidden_addresses.contains(&edge.callee_va)
+            })
+            .collect::<Vec<_>>();
 
         ui.horizontal(|ui| {
             ui.strong("调用图");
             ui.separator();
-            ui.label(format!("节点：{}", call_graph.nodes.len()));
-            ui.label(format!("边：{}", call_graph.edges.len()));
+            if self.hide_runtime_library_functions {
+                ui.label(format!(
+                    "节点：{} / {}",
+                    visible_nodes.len(),
+                    call_graph.nodes.len()
+                ));
+                ui.label(format!(
+                    "边：{} / {}",
+                    visible_edges.len(),
+                    call_graph.edges.len()
+                ));
+                ui.label(format!("隐藏库函数：{}", hidden_addresses.len()));
+            } else {
+                ui.label(format!("节点：{}", visible_nodes.len()));
+                ui.label(format!("边：{}", visible_edges.len()));
+            }
         });
         self.graph_controls(ui);
         ui.separator();
@@ -2676,7 +2784,7 @@ impl FyIdaApp {
                             ui.strong("类型");
                             ui.strong("调用数");
                             ui.end_row();
-                            for node in &call_graph.nodes {
+                            for node in &visible_nodes {
                                 if ui
                                     .selectable_label(false, format!("{:016X}", node.start_va))
                                     .clicked()
@@ -2690,11 +2798,16 @@ impl FyIdaApp {
                                     self.project.jump_to(node.start_va, Some(name.to_owned()));
                                     self.center_tab = 0;
                                 }
-                                ui.label(if node.is_external {
-                                    "预留/外部"
+                                if let Some(signature) = runtime_function_signature_in(
+                                    &runtime_signatures,
+                                    node.start_va,
+                                ) {
+                                    ui.label(format!("运行库 {}", signature.kind.label()));
+                                } else if node.is_external {
+                                    ui.label("预留/外部");
                                 } else {
-                                    "已发现"
-                                });
+                                    ui.label("已发现");
+                                }
                                 ui.label(node.call_count.to_string());
                                 ui.end_row();
                             }
@@ -2702,7 +2815,7 @@ impl FyIdaApp {
 
                     ui.separator();
                     ui.strong("调用边");
-                    if call_graph.edges.is_empty() {
+                    if visible_edges.is_empty() {
                         ui.label("当前样本没有 direct call 边，或尚未识别到可解析调用目标。");
                     } else {
                         Grid::new("call_graph_edges")
@@ -2715,7 +2828,7 @@ impl FyIdaApp {
                                 ui.strong("Callsite");
                                 ui.strong("类型");
                                 ui.end_row();
-                                for edge in &call_graph.edges {
+                                for edge in &visible_edges {
                                     if ui
                                         .selectable_label(false, format!("{:016X}", edge.caller_va))
                                         .clicked()
@@ -3641,6 +3754,33 @@ impl FyIdaApp {
     }
 }
 
+fn normalized_filter(text: &str) -> String {
+    text.trim().to_lowercase()
+}
+
+fn row_matches_filter(filter: &str, values: &[&str]) -> bool {
+    filter.is_empty()
+        || values
+            .iter()
+            .any(|value| value.to_lowercase().contains(filter))
+}
+
+fn is_runtime_function_signature(signature: &RuntimeSignature) -> bool {
+    matches!(
+        signature.target,
+        RuntimeSignatureTarget::Function | RuntimeSignatureTarget::Pattern
+    )
+}
+
+fn runtime_function_signature_in(
+    signatures: &[RuntimeSignature],
+    address: u64,
+) -> Option<&RuntimeSignature> {
+    signatures
+        .iter()
+        .find(|signature| signature.address == address && is_runtime_function_signature(signature))
+}
+
 fn parse_number(text: &str) -> Option<u64> {
     let text = text.trim();
     let hex = text
@@ -4043,4 +4183,49 @@ fn comment_color() -> Color32 {
 
 fn error_color() -> Color32 {
     Color32::from_rgb(215, 58, 73)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use fyida_analysis::RuntimeSignatureKind;
+
+    fn signature(address: u64, target: RuntimeSignatureTarget) -> RuntimeSignature {
+        RuntimeSignature {
+            address,
+            name: format!("sig_{address:X}"),
+            kind: RuntimeSignatureKind::MemoryRoutine,
+            target,
+            library: "test".to_owned(),
+            evidence: "unit test".to_owned(),
+            confidence: 90,
+        }
+    }
+
+    #[test]
+    fn runtime_function_filter_matches_functions_and_patterns_only() {
+        let signatures = vec![
+            signature(0x1000, RuntimeSignatureTarget::Function),
+            signature(0x2000, RuntimeSignatureTarget::Pattern),
+            signature(0x3000, RuntimeSignatureTarget::Import),
+        ];
+
+        assert!(runtime_function_signature_in(&signatures, 0x1000).is_some());
+        assert!(runtime_function_signature_in(&signatures, 0x2000).is_some());
+        assert!(runtime_function_signature_in(&signatures, 0x3000).is_none());
+        assert!(runtime_function_signature_in(&signatures, 0x4000).is_none());
+    }
+
+    #[test]
+    fn left_filter_matches_any_visible_cell_case_insensitively() {
+        assert!(row_matches_filter("mem", &["140001000", "memcpy", "函数"]));
+        assert!(row_matches_filter(
+            "runtime",
+            &["140001000", "sub_140001000", "Runtime CRT"]
+        ));
+        assert!(!row_matches_filter(
+            "crypto",
+            &["140001000", "memcpy", "函数"]
+        ));
+    }
 }

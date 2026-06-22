@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.15.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a GUI "隐藏运行库函数" toggle in the View menu and left navigation panel.
+- Added runtime/library-function filtering to the Functions list, including a visible hidden-count summary.
+- Added runtime/library-function filtering to the Names list, hiding matching function and runtime-signature rows while preserving import/runtime import entries.
+- Added call-graph filtering that hides runtime/library nodes and removes edges connected to hidden nodes.
+- Added runtime classification text to the current Function Graph header when the selected function is recognized as runtime/library code.
+- Added unit coverage for runtime-function filtering helpers and left-panel filter matching.
+
+### Changed
+
+- Updated the workspace version to `0.15.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the runtime-library-filtering checkpoint.
+- The existing left-panel filter box now applies to the Functions and Names lists.
+
+### Known Issues
+
+- Runtime/library filtering is GUI-session state and is not yet persisted into project files or user preferences.
+- Filtering currently targets function and pattern runtime signatures; imported runtime APIs remain visible so analysts can still inspect external API usage.
+- Headless reports still export the full analysis model; runtime-function filtering is currently a GUI navigation feature.
+
+### Recovery
+
+- Source tag: `v0.15.0-alpha.1`.
+- Roll back with: `git checkout v0.15.0-alpha.1`.
+
 ## v0.14.0-alpha.1 - 2026-06-23
 
 ### Added
