@@ -4,6 +4,41 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.6.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added navigation history to `ProjectState` with back/forward stacks for GUI jumps.
+- Added toolbar and shortcut support for navigation back/forward (`Esc`, `Alt+Left`, `Alt+Right`).
+- Added symbolic quick jump resolution for function names, user names, imports, exports, and string keywords in addition to VA/RVA/File Offset input.
+- Added clickable structured search results that jump back into the disassembly view.
+- Added global search coverage for direct addresses, byte sequences, user names, address comments, function comments, bookmarks, manual code/data definitions, functions, strings, imports, exports, and xrefs.
+- Added a real byte-backed Hex View centered on the current file offset, with VA/FO labels and clickable row navigation.
+- Added clickable xref source/target addresses in the right-side cross-reference panel.
+- Added unit coverage for navigation history back/forward behavior.
+
+### Changed
+
+- Updated the workspace version to `0.6.0-alpha.1`.
+- Updated GUI, CLI, startup log, and README status text for the GUI analysis-experience checkpoint.
+
+### Fixed
+
+- Toolbar back/forward controls now perform real navigation instead of acting as placeholders.
+- Hex View now renders loaded input bytes instead of static PE/Raw summary placeholder rows.
+
+### Known Issues
+
+- Search results are clickable text rows rather than a sortable/filterable result table.
+- Hex View is synchronized around the current address but does not yet support byte selection or copy.
+- Navigation history tracks address jumps only; full tab/layout restoration remains a future UI-state task.
+- The function graph, call graph, and saved docking layout remain future milestones.
+
+### Recovery
+
+- Source tag: `v0.6.0-alpha.1`.
+- Roll back with: `git checkout v0.6.0-alpha.1`.
+
 ## v0.5.0-alpha.1 - 2026-06-23
 
 ### Added

@@ -9,7 +9,7 @@ use fyida_loader::RawLoadOptions;
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.5.0-alpha.1 已提供项目文件与人工标注基础能力。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.6.0-alpha.1 已增强 GUI 搜索、跳转、导航历史和 Hex 同步体验。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]

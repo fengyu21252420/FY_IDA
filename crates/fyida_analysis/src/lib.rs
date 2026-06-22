@@ -275,7 +275,7 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.4.1-alpha.1 开发中，Raw Binary x64 支持已接入。".to_owned(),
+        "当前版本：v0.6.0-alpha.1，GUI 搜索、跳转、导航历史和 Hex 同步已接入。".to_owned(),
         "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串和基础引用。"
             .to_owned(),
     ]

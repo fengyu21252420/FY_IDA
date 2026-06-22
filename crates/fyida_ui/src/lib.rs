@@ -73,8 +73,9 @@ struct FyIdaApp {
     comment_text: String,
     project_path: Option<PathBuf>,
     source_hash: Option<String>,
+    input_bytes: Vec<u8>,
     logs: Vec<String>,
-    search_results: Vec<String>,
+    search_results: Vec<SearchResult>,
     disassembly_rows: Vec<DisassemblyRow>,
     analysis: Option<StaticAnalysis>,
     recent_files: VecDeque<PathBuf>,
@@ -83,6 +84,31 @@ struct FyIdaApp {
 enum ProjectLoadResult {
     Pe(fyida_core::PeImage, Vec<u8>),
     Raw(RawImage, Vec<u8>),
+}
+
+#[derive(Debug, Clone)]
+struct SearchResult {
+    label: String,
+    address: Option<u64>,
+    context: Option<String>,
+}
+
+impl SearchResult {
+    fn plain(label: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            address: None,
+            context: None,
+        }
+    }
+
+    fn jump(label: impl Into<String>, address: u64, context: impl Into<String>) -> Self {
+        Self {
+            label: label.into(),
+            address: Some(address),
+            context: Some(context.into()),
+        }
+    }
 }
 
 impl FyIdaApp {
@@ -113,8 +139,9 @@ impl FyIdaApp {
             comment_text: String::new(),
             project_path: None,
             source_hash: None,
+            input_bytes: Vec::new(),
             logs: startup_log_lines(),
-            search_results: vec!["尚未执行搜索。".to_owned()],
+            search_results: vec![SearchResult::plain("尚未执行搜索。")],
             disassembly_rows: empty_workspace_disassembly(),
             analysis: None,
             recent_files: VecDeque::new(),
@@ -163,6 +190,7 @@ impl FyIdaApp {
                     self.disassembly_rows = file_error_disassembly_row(&message);
                     self.analysis = None;
                     self.source_hash = None;
+                    self.input_bytes.clear();
                     self.project_path = None;
                     self.logs.push(message);
                     self.right_tab = 1;
@@ -365,6 +393,7 @@ impl FyIdaApp {
                 self.disassembly_rows = file_error_disassembly_row(&message);
                 self.analysis = None;
                 self.source_hash = None;
+                self.input_bytes.clear();
                 self.project_path = None;
                 self.logs.push(message);
                 self.right_tab = 1;
@@ -395,6 +424,7 @@ impl FyIdaApp {
         let analysis = analyze_pe(&image, bytes);
         let disassembly = pe_entry_disassembly(&image, bytes);
         self.source_hash = Some(sha256_hex(bytes));
+        self.input_bytes = bytes.to_vec();
         self.project_path = None;
         self.logs.extend(pe_loaded_log_lines(&image));
         self.logs.extend(static_analysis_log_lines(&analysis));
@@ -411,6 +441,7 @@ impl FyIdaApp {
         let analysis = analyze_raw(&image, bytes);
         let disassembly = raw_entry_disassembly(&image, bytes);
         self.source_hash = Some(sha256_hex(bytes));
+        self.input_bytes = bytes.to_vec();
         self.project_path = None;
         self.logs.extend(raw_loaded_log_lines(&image));
         self.logs.extend(static_analysis_log_lines(&analysis));
@@ -430,6 +461,7 @@ impl FyIdaApp {
             file_error_disassembly_row("不是有效的 PE 文件，无法进行 x64 反汇编。");
         self.analysis = None;
         self.source_hash = None;
+        self.input_bytes.clear();
         self.project_path = None;
         self.center_tab = 0;
         self.right_tab = 1;
@@ -507,6 +539,18 @@ impl FyIdaApp {
         }
     }
 
+    fn go_back(&mut self) {
+        if self.project.go_back() {
+            self.logs.push("已后退到上一位置。".to_owned());
+        }
+    }
+
+    fn go_forward(&mut self) {
+        if self.project.go_forward() {
+            self.logs.push("已前进到下一位置。".to_owned());
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &Context) {
         if ctx.input(|input| input.key_pressed(Key::O) && input.modifiers.ctrl) {
             self.open_file_dialog();
@@ -519,6 +563,15 @@ impl FyIdaApp {
         }
         if ctx.input(|input| input.key_pressed(Key::Y) && input.modifiers.ctrl) {
             self.redo_annotation();
+        }
+        if ctx.input(|input| input.key_pressed(Key::Escape)) {
+            self.go_back();
+        }
+        if ctx.input(|input| input.key_pressed(Key::ArrowLeft) && input.modifiers.alt) {
+            self.go_back();
+        }
+        if ctx.input(|input| input.key_pressed(Key::ArrowRight) && input.modifiers.alt) {
+            self.go_forward();
         }
         if ctx.input(|input| input.key_pressed(Key::N)) {
             self.open_rename_dialog();
@@ -708,8 +761,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.5.0-alpha.1");
-                        ui.label("项目文件与人工标注 MVP。");
+                        ui.label("FY_IDA v0.6.0-alpha.1");
+                        ui.label("GUI 分析体验增强 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -745,8 +798,26 @@ impl FyIdaApp {
                         self.save_project();
                     }
                     ui.separator();
-                    toolbar_button(ui, "后退", "返回上一位置");
-                    toolbar_button(ui, "前进", "前进到下一位置");
+                    if toolbar_enabled_button(
+                        ui,
+                        self.project.can_go_back(),
+                        "后退",
+                        "返回上一位置 (Esc / Alt+Left)",
+                    )
+                    .clicked()
+                    {
+                        self.go_back();
+                    }
+                    if toolbar_enabled_button(
+                        ui,
+                        self.project.can_go_forward(),
+                        "前进",
+                        "前进到下一位置 (Alt+Right)",
+                    )
+                    .clicked()
+                    {
+                        self.go_forward();
+                    }
                     if toolbar_button(ui, "跳转", "快速跳转 (G)").clicked() {
                         self.quick_jump_open = true;
                     }
@@ -1186,13 +1257,14 @@ impl FyIdaApp {
             });
     }
 
-    fn right_content(&self, ui: &mut Ui) {
+    fn right_content(&mut self, ui: &mut Ui) {
         match RIGHT_TABS[self.right_tab] {
             "交叉引用" => {
                 if let Some(analysis) = &self.analysis {
                     if analysis.xrefs.is_empty() {
                         ui.label("暂未发现 direct call / jump 交叉引用。");
                     } else {
+                        let xrefs = analysis.xrefs.clone();
                         Grid::new("xref_grid")
                             .num_columns(3)
                             .striped(true)
@@ -1203,9 +1275,21 @@ impl FyIdaApp {
                                 ui.strong("类型");
                                 ui.end_row();
 
-                                for xref in &analysis.xrefs {
-                                    ui.label(format!("{:016X}", xref.from_va));
-                                    ui.label(format!("{:016X}", xref.to_va));
+                                for xref in xrefs {
+                                    if ui
+                                        .selectable_label(false, format!("{:016X}", xref.from_va))
+                                        .clicked()
+                                    {
+                                        self.project
+                                            .jump_to(xref.from_va, Some("xref 来源".to_owned()));
+                                    }
+                                    if ui
+                                        .selectable_label(false, format!("{:016X}", xref.to_va))
+                                        .clicked()
+                                    {
+                                        self.project
+                                            .jump_to(xref.to_va, Some("xref 目标".to_owned()));
+                                    }
                                     ui.label(xref.kind.label());
                                     ui.end_row();
                                 }
@@ -1424,7 +1508,7 @@ impl FyIdaApp {
     fn bottom_content(&mut self, ui: &mut Ui) {
         match BOTTOM_TABS[self.bottom_tab] {
             "输出" => log_view(ui, &self.logs),
-            "搜索结果" => log_view(ui, &self.search_results),
+            "搜索结果" => self.search_results_view(ui),
             "Python 控制台" => {
                 ui.label("Python 控制台将在脚本系统阶段启用。");
                 ui.add_enabled(
@@ -1435,6 +1519,32 @@ impl FyIdaApp {
             "日志" => log_view(ui, &self.logs),
             _ => placeholder_list(ui, &["暂无后台任务"]),
         }
+    }
+
+    fn search_results_view(&mut self, ui: &mut Ui) {
+        ScrollArea::vertical().show(ui, |ui| {
+            for result in self.search_results.clone() {
+                if let Some(address) = result.address {
+                    if ui
+                        .selectable_label(
+                            false,
+                            RichText::new(&result.label).color(address_color()),
+                        )
+                        .clicked()
+                    {
+                        self.project.jump_to(
+                            address,
+                            result.context.clone().or(Some("搜索结果".to_owned())),
+                        );
+                        self.center_tab = 0;
+                        self.logs
+                            .push(format!("从搜索结果跳转到 0x{address:016X}。"));
+                    }
+                } else {
+                    ui.label(result.label);
+                }
+            }
+        });
     }
 
     fn disassembly_view(&mut self, ui: &mut Ui) {
@@ -1526,7 +1636,23 @@ impl FyIdaApp {
         });
     }
 
-    fn hex_view(&self, ui: &mut Ui) {
+    fn hex_view(&mut self, ui: &mut Ui) {
+        if self.input_bytes.is_empty() {
+            placeholder_list(ui, &["尚未读取文件字节"]);
+            return;
+        }
+
+        let current_offset = self
+            .project
+            .current_file_offset()
+            .and_then(|offset| usize::try_from(offset).ok())
+            .unwrap_or(0)
+            .min(self.input_bytes.len().saturating_sub(1));
+        let start_offset = current_offset.saturating_sub(0x40) & !0xF;
+        let end_offset = start_offset
+            .saturating_add(0x180)
+            .min(self.input_bytes.len());
+
         ScrollArea::both().show(ui, |ui| {
             Grid::new("hex_grid")
                 .num_columns(3)
@@ -1538,39 +1664,33 @@ impl FyIdaApp {
                     ui.strong("ASCII / UTF-16 预览");
                     ui.end_row();
 
-                    if let Some(image) = self.project.pe_image() {
-                        ui.label("FO 00000000");
-                        ui.label("4D 5A");
-                        ui.label("DOS Header / MZ");
-                        ui.end_row();
+                    for row_start in (start_offset..end_offset).step_by(16) {
+                        let row_end = row_start.saturating_add(16).min(self.input_bytes.len());
+                        let row = &self.input_bytes[row_start..row_end];
+                        let file_offset = u64::try_from(row_start).unwrap_or(0);
+                        let va = self.file_offset_to_va(file_offset);
+                        let label = match va {
+                            Some(va) => format!("FO {file_offset:08X} / VA {va:016X}"),
+                            None => format!("FO {file_offset:08X}"),
+                        };
+                        let is_current = current_offset >= row_start && current_offset < row_end;
+                        let label_text = if is_current {
+                            RichText::new(label)
+                                .color(address_color())
+                                .background_color(Color32::from_rgb(255, 243, 176))
+                        } else {
+                            RichText::new(label).color(address_color())
+                        };
 
-                        ui.label(format!("FO {:08X}", image.dos_header.e_lfanew));
-                        ui.label("50 45 00 00");
-                        ui.label("NT Header / PE");
-                        ui.end_row();
-
-                        ui.label(format!("VA {:016X}", image.entry_point_va()));
-                        ui.label(format!("RVA {:08X}", image.entry_point_rva()));
-                        ui.label("EntryPoint");
-                        ui.end_row();
-                    } else if let Some(raw) = self.project.raw_image() {
-                        ui.label("FO 00000000");
-                        ui.label("Raw Binary 起始字节");
-                        ui.label(format!("VA {:016X}", raw.base_address));
-                        ui.end_row();
-
-                        ui.label(format!("FO {:08X}", raw.entry_offset().unwrap_or(0)));
-                        ui.label("Raw EntryPoint");
-                        ui.label(format!("VA {:016X}", raw.entry_address));
-                        ui.end_row();
-                    } else {
-                        ui.label("00001000");
-                        ui.label("4D 5A 90 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??");
-                        ui.label("MZ..");
-                        ui.end_row();
-                        ui.label("00001010");
-                        ui.label("尚未读取文件字节");
-                        ui.label("等待 loader");
+                        if let Some(va) = va {
+                            if ui.selectable_label(is_current, label_text).clicked() {
+                                self.project.jump_to(va, Some("Hex".to_owned()));
+                            }
+                        } else {
+                            ui.label(label_text);
+                        }
+                        ui.label(RichText::new(hex_bytes(row)).color(bytes_color()));
+                        ui.label(ascii_preview(row));
                         ui.end_row();
                     }
                 });
@@ -1747,38 +1867,104 @@ impl FyIdaApp {
 
     fn resolve_jump_input(&self) -> Option<(u64, String)> {
         let text = self.quick_jump_text.trim();
+        let text_lower = text.to_lowercase();
 
         if let Some(image) = self.project.pe_image() {
-            if let Some(raw_rva) = text.strip_prefix("rva:") {
+            if let Some(raw_rva) = text_lower
+                .strip_prefix("rva:")
+                .and_then(|_| text.split_once(':').map(|(_, value)| value))
+            {
                 let rva = parse_number(raw_rva.trim())?;
                 return Some((image.rva_to_va(rva), format!("RVA 0x{rva:08X}")));
             }
 
-            if let Some(raw_file_offset) = text.strip_prefix("file:") {
+            if let Some(raw_file_offset) = text_lower
+                .strip_prefix("file:")
+                .and_then(|_| text.split_once(':').map(|(_, value)| value))
+            {
                 let file_offset = parse_number(raw_file_offset.trim())?;
                 let va = image.file_offset_to_va(file_offset)?;
                 return Some((va, format!("FO 0x{file_offset:08X}")));
             }
 
-            let va = parse_number(text)?;
-            return Some((va, format!("VA 0x{va:016X}")));
+            if let Some(va) = parse_number(text) {
+                return Some((va, format!("VA 0x{va:016X}")));
+            }
         }
 
         if let Some(raw) = self.project.raw_image() {
-            if let Some(raw_file_offset) = text.strip_prefix("file:") {
+            if let Some(raw_file_offset) = text_lower
+                .strip_prefix("file:")
+                .and_then(|_| text.split_once(':').map(|(_, value)| value))
+            {
                 let file_offset = parse_number(raw_file_offset.trim())?;
                 let va = raw.file_offset_to_va(file_offset)?;
                 return Some((va, format!("FO 0x{file_offset:08X}")));
             }
-            if let Some(raw_rva) = text.strip_prefix("rva:") {
+            if let Some(raw_rva) = text_lower
+                .strip_prefix("rva:")
+                .and_then(|_| text.split_once(':').map(|(_, value)| value))
+            {
                 let rva = parse_number(raw_rva.trim())?;
                 let va = raw.rva_to_va(rva)?;
                 return Some((va, format!("Raw+0x{rva:X}")));
             }
-            let va = parse_number(text)?;
-            return raw
-                .contains_va(va)
-                .then_some((va, format!("VA 0x{va:016X}")));
+            if let Some(va) = parse_number(text) {
+                return raw
+                    .contains_va(va)
+                    .then_some((va, format!("VA 0x{va:016X}")));
+            }
+        }
+
+        self.resolve_symbolic_jump(text)
+    }
+
+    fn resolve_symbolic_jump(&self, text: &str) -> Option<(u64, String)> {
+        let analysis = self.analysis.as_ref()?;
+        let query = text.trim().to_lowercase();
+        if query.is_empty() {
+            return None;
+        }
+
+        for name in self.project.user_names() {
+            if name.name.to_lowercase().contains(&query) {
+                return Some((name.address, format!("名称 {}", name.name)));
+            }
+        }
+
+        for function in &analysis.functions {
+            let name = self
+                .project
+                .name_for(function.start_va)
+                .unwrap_or(&function.name);
+            if name.to_lowercase().contains(&query) {
+                return Some((function.start_va, format!("函数 {name}")));
+            }
+        }
+
+        for import in &analysis.imports {
+            let name = import.display_name();
+            if name.to_lowercase().contains(&query)
+                || import
+                    .name
+                    .as_ref()
+                    .map(|api| api.to_lowercase().contains(&query))
+                    .unwrap_or(false)
+            {
+                return Some((import.thunk_va, format!("导入 {name}")));
+            }
+        }
+
+        for export in &analysis.exports {
+            if export.name.to_lowercase().contains(&query) {
+                return Some((export.va, format!("导出 {}", export.name)));
+            }
+        }
+
+        for string in &analysis.strings {
+            if string.value.to_lowercase().contains(&query) {
+                return Some((string.address, "字符串".to_owned()));
+            }
         }
 
         None
@@ -1801,22 +1987,109 @@ impl FyIdaApp {
         })
     }
 
-    fn run_search(&self) -> Vec<String> {
+    fn run_search(&self) -> Vec<SearchResult> {
         let query = self.search_text.trim();
         if query.is_empty() {
-            return vec!["请输入搜索内容。".to_owned()];
+            return vec![SearchResult::plain("请输入搜索内容。")];
         }
-
-        let Some(analysis) = &self.analysis else {
-            return vec![
-                format!("搜索请求：{query}"),
-                "尚未打开可分析的 PE 或 Raw Binary 文件。".to_owned(),
-            ];
-        };
 
         let query_lower = query.to_lowercase();
         let mut results = Vec::new();
-        results.push(format!("搜索请求：{query}"));
+        results.push(SearchResult::plain(format!("搜索请求：{query}")));
+
+        if let Some(address) = parse_number(query) {
+            results.push(SearchResult::jump(
+                format!("地址 0x{address:016X}"),
+                address,
+                format!("VA 0x{address:016X}"),
+            ));
+        }
+
+        if let Some(pattern) = parse_byte_pattern(query) {
+            for file_offset in find_byte_pattern(&self.input_bytes, &pattern)
+                .into_iter()
+                .take(64)
+            {
+                if let Some(va) = self.file_offset_to_va(file_offset) {
+                    results.push(SearchResult::jump(
+                        format!(
+                            "字节序列 FO 0x{file_offset:08X} / VA 0x{va:016X} {}",
+                            format_byte_pattern(&pattern)
+                        ),
+                        va,
+                        "字节序列".to_owned(),
+                    ));
+                } else {
+                    results.push(SearchResult::plain(format!(
+                        "字节序列 FO 0x{file_offset:08X} {}",
+                        format_byte_pattern(&pattern)
+                    )));
+                }
+            }
+        }
+
+        for name in self.project.user_names() {
+            if name.name.to_lowercase().contains(&query_lower)
+                || address_matches(name.address, query)
+            {
+                results.push(SearchResult::jump(
+                    format!("用户名称 0x{:016X} {}", name.address, name.name),
+                    name.address,
+                    name.name,
+                ));
+            }
+        }
+
+        for comment in self.project.address_comments() {
+            if comment.text.to_lowercase().contains(&query_lower)
+                || address_matches(comment.address, query)
+            {
+                results.push(SearchResult::jump(
+                    format!("地址注释 0x{:016X} {}", comment.address, comment.text),
+                    comment.address,
+                    "地址注释".to_owned(),
+                ));
+            }
+        }
+
+        for comment in self.project.function_comments() {
+            if comment.text.to_lowercase().contains(&query_lower)
+                || address_matches(comment.function_start, query)
+            {
+                results.push(SearchResult::jump(
+                    format!(
+                        "函数注释 0x{:016X} {}",
+                        comment.function_start, comment.text
+                    ),
+                    comment.function_start,
+                    "函数注释".to_owned(),
+                ));
+            }
+        }
+
+        for definition in self.project.manual_definitions() {
+            if definition.kind.label().contains(query) || address_matches(definition.address, query)
+            {
+                results.push(SearchResult::jump(
+                    format!(
+                        "手动定义 0x{:016X} {}",
+                        definition.address,
+                        definition.kind.label()
+                    ),
+                    definition.address,
+                    definition.kind.label(),
+                ));
+            }
+        }
+
+        let Some(analysis) = &self.analysis else {
+            if results.len() == 1 {
+                results.push(SearchResult::plain(
+                    "尚未打开可分析的 PE 或 Raw Binary 文件。",
+                ));
+            }
+            return results;
+        };
 
         for function in &analysis.functions {
             let name = self
@@ -1824,69 +2097,109 @@ impl FyIdaApp {
                 .name_for(function.start_va)
                 .unwrap_or(&function.name);
             if name.to_lowercase().contains(&query_lower)
-                || format!("{:016X}", function.start_va).contains(query)
+                || address_matches(function.start_va, query)
             {
-                results.push(format!("函数 0x{:016X} {}", function.start_va, name));
+                results.push(SearchResult::jump(
+                    format!("函数 0x{:016X} {}", function.start_va, name),
+                    function.start_va,
+                    name.to_owned(),
+                ));
             }
         }
 
         for bookmark in self.project.bookmarks() {
-            if format!("{:016X}", bookmark.address).contains(query)
+            if address_matches(bookmark.address, query)
                 || self
                     .project
                     .address_comment(bookmark.address)
                     .map(|comment| comment.to_lowercase().contains(&query_lower))
                     .unwrap_or(false)
             {
-                results.push(format!("书签 0x{:016X}", bookmark.address));
+                results.push(SearchResult::jump(
+                    format!("书签 0x{:016X}", bookmark.address),
+                    bookmark.address,
+                    "书签".to_owned(),
+                ));
             }
         }
 
         for string in &analysis.strings {
             if string.value.to_lowercase().contains(&query_lower)
-                || format!("{:016X}", string.address).contains(query)
+                || address_matches(string.address, query)
             {
-                results.push(format!(
-                    "字符串 0x{:016X} [{}] {}",
+                results.push(SearchResult::jump(
+                    format!(
+                        "字符串 0x{:016X} [{}] {}",
+                        string.address,
+                        string.encoding.label(),
+                        string.value
+                    ),
                     string.address,
-                    string.encoding.label(),
-                    string.value
+                    "字符串".to_owned(),
                 ));
             }
         }
 
         for import in &analysis.imports {
             let name = import.display_name();
-            if name.to_lowercase().contains(&query_lower)
-                || format!("{:016X}", import.thunk_va).contains(query)
+            if name.to_lowercase().contains(&query_lower) || address_matches(import.thunk_va, query)
             {
-                results.push(format!("导入 0x{:016X} {}", import.thunk_va, name));
+                results.push(SearchResult::jump(
+                    format!("导入 0x{:016X} {}", import.thunk_va, name),
+                    import.thunk_va,
+                    name,
+                ));
             }
         }
 
         for export in &analysis.exports {
             if export.name.to_lowercase().contains(&query_lower)
-                || format!("{:016X}", export.va).contains(query)
+                || address_matches(export.va, query)
             {
-                results.push(format!(
-                    "导出 0x{:016X} {} ordinal {}",
-                    export.va, export.name, export.ordinal
+                results.push(SearchResult::jump(
+                    format!(
+                        "导出 0x{:016X} {} ordinal {}",
+                        export.va, export.name, export.ordinal
+                    ),
+                    export.va,
+                    export.name.clone(),
                 ));
             }
         }
 
         for xref in &analysis.xrefs {
-            let from = format!("{:016X}", xref.from_va);
-            let to = format!("{:016X}", xref.to_va);
-            if from.contains(query) || to.contains(query) || xref.kind.label().contains(query) {
-                results.push(format!("交叉引用 {from} -> {to} {}", xref.kind.label()));
+            if address_matches(xref.from_va, query)
+                || address_matches(xref.to_va, query)
+                || xref.kind.label().contains(query)
+                || xref.label.to_lowercase().contains(&query_lower)
+            {
+                results.push(SearchResult::jump(
+                    format!(
+                        "交叉引用 {:016X} -> {:016X} {}",
+                        xref.from_va,
+                        xref.to_va,
+                        xref.kind.label()
+                    ),
+                    xref.from_va,
+                    xref.kind.label(),
+                ));
             }
         }
 
         if results.len() == 1 {
-            results.push("没有匹配结果。".to_owned());
+            results.push(SearchResult::plain("没有匹配结果。"));
         }
         results
+    }
+
+    fn file_offset_to_va(&self, file_offset: u64) -> Option<u64> {
+        if let Some(image) = self.project.pe_image() {
+            image.file_offset_to_va(file_offset)
+        } else if let Some(raw) = self.project.raw_image() {
+            raw.file_offset_to_va(file_offset)
+        } else {
+            None
+        }
     }
 }
 
@@ -1900,6 +2213,87 @@ fn parse_number(text: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16)
         .ok()
         .or_else(|| text.parse::<u64>().ok())
+}
+
+fn address_matches(address: u64, query: &str) -> bool {
+    let query = query
+        .trim()
+        .trim_start_matches("0x")
+        .trim_start_matches("0X")
+        .to_lowercase();
+    if query.is_empty() {
+        return false;
+    }
+
+    format!("{address:016X}").to_lowercase().contains(&query)
+}
+
+fn parse_byte_pattern(text: &str) -> Option<Vec<u8>> {
+    let compact = text
+        .chars()
+        .filter(|character| !character.is_ascii_whitespace())
+        .collect::<String>();
+    if compact.len() < 2
+        || compact.len() % 2 != 0
+        || !compact
+            .chars()
+            .all(|character| character.is_ascii_hexdigit())
+    {
+        return None;
+    }
+
+    let mut bytes = Vec::with_capacity(compact.len() / 2);
+    for index in (0..compact.len()).step_by(2) {
+        let byte = u8::from_str_radix(&compact[index..index + 2], 16).ok()?;
+        bytes.push(byte);
+    }
+    Some(bytes)
+}
+
+fn find_byte_pattern(bytes: &[u8], pattern: &[u8]) -> Vec<u64> {
+    if pattern.is_empty() || pattern.len() > bytes.len() {
+        return Vec::new();
+    }
+
+    bytes
+        .windows(pattern.len())
+        .enumerate()
+        .filter_map(|(offset, window)| {
+            (window == pattern).then(|| u64::try_from(offset).unwrap_or(0))
+        })
+        .collect()
+}
+
+fn format_byte_pattern(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn hex_bytes(bytes: &[u8]) -> String {
+    let mut parts = bytes
+        .iter()
+        .map(|byte| format!("{byte:02X}"))
+        .collect::<Vec<_>>();
+    while parts.len() < 16 {
+        parts.push("  ".to_owned());
+    }
+    parts.join(" ")
+}
+
+fn ascii_preview(bytes: &[u8]) -> String {
+    bytes
+        .iter()
+        .map(|byte| {
+            if byte.is_ascii_graphic() || *byte == b' ' {
+                char::from(*byte)
+            } else {
+                '.'
+            }
+        })
+        .collect()
 }
 
 impl eframe::App for FyIdaApp {
@@ -1987,6 +2381,19 @@ fn tab_strip(ui: &mut Ui, labels: &[&str], selected: &mut usize) {
 fn toolbar_button(ui: &mut Ui, label: &str, tooltip: &str) -> egui::Response {
     ui.add_sized([72.0, 24.0], egui::Button::new(label))
         .on_hover_text(tooltip)
+}
+
+fn toolbar_enabled_button(
+    ui: &mut Ui,
+    enabled: bool,
+    label: &str,
+    tooltip: &str,
+) -> egui::Response {
+    ui.add_enabled_ui(enabled, |ui| {
+        ui.add_sized([72.0, 24.0], egui::Button::new(label))
+    })
+    .inner
+    .on_hover_text(tooltip)
 }
 
 fn disabled_menu_items(ui: &mut Ui, labels: &[&str]) {

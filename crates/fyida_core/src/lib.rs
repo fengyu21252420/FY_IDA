@@ -7,6 +7,7 @@ use sha2::{Digest, Sha256};
 
 pub const APP_NAME: &str = "FY_IDA";
 pub const PROJECT_SCHEMA_VERSION: u32 = 1;
+const MAX_NAVIGATION_HISTORY: usize = 128;
 pub const PE_DIRECTORY_EXPORT: usize = 0;
 pub const PE_DIRECTORY_IMPORT: usize = 1;
 pub const PE_DIRECTORY_BASERELOC: usize = 5;
@@ -577,6 +578,12 @@ enum AnnotationCommand {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+struct NavigationPoint {
+    address: u64,
+    function: Option<String>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisState {
     NoFile,
     NotAnalyzed,
@@ -611,6 +618,8 @@ pub struct ProjectState {
     manual_definitions: BTreeMap<u64, ManualDefinitionKind>,
     undo_stack: Vec<AnnotationCommand>,
     redo_stack: Vec<AnnotationCommand>,
+    back_stack: Vec<NavigationPoint>,
+    forward_stack: Vec<NavigationPoint>,
     current_address: Option<u64>,
     current_rva: Option<u64>,
     current_file_offset: Option<u64>,
@@ -632,6 +641,8 @@ impl Default for ProjectState {
             manual_definitions: BTreeMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
+            back_stack: Vec::new(),
+            forward_stack: Vec::new(),
             current_address: None,
             current_rva: None,
             current_file_offset: None,
@@ -711,6 +722,54 @@ impl ProjectState {
         !self.redo_stack.is_empty()
     }
 
+    pub fn can_go_back(&self) -> bool {
+        !self.back_stack.is_empty()
+    }
+
+    pub fn can_go_forward(&self) -> bool {
+        !self.forward_stack.is_empty()
+    }
+
+    pub fn user_names(&self) -> Vec<UserName> {
+        self.user_names
+            .iter()
+            .map(|(address, name)| UserName {
+                address: *address,
+                name: name.clone(),
+            })
+            .collect()
+    }
+
+    pub fn address_comments(&self) -> Vec<UserComment> {
+        self.address_comments
+            .iter()
+            .map(|(address, text)| UserComment {
+                address: *address,
+                text: text.clone(),
+            })
+            .collect()
+    }
+
+    pub fn function_comments(&self) -> Vec<FunctionComment> {
+        self.function_comments
+            .iter()
+            .map(|(function_start, text)| FunctionComment {
+                function_start: *function_start,
+                text: text.clone(),
+            })
+            .collect()
+    }
+
+    pub fn manual_definitions(&self) -> Vec<ManualDefinition> {
+        self.manual_definitions
+            .iter()
+            .map(|(address, kind)| ManualDefinition {
+                address: *address,
+                kind: *kind,
+            })
+            .collect()
+    }
+
     pub fn bookmarks(&self) -> Vec<Bookmark> {
         self.bookmarks
             .iter()
@@ -723,9 +782,10 @@ impl ProjectState {
         self.pe_image = None;
         self.raw_image = None;
         self.clear_user_state();
+        self.clear_navigation_history();
         self.analysis_state = AnalysisState::NotAnalyzed;
         self.dirty = true;
-        self.jump_to(0x1400_01000, Some("入口占位".to_owned()));
+        self.set_current_location(0x1400_01000, Some("入口占位".to_owned()));
     }
 
     pub fn load_pe(&mut self, pe_image: PeImage) {
@@ -737,6 +797,7 @@ impl ProjectState {
         self.pe_image = Some(pe_image);
         self.raw_image = None;
         self.clear_user_state();
+        self.clear_navigation_history();
         self.analysis_state = AnalysisState::PeLoaded;
         self.dirty = true;
         self.current_address = Some(entry_point);
@@ -753,6 +814,7 @@ impl ProjectState {
         self.pe_image = None;
         self.raw_image = Some(raw_image);
         self.clear_user_state();
+        self.clear_navigation_history();
         self.analysis_state = AnalysisState::RawLoaded;
         self.dirty = true;
         self.current_address = Some(entry_point);
@@ -766,6 +828,7 @@ impl ProjectState {
         self.pe_image = None;
         self.raw_image = None;
         self.clear_user_state();
+        self.clear_navigation_history();
         self.analysis_state = AnalysisState::Error(message.into());
         self.dirty = false;
         self.current_address = None;
@@ -778,10 +841,47 @@ impl ProjectState {
         self.pe_image = None;
         self.raw_image = None;
         self.clear_user_state();
+        self.clear_navigation_history();
         self.analysis_state = AnalysisState::Error(message.into());
     }
 
     pub fn jump_to(&mut self, address: u64, function: Option<String>) {
+        if self.current_address != Some(address) {
+            if let Some(point) = self.current_navigation_point() {
+                self.back_stack.push(point);
+                if self.back_stack.len() > MAX_NAVIGATION_HISTORY {
+                    self.back_stack.remove(0);
+                }
+            }
+            self.forward_stack.clear();
+        }
+
+        self.set_current_location(address, function);
+    }
+
+    pub fn go_back(&mut self) -> bool {
+        let Some(previous) = self.back_stack.pop() else {
+            return false;
+        };
+        if let Some(current) = self.current_navigation_point() {
+            self.forward_stack.push(current);
+        }
+        self.set_current_location(previous.address, previous.function);
+        true
+    }
+
+    pub fn go_forward(&mut self) -> bool {
+        let Some(next) = self.forward_stack.pop() else {
+            return false;
+        };
+        if let Some(current) = self.current_navigation_point() {
+            self.back_stack.push(current);
+        }
+        self.set_current_location(next.address, next.function);
+        true
+    }
+
+    fn set_current_location(&mut self, address: u64, function: Option<String>) {
         self.current_address = Some(address);
 
         if let Some(pe_image) = &self.pe_image {
@@ -981,6 +1081,18 @@ impl ProjectState {
         self.manual_definitions.clear();
         self.undo_stack.clear();
         self.redo_stack.clear();
+    }
+
+    fn clear_navigation_history(&mut self) {
+        self.back_stack.clear();
+        self.forward_stack.clear();
+    }
+
+    fn current_navigation_point(&self) -> Option<NavigationPoint> {
+        self.current_address.map(|address| NavigationPoint {
+            address,
+            function: self.current_function.clone(),
+        })
     }
 
     fn apply_command(&mut self, command: &AnnotationCommand, forward: bool) {
@@ -1275,6 +1387,34 @@ mod tests {
         assert_eq!(project.current_rva(), Some(0x20));
         assert_eq!(project.current_file_offset(), Some(0x20));
         assert_eq!(project.current_function(), Some("raw_entry"));
+    }
+
+    #[test]
+    fn navigation_history_supports_back_and_forward() {
+        let image = sample_pe_image();
+        let mut project = ProjectState::default();
+
+        project.load_pe(image);
+        assert!(!project.can_go_back());
+        assert!(!project.can_go_forward());
+
+        project.jump_to(0x1400_01020, Some("first".to_owned()));
+        project.jump_to(0x1400_01040, Some("second".to_owned()));
+
+        assert!(project.can_go_back());
+        assert!(!project.can_go_forward());
+        assert!(project.go_back());
+        assert_eq!(project.current_address(), Some(0x1400_01020));
+        assert_eq!(project.current_function(), Some("first"));
+        assert!(project.can_go_forward());
+
+        assert!(project.go_back());
+        assert_eq!(project.current_address(), Some(0x1400_01010));
+        assert_eq!(project.current_function(), Some("入口点"));
+
+        assert!(project.go_forward());
+        assert_eq!(project.current_address(), Some(0x1400_01020));
+        assert_eq!(project.current_file_offset(), Some(0x220));
     }
 
     #[test]
