@@ -4,6 +4,35 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.2.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a PE Loader MVP that parses DOS Header, NT Header, COFF File Header, Optional Header, ImageBase, EntryPoint, Machine, Subsystem, Characteristics, and Section Table data.
+- Added VA/RVA/File Offset mapping helpers with unit test coverage.
+- Added GUI PE summary output for basic header fields and section lists.
+- Added clear Chinese error handling for non-PE files.
+- Added headless PE summary output for command-line verification.
+
+### Changed
+
+- Updated the workspace version to `0.2.0-alpha.1`.
+- Replaced file-open placeholders with PE parsing results in the GUI and logs.
+
+### Fixed
+
+- File selection no longer reports successful analysis for unsupported non-PE inputs.
+
+### Known Issues
+
+- x64 disassembly, imports, exports, relocations, strings, and xrefs are still future milestones.
+- Raw Binary loading is still not implemented in this checkpoint.
+
+### Recovery
+
+- Source tag: `v0.2.0-alpha.1`.
+- Roll back with: `git checkout v0.2.0-alpha.1`.
+
 ## v0.1.0-alpha.2 - 2026-06-23
 
 ### Added

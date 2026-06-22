@@ -6,9 +6,11 @@ use eframe::egui::{
     Grid, Key, Layout, RichText, ScrollArea, SidePanel, Stroke, TextEdit, TopBottomPanel, Ui,
     Visuals, Window,
 };
-use fyida_analysis::{file_selected_log_lines, placeholder_disassembly, startup_log_lines};
+use fyida_analysis::{
+    file_error_log_lines, pe_loaded_log_lines, placeholder_disassembly, startup_log_lines,
+};
 use fyida_core::{format_address, FileSelection, ProjectState, APP_NAME};
-use fyida_loader::load_file_metadata;
+use fyida_loader::{load_file_metadata, load_pe_from_selection};
 use rfd::FileDialog;
 
 const LEFT_TABS: [&str; 7] = ["函数", "名称", "字符串", "导入", "导出", "段", "书签"];
@@ -97,20 +99,39 @@ impl FyIdaApp {
 
     fn select_path(&mut self, path: PathBuf) {
         match load_file_metadata(&path) {
-            Ok(selection) => self.apply_file_selection(selection),
+            Ok(selection) => self.load_selected_file(selection),
             Err(error) => {
                 let message = error.to_string();
                 self.project.set_error(message.clone());
                 self.logs.push(message);
+                self.right_tab = 1;
+                self.bottom_tab = 0;
             }
         }
     }
 
-    fn apply_file_selection(&mut self, selection: FileSelection) {
+    fn load_selected_file(&mut self, selection: FileSelection) {
         self.add_recent_file(selection.path().to_path_buf());
-        self.logs.extend(file_selected_log_lines(&selection));
-        self.project.select_file(selection);
+
+        match load_pe_from_selection(selection.clone()) {
+            Ok(image) => self.apply_pe_image(image),
+            Err(error) => self.apply_file_error(selection, error.to_string()),
+        }
+    }
+
+    fn apply_pe_image(&mut self, image: fyida_core::PeImage) {
+        self.logs.extend(pe_loaded_log_lines(&image));
+        self.project.load_pe(image);
         self.center_tab = 0;
+        self.right_tab = 1;
+        self.bottom_tab = 0;
+    }
+
+    fn apply_file_error(&mut self, selection: FileSelection, message: String) {
+        self.logs.extend(file_error_log_lines(&selection, &message));
+        self.project.set_file_error(selection, message);
+        self.center_tab = 0;
+        self.right_tab = 1;
         self.bottom_tab = 0;
     }
 
@@ -248,8 +269,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.1.0-alpha.2");
-                        ui.label("中文 GUI 空壳。");
+                        ui.label("FY_IDA v0.2.0-alpha.1");
+                        ui.label("PE Loader MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -378,19 +399,33 @@ impl FyIdaApp {
             "字符串" => placeholder_list(ui, &["尚未扫描字符串", "打开文件后等待分析"]),
             "导入" => placeholder_list(ui, &["尚未解析导入表"]),
             "导出" => placeholder_list(ui, &["尚未解析导出表"]),
-            "段" => placeholder_list(ui, &[".text 占位", ".rdata 占位", ".data 占位"]),
+            "段" => self.section_list(ui),
             _ => placeholder_list(ui, &["暂无书签"]),
         });
     }
 
     fn function_list(&mut self, ui: &mut Ui) {
-        let rows = if self.project.selected_file().is_some() {
-            vec![
-                ("140001000", "入口占位", "暂未分析"),
-                ("140001020", "sub_140001020", "待识别"),
-            ]
+        let rows = if let Some(image) = self.project.pe_image() {
+            vec![(
+                image.entry_point_va(),
+                format!("{:016X}", image.entry_point_va()),
+                "入口点".to_owned(),
+                "PE Header".to_owned(),
+            )]
+        } else if self.project.selected_file().is_some() {
+            vec![(
+                0,
+                "--------".to_owned(),
+                "无法分析".to_owned(),
+                "非 PE 或加载失败".to_owned(),
+            )]
         } else {
-            vec![("140001000", "示例入口", "占位")]
+            vec![(
+                0x1400_01000,
+                "140001000".to_owned(),
+                "示例入口".to_owned(),
+                "占位".to_owned(),
+            )]
         };
 
         Grid::new("function_list_grid")
@@ -403,14 +438,54 @@ impl FyIdaApp {
                 ui.strong("状态");
                 ui.end_row();
 
-                for (address, name, status) in rows {
+                for (va, address, name, status) in rows {
                     let address_clicked = ui.selectable_label(false, address).clicked();
-                    let name_clicked = ui.selectable_label(false, name).clicked();
+                    let name_clicked = ui.selectable_label(false, &name).clicked();
                     if address_clicked || name_clicked {
-                        self.project.jump_to(0x1400_01000, Some(name.to_owned()));
+                        self.project.jump_to(va, Some(name.clone()));
                         self.logs.push(format!("跳转到函数：{name}"));
                     }
                     ui.label(status);
+                    ui.end_row();
+                }
+            });
+    }
+
+    fn section_list(&mut self, ui: &mut Ui) {
+        let (image_base, sections) = match self.project.pe_image() {
+            Some(image) => (image.image_base(), image.sections.clone()),
+            None => {
+                placeholder_list(ui, &["尚未解析 section table"]);
+                return;
+            }
+        };
+
+        Grid::new("section_list_grid")
+            .num_columns(5)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("名称");
+                ui.strong("RVA");
+                ui.strong("FO");
+                ui.strong("大小");
+                ui.strong("权限");
+                ui.end_row();
+
+                for section in sections {
+                    let va = section.virtual_address_va(image_base);
+                    if ui.selectable_label(false, &section.name).clicked() {
+                        self.project
+                            .jump_to(va, Some(format!("section {}", section.name)));
+                        self.logs.push(format!("跳转到 section：{}", section.name));
+                    }
+                    ui.label(format!("{:08X}", section.virtual_address));
+                    ui.label(format!("{:08X}", section.pointer_to_raw_data));
+                    ui.label(format!(
+                        "V {:X} / R {:X}",
+                        section.virtual_size, section.size_of_raw_data
+                    ));
+                    ui.label(section.permissions());
                     ui.end_row();
                 }
             });
@@ -448,6 +523,76 @@ impl FyIdaApp {
                         ui.label("分析状态");
                         ui.label(self.project.analysis_state().label());
                         ui.end_row();
+
+                        if let Some(image) = self.project.pe_image() {
+                            ui.separator();
+                            ui.separator();
+                            ui.end_row();
+
+                            ui.label("DOS e_magic");
+                            ui.label(format!("0x{:04X} (MZ)", image.dos_header.e_magic));
+                            ui.end_row();
+
+                            ui.label("DOS e_lfanew");
+                            ui.label(format!("0x{:08X}", image.dos_header.e_lfanew));
+                            ui.end_row();
+
+                            ui.label("NT Signature");
+                            ui.label(format!("0x{:08X} (PE)", image.nt_headers.signature));
+                            ui.end_row();
+
+                            ui.label("Machine");
+                            ui.label(format!(
+                                "{} / 0x{:04X}",
+                                image.machine_label(),
+                                image.nt_headers.file_header.machine
+                            ));
+                            ui.end_row();
+
+                            ui.label("Characteristics");
+                            let flags = image
+                                .nt_headers
+                                .file_header
+                                .characteristics_labels()
+                                .join(" | ");
+                            ui.label(format!(
+                                "0x{:04X} {}",
+                                image.nt_headers.file_header.characteristics, flags
+                            ));
+                            ui.end_row();
+
+                            ui.label("Optional Header");
+                            ui.label(format!(
+                                "{} / Magic 0x{:04X}",
+                                image.nt_headers.optional_header.kind.label(),
+                                image.nt_headers.optional_header.magic
+                            ));
+                            ui.end_row();
+
+                            ui.label("ImageBase");
+                            ui.label(format!("0x{:016X}", image.image_base()));
+                            ui.end_row();
+
+                            ui.label("EntryPoint");
+                            ui.label(format!(
+                                "VA 0x{:016X} / RVA 0x{:08X}",
+                                image.entry_point_va(),
+                                image.entry_point_rva()
+                            ));
+                            ui.end_row();
+
+                            ui.label("Subsystem");
+                            ui.label(format!(
+                                "{} / 0x{:04X}",
+                                image.subsystem_label(),
+                                image.nt_headers.optional_header.subsystem
+                            ));
+                            ui.end_row();
+
+                            ui.label("Sections");
+                            ui.label(image.sections.len().to_string());
+                            ui.end_row();
+                        }
                     });
             }
             "局部类型" => placeholder_list(ui, &["暂无局部类型", "后续支持函数原型与结构体"]),
@@ -491,14 +636,14 @@ impl FyIdaApp {
                     ui.strong("注释");
                     ui.end_row();
 
-                    for row in placeholder_disassembly(self.project.selected_file()) {
+                    for row in placeholder_disassembly(self.project.pe_image()) {
                         let address = format!("{:08X}", row.address);
                         if ui
                             .selectable_label(false, RichText::new(address).color(address_color()))
                             .clicked()
                         {
                             self.project
-                                .jump_to(row.address, Some("入口占位".to_owned()));
+                                .jump_to(row.address, Some(row.mnemonic.clone()));
                         }
                         ui.label(RichText::new(row.bytes).color(bytes_color()));
                         ui.label(RichText::new(row.mnemonic).color(mnemonic_color()).strong());
@@ -551,14 +696,32 @@ impl FyIdaApp {
                     ui.strong("00 01 02 03 04 05 06 07 08 09 0A 0B 0C 0D 0E 0F");
                     ui.strong("ASCII / UTF-16 预览");
                     ui.end_row();
-                    ui.label("00001000");
-                    ui.label("4D 5A 90 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??");
-                    ui.label("MZ..");
-                    ui.end_row();
-                    ui.label("00001010");
-                    ui.label("暂未读取文件字节");
-                    ui.label("等待 loader");
-                    ui.end_row();
+
+                    if let Some(image) = self.project.pe_image() {
+                        ui.label("FO 00000000");
+                        ui.label("4D 5A");
+                        ui.label("DOS Header / MZ");
+                        ui.end_row();
+
+                        ui.label(format!("FO {:08X}", image.dos_header.e_lfanew));
+                        ui.label("50 45 00 00");
+                        ui.label("NT Header / PE");
+                        ui.end_row();
+
+                        ui.label(format!("VA {:016X}", image.entry_point_va()));
+                        ui.label(format!("RVA {:08X}", image.entry_point_rva()));
+                        ui.label("EntryPoint");
+                        ui.end_row();
+                    } else {
+                        ui.label("00001000");
+                        ui.label("4D 5A 90 00 ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ?? ??");
+                        ui.label("MZ..");
+                        ui.end_row();
+                        ui.label("00001010");
+                        ui.label("尚未读取文件字节");
+                        ui.label("等待 loader");
+                        ui.end_row();
+                    }
                 });
         });
     }
@@ -596,10 +759,14 @@ impl FyIdaApp {
                 ui.label("输入 VA、RVA、文件偏移、函数名或字符串关键词。");
                 ui.add(TextEdit::singleline(&mut self.quick_jump_text).hint_text("140001000"));
                 if ui.button("跳转").clicked() {
-                    self.project
-                        .jump_to(0x1400_01000, Some("入口占位".to_owned()));
-                    self.logs
-                        .push(format!("快速跳转请求：{}", self.quick_jump_text));
+                    if let Some((va, label)) = self.resolve_jump_input() {
+                        self.project.jump_to(va, Some(label));
+                        self.logs
+                            .push(format!("快速跳转完成：{}", self.quick_jump_text));
+                    } else {
+                        self.logs
+                            .push(format!("快速跳转无法解析：{}", self.quick_jump_text));
+                    }
                     self.quick_jump_open = false;
                 }
             });
@@ -624,6 +791,37 @@ impl FyIdaApp {
             });
         self.search_open = search_open && self.search_open;
     }
+
+    fn resolve_jump_input(&self) -> Option<(u64, String)> {
+        let text = self.quick_jump_text.trim();
+        let image = self.project.pe_image()?;
+
+        if let Some(raw_rva) = text.strip_prefix("rva:") {
+            let rva = parse_number(raw_rva.trim())?;
+            return Some((image.rva_to_va(rva), format!("RVA 0x{rva:08X}")));
+        }
+
+        if let Some(raw_file_offset) = text.strip_prefix("file:") {
+            let file_offset = parse_number(raw_file_offset.trim())?;
+            let va = image.file_offset_to_va(file_offset)?;
+            return Some((va, format!("FO 0x{file_offset:08X}")));
+        }
+
+        let va = parse_number(text)?;
+        Some((va, format!("VA 0x{va:016X}")))
+    }
+}
+
+fn parse_number(text: &str) -> Option<u64> {
+    let text = text.trim();
+    let hex = text
+        .strip_prefix("0x")
+        .or_else(|| text.strip_prefix("0X"))
+        .unwrap_or(text);
+
+    u64::from_str_radix(hex, 16)
+        .ok()
+        .or_else(|| text.parse::<u64>().ok())
 }
 
 impl eframe::App for FyIdaApp {
