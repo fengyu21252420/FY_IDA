@@ -1363,8 +1363,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.9.0-alpha.1");
-                        ui.label("类型系统、C Header 与类型应用 MVP。");
+                        ui.label("FY_IDA v0.10.0-alpha.1");
+                        ui.label("headless JSON/CSV、批量分析与错误报告 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });

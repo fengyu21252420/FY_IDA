@@ -4,6 +4,43 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.10.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a report-based headless output layer for PE and Raw Binary analysis.
+- Added `--export-format text|json|csv` for headless reports.
+- Added `--export all|summary|functions|strings|imports|exports|xrefs|types` for selected CSV/text-oriented exports.
+- Added `--output <OUTPUT>` to write headless reports to files.
+- Added JSON reports with input metadata, SHA-256, sections, functions, strings, imports, exports, relocations, xrefs, CFG/call-graph counts, PDB records, PDB symbols, PDB types, and type-library summaries.
+- Added CSV exports for summaries, functions, strings, imports, exports, xrefs, and types.
+- Added `--batch-dir <DIR>` and `--recursive` for batch directory analysis.
+- Added batch text/JSON/CSV summaries with per-file status, elapsed time, analysis counts, and nested JSON reports for successful files.
+- Added `--timeout-ms <MS>` timeout reporting for single-file and batch headless runs.
+- Added `--error-report <REPORT>` to write JSON error reports for failed single-file or batch runs.
+
+### Changed
+
+- Updated the workspace version to `0.10.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the headless/export checkpoint.
+- Reworked the CLI crate around a stable serializable report model while keeping the GUI positional file behavior intact.
+
+### Fixed
+
+- Headless output can now be consumed by scripts without scraping console text when JSON or CSV output is selected.
+
+### Known Issues
+
+- Timeout handling is cooperative and reports overruns after an analysis call returns; it does not preempt or kill in-progress analysis.
+- Batch raw mode applies the same Raw Binary base/entry/arch options to every file in the directory.
+- JSON batch reports include nested per-file reports and can become large on big directories.
+- Export filtering currently affects CSV/text-oriented output; JSON single-file reports include the complete report model.
+
+### Recovery
+
+- Source tag: `v0.10.0-alpha.1`.
+- Roll back with: `git checkout v0.10.0-alpha.1`.
+
 ## v0.9.0-alpha.1 - 2026-06-23
 
 ### Added

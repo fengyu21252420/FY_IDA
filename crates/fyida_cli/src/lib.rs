@@ -1,16 +1,20 @@
 use std::collections::BTreeMap;
-use std::path::PathBuf;
+use std::fmt::Write as _;
+use std::path::{Path, PathBuf};
+use std::time::{Duration, Instant};
 
-use clap::Parser;
-use fyida_core::RawArch;
+use clap::{Parser, ValueEnum};
+use fyida_analysis::StaticAnalysis;
+use fyida_core::{sha256_hex, RawArch};
 use fyida_loader::RawLoadOptions;
+use serde::Serialize;
 
 #[derive(Debug, Parser)]
 #[command(
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.9.0-alpha.1 已提供内部类型模型、C Header 导入/导出、类型应用和 PDB 类型快照。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.10.0-alpha.1 已提供 headless JSON/CSV 导出、批量目录分析、错误报告、类型导入导出、PDB 符号和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -37,168 +41,1051 @@ pub struct Cli {
     #[arg(long, value_name = "HEADER", help = "导出内置/导入的类型库为 C Header")]
     pub export_types: Option<PathBuf>,
 
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ExportFormat::Text,
+        help = "headless 输出格式"
+    )]
+    pub export_format: ExportFormat,
+
+    #[arg(
+        long,
+        value_enum,
+        default_value_t = ExportKind::All,
+        help = "CSV/text 输出的数据范围"
+    )]
+    pub export: ExportKind,
+
+    #[arg(long, value_name = "OUTPUT", help = "将 headless 报告写入文件")]
+    pub output: Option<PathBuf>,
+
+    #[arg(long, value_name = "DIR", help = "批量分析目录中的文件")]
+    pub batch_dir: Option<PathBuf>,
+
+    #[arg(long, help = "批量分析时递归子目录")]
+    pub recursive: bool,
+
+    #[arg(long, default_value_t = 0, help = "单文件分析超时毫秒；0 表示不限制")]
+    pub timeout_ms: u64,
+
+    #[arg(
+        long,
+        value_name = "REPORT",
+        help = "将 headless 错误报告写入 JSON 文件"
+    )]
+    pub error_report: Option<PathBuf>,
+
     #[arg(value_name = "FILE", help = "启动 GUI 时预选的输入文件路径")]
     pub file: Option<PathBuf>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportFormat {
+    Text,
+    Json,
+    Csv,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum ExportKind {
+    All,
+    Summary,
+    Functions,
+    Strings,
+    Imports,
+    Exports,
+    Xrefs,
+    Types,
+}
+
+#[derive(Debug, Serialize)]
+struct HeadlessReport {
+    version: String,
+    input: InputReport,
+    analysis: AnalysisReport,
+    type_library: TypeLibraryReport,
+    messages: Vec<String>,
+    elapsed_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct InputReport {
+    path: String,
+    kind: String,
+    size_bytes: u64,
+    sha256: String,
+    arch: Option<String>,
+    base_address: Option<u64>,
+    entry_va: Option<u64>,
+    entry_rva_or_offset: Option<u64>,
+    image_base: Option<u64>,
+    machine: Option<String>,
+    subsystem: Option<String>,
+    sections: Vec<SectionReport>,
+}
+
+#[derive(Debug, Serialize)]
+struct SectionReport {
+    name: String,
+    rva: u32,
+    va: u64,
+    file_offset: u32,
+    virtual_size: u32,
+    raw_size: u32,
+    permissions: String,
+}
+
+#[derive(Debug, Serialize)]
+struct AnalysisReport {
+    functions: Vec<FunctionRecord>,
+    strings: Vec<StringRecord>,
+    imports: Vec<ImportRecord>,
+    exports: Vec<ExportRecord>,
+    relocations: Vec<RelocationRecord>,
+    xrefs: Vec<XrefRecord>,
+    cfg_count: usize,
+    call_graph_nodes: usize,
+    call_graph_edges: usize,
+    pdb_records: Vec<PdbRecord>,
+    pdb_symbols: Vec<PdbSymbolRecord>,
+    pdb_types: Vec<PdbTypeRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct FunctionRecord {
+    start_va: u64,
+    name: String,
+    size: u64,
+    instruction_count: usize,
+    call_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct StringRecord {
+    address: u64,
+    file_offset: u64,
+    encoding: String,
+    value: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ImportRecord {
+    thunk_va: u64,
+    thunk_rva: u32,
+    dll: String,
+    name: Option<String>,
+    ordinal: Option<u16>,
+    hint: Option<u16>,
+    display_name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct ExportRecord {
+    va: u64,
+    rva: u32,
+    ordinal: u32,
+    name: String,
+}
+
+#[derive(Debug, Serialize)]
+struct RelocationRecord {
+    va: u64,
+    rva: u32,
+    page_rva: u32,
+    kind: String,
+}
+
+#[derive(Debug, Serialize)]
+struct XrefRecord {
+    from_va: u64,
+    to_va: u64,
+    kind: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PdbRecord {
+    format: String,
+    path: String,
+    guid: Option<String>,
+    age: Option<u32>,
+    signature: Option<u32>,
+    debug_rva: u32,
+    debug_file_offset: u32,
+}
+
+#[derive(Debug, Serialize)]
+struct PdbSymbolRecord {
+    address: Option<u64>,
+    rva: Option<u32>,
+    kind: String,
+    name: String,
+    original_name: String,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PdbTypeRecord {
+    name: String,
+    kind: String,
+    source: String,
+}
+
+#[derive(Debug, Serialize)]
+struct TypeLibraryReport {
+    count: usize,
+    types: Vec<TypeRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct TypeRecord {
+    name: String,
+    kind: String,
+    source: String,
+    signature: String,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchReport {
+    version: String,
+    root: String,
+    recursive: bool,
+    files: Vec<BatchFileReport>,
+    errors: Vec<BatchError>,
+    elapsed_ms: u128,
+}
+
+#[derive(Debug, Serialize)]
+struct BatchFileReport {
+    path: String,
+    status: String,
+    elapsed_ms: u128,
+    functions: usize,
+    strings: usize,
+    imports: usize,
+    exports: usize,
+    xrefs: usize,
+    pdb_symbols: usize,
+    pdb_types: usize,
+    error: Option<String>,
+    report: Option<HeadlessReport>,
+}
+
+#[derive(Debug, Clone, Serialize)]
+struct BatchError {
+    path: String,
+    message: String,
+}
+
+struct CliTypeLoad {
+    types: Vec<fyida_core::ProjectType>,
+    messages: Vec<String>,
+}
+
 pub fn run_headless(cli: &Cli) -> i32 {
-    let Some(file) = &cli.file else {
-        println!("FY_IDA headless 模式需要提供输入文件。");
-        return 2;
-    };
-    let cli_types = match load_cli_types(cli) {
+    let type_load = match load_cli_types(cli) {
         Ok(types) => types,
         Err(message) => {
+            let _ = write_errors(
+                cli,
+                &[BatchError {
+                    path: "-".to_owned(),
+                    message: message.clone(),
+                }],
+            );
             eprintln!("类型参数错误：{message}");
             return 2;
         }
     };
 
-    if cli.raw {
-        let options = match raw_options(cli) {
-            Ok(options) => options,
-            Err(message) => {
-                eprintln!("Raw Binary 参数错误：{message}");
-                return 2;
-            }
-        };
-
-        return match fyida_loader::load_raw_file_with_bytes(file, options) {
-            Ok(loaded) => {
-                let image = loaded.image;
-                println!("Raw Binary 加载完成：{}", image.file().path().display());
-                println!("Arch：{}", image.arch.label());
-                println!("Base：0x{:016X}", image.base_address);
-                println!(
-                    "Entry：VA 0x{:016X} / FO 0x{:08X}",
-                    image.entry_address,
-                    image.entry_offset().unwrap_or(0)
-                );
-                println!("Size：{}", image.file().formatted_size());
-
-                match fyida_disasm::disassemble_raw_entry_point(&image, &loaded.bytes) {
-                    Ok(instructions) => {
-                        println!("Raw 入口点反汇编：");
-                        for instruction in instructions {
-                            let comment = if instruction.invalid {
-                                " ; 无效 x64 指令占位"
-                            } else {
-                                ""
-                            };
-                            println!(
-                                "  {:016X}  {:<24} {:<8} {}{}",
-                                instruction.address,
-                                instruction.bytes_text(),
-                                instruction.mnemonic,
-                                instruction.operands,
-                                comment
-                            );
-                        }
-                    }
-                    Err(error) => {
-                        println!("Raw 反汇编提示：{error}");
-                    }
-                }
-
-                let analysis = fyida_analysis::analyze_raw(&image, &loaded.bytes);
-                print_static_analysis(&analysis);
-                print_type_library(&cli_types);
-                0
-            }
-            Err(error) => {
-                eprintln!("Raw Binary 加载失败：{error}");
-                1
-            }
-        };
+    if let Some(batch_dir) = &cli.batch_dir {
+        return run_batch(cli, batch_dir, &type_load);
     }
 
-    match fyida_loader::load_pe_file_with_bytes(file) {
-        Ok(loaded) => {
-            let image = loaded.image;
-            println!("PE 加载完成：{}", image.file().path().display());
-            println!(
-                "Machine：{} (0x{:04X})",
-                image.machine_label(),
-                image.nt_headers.file_header.machine
-            );
-            println!("ImageBase：0x{:016X}", image.image_base());
-            println!(
-                "EntryPoint：VA 0x{:016X} / RVA 0x{:08X}",
-                image.entry_point_va(),
-                image.entry_point_rva()
-            );
-            println!("Subsystem：{}", image.subsystem_label());
-            println!("Sections：{}", image.sections.len());
-            for section in &image.sections {
-                println!(
-                    "  {} RVA 0x{:08X} VA 0x{:016X} FO 0x{:08X} VS 0x{:X} RAW 0x{:X} {}",
-                    section.name,
-                    section.virtual_address,
-                    section.virtual_address_va(image.image_base()),
-                    section.pointer_to_raw_data,
-                    section.virtual_size,
-                    section.size_of_raw_data,
-                    section.permissions()
+    let Some(file) = &cli.file else {
+        let message = "FY_IDA headless 模式需要提供输入文件，或使用 --batch-dir。".to_owned();
+        let _ = write_errors(
+            cli,
+            &[BatchError {
+                path: "-".to_owned(),
+                message: message.clone(),
+            }],
+        );
+        eprintln!("{message}");
+        return 2;
+    };
+
+    match analyze_one(cli, file, &type_load) {
+        Ok(report) => match emit_single_report(cli, &report) {
+            Ok(()) => 0,
+            Err(message) => {
+                let _ = write_errors(
+                    cli,
+                    &[BatchError {
+                        path: file.display().to_string(),
+                        message: message.clone(),
+                    }],
                 );
+                eprintln!("导出失败：{message}");
+                1
             }
-
-            match fyida_disasm::disassemble_entry_point(&image, &loaded.bytes) {
-                Ok(instructions) => {
-                    println!("入口点反汇编：");
-                    for instruction in instructions {
-                        let comment = if instruction.invalid {
-                            " ; 无效 x64 指令占位"
-                        } else {
-                            ""
-                        };
-                        println!(
-                            "  {:016X}  {:<24} {:<8} {}{}",
-                            instruction.address,
-                            instruction.bytes_text(),
-                            instruction.mnemonic,
-                            instruction.operands,
-                            comment
-                        );
-                    }
-                }
-                Err(error) => {
-                    println!("反汇编提示：{error}");
-                }
-            }
-
-            let mut analysis = fyida_analysis::analyze_pe(&image, &loaded.bytes);
-            if let Some(pdb_path) = &cli.pdb {
-                match fyida_analysis::apply_pdb_file(&image, &mut analysis, pdb_path) {
-                    Ok(summary) => {
-                        println!(
-                            "PDB 已加载：{} / symbols {} / types {} / sources {} / match {}",
-                            summary.loaded.path,
-                            summary.symbol_count,
-                            summary.type_count,
-                            summary.source_count,
-                            match summary.loaded.matched_pe {
-                                Some(true) => "yes",
-                                Some(false) => "no",
-                                None => "unknown",
-                            }
-                        );
-                    }
-                    Err(error) => println!("PDB 加载失败：{error}"),
-                }
-            }
-            print_static_analysis(&analysis);
-            print_type_library(&cli_types);
-            0
-        }
-        Err(error) => {
-            eprintln!("PE 加载失败：{error}");
+        },
+        Err(message) => {
+            let _ = write_errors(
+                cli,
+                &[BatchError {
+                    path: file.display().to_string(),
+                    message: message.clone(),
+                }],
+            );
+            eprintln!("{message}");
             1
         }
     }
 }
 
-fn load_cli_types(cli: &Cli) -> Result<Vec<fyida_core::ProjectType>, String> {
+fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
+    let started = Instant::now();
+    let files = match collect_batch_files(batch_dir, cli.recursive) {
+        Ok(files) => files,
+        Err(message) => {
+            let _ = write_errors(
+                cli,
+                &[BatchError {
+                    path: batch_dir.display().to_string(),
+                    message: message.clone(),
+                }],
+            );
+            eprintln!("批量分析失败：{message}");
+            return 1;
+        }
+    };
+
+    let mut entries = Vec::new();
+    let mut errors = Vec::new();
+    for file in files {
+        let file_started = Instant::now();
+        match analyze_one(cli, &file, type_load) {
+            Ok(report) => {
+                let elapsed_ms = file_started.elapsed().as_millis();
+                if timed_out(cli, file_started.elapsed()) {
+                    let message = format!("分析超过 timeout-ms {}", cli.timeout_ms);
+                    errors.push(BatchError {
+                        path: file.display().to_string(),
+                        message: message.clone(),
+                    });
+                    entries.push(BatchFileReport {
+                        path: file.display().to_string(),
+                        status: "timeout".to_owned(),
+                        elapsed_ms,
+                        functions: 0,
+                        strings: 0,
+                        imports: 0,
+                        exports: 0,
+                        xrefs: 0,
+                        pdb_symbols: 0,
+                        pdb_types: 0,
+                        error: Some(message),
+                        report: None,
+                    });
+                } else {
+                    entries.push(batch_success(
+                        file.display().to_string(),
+                        elapsed_ms,
+                        report,
+                    ));
+                }
+            }
+            Err(message) => {
+                let elapsed_ms = file_started.elapsed().as_millis();
+                errors.push(BatchError {
+                    path: file.display().to_string(),
+                    message: message.clone(),
+                });
+                entries.push(BatchFileReport {
+                    path: file.display().to_string(),
+                    status: "error".to_owned(),
+                    elapsed_ms,
+                    functions: 0,
+                    strings: 0,
+                    imports: 0,
+                    exports: 0,
+                    xrefs: 0,
+                    pdb_symbols: 0,
+                    pdb_types: 0,
+                    error: Some(message),
+                    report: None,
+                });
+            }
+        }
+    }
+
+    let report = BatchReport {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        root: batch_dir.display().to_string(),
+        recursive: cli.recursive,
+        files: entries,
+        errors,
+        elapsed_ms: started.elapsed().as_millis(),
+    };
+    if let Err(message) = write_errors(cli, &report.errors) {
+        eprintln!("错误报告写入失败：{message}");
+        return 1;
+    }
+    match emit_batch_report(cli, &report) {
+        Ok(()) if report.errors.is_empty() => 0,
+        Ok(()) => 1,
+        Err(message) => {
+            eprintln!("批量报告导出失败：{message}");
+            1
+        }
+    }
+}
+
+fn batch_success(path: String, elapsed_ms: u128, report: HeadlessReport) -> BatchFileReport {
+    BatchFileReport {
+        path,
+        status: "ok".to_owned(),
+        elapsed_ms,
+        functions: report.analysis.functions.len(),
+        strings: report.analysis.strings.len(),
+        imports: report.analysis.imports.len(),
+        exports: report.analysis.exports.len(),
+        xrefs: report.analysis.xrefs.len(),
+        pdb_symbols: report.analysis.pdb_symbols.len(),
+        pdb_types: report.analysis.pdb_types.len(),
+        error: None,
+        report: Some(report),
+    }
+}
+
+fn analyze_one(cli: &Cli, file: &Path, type_load: &CliTypeLoad) -> Result<HeadlessReport, String> {
+    let started = Instant::now();
+    if cli.raw {
+        let options = raw_options(cli)?;
+        let loaded = fyida_loader::load_raw_file_with_bytes(file, options)
+            .map_err(|error| format!("Raw Binary 加载失败：{error}"))?;
+        let analysis = fyida_analysis::analyze_raw(&loaded.image, &loaded.bytes);
+        let report = HeadlessReport {
+            version: env!("CARGO_PKG_VERSION").to_owned(),
+            input: raw_input_report(&loaded.image, &loaded.bytes),
+            analysis: analysis_report(&analysis),
+            type_library: type_library_report(&type_load.types),
+            messages: type_load.messages.clone(),
+            elapsed_ms: started.elapsed().as_millis(),
+        };
+        return timeout_checked(cli, started, report);
+    }
+
+    let loaded = fyida_loader::load_pe_file_with_bytes(file)
+        .map_err(|error| format!("PE 加载失败：{error}"))?;
+    let mut analysis = fyida_analysis::analyze_pe(&loaded.image, &loaded.bytes);
+    let mut messages = type_load.messages.clone();
+    if let Some(pdb_path) = &cli.pdb {
+        match fyida_analysis::apply_pdb_file(&loaded.image, &mut analysis, pdb_path) {
+            Ok(summary) => messages.push(format!(
+                "PDB 已加载：{} / symbols {} / types {} / sources {} / match {}",
+                summary.loaded.path,
+                summary.symbol_count,
+                summary.type_count,
+                summary.source_count,
+                match summary.loaded.matched_pe {
+                    Some(true) => "yes",
+                    Some(false) => "no",
+                    None => "unknown",
+                }
+            )),
+            Err(error) => messages.push(format!("PDB 加载失败：{error}")),
+        }
+    }
+
+    let report = HeadlessReport {
+        version: env!("CARGO_PKG_VERSION").to_owned(),
+        input: pe_input_report(&loaded.image, &loaded.bytes),
+        analysis: analysis_report(&analysis),
+        type_library: type_library_report(&type_load.types),
+        messages,
+        elapsed_ms: started.elapsed().as_millis(),
+    };
+    timeout_checked(cli, started, report)
+}
+
+fn timeout_checked(
+    cli: &Cli,
+    started: Instant,
+    report: HeadlessReport,
+) -> Result<HeadlessReport, String> {
+    if timed_out(cli, started.elapsed()) {
+        Err(format!("分析超过 timeout-ms {}", cli.timeout_ms))
+    } else {
+        Ok(report)
+    }
+}
+
+fn timed_out(cli: &Cli, elapsed: Duration) -> bool {
+    cli.timeout_ms > 0 && elapsed > Duration::from_millis(cli.timeout_ms)
+}
+
+fn pe_input_report(image: &fyida_core::PeImage, bytes: &[u8]) -> InputReport {
+    InputReport {
+        path: image.file().path().display().to_string(),
+        kind: "PE".to_owned(),
+        size_bytes: image.file().size_bytes(),
+        sha256: sha256_hex(bytes),
+        arch: Some("x64".to_owned()),
+        base_address: Some(image.image_base()),
+        entry_va: Some(image.entry_point_va()),
+        entry_rva_or_offset: Some(u64::from(image.entry_point_rva())),
+        image_base: Some(image.image_base()),
+        machine: Some(image.machine_label().to_owned()),
+        subsystem: Some(image.subsystem_label().to_owned()),
+        sections: image
+            .sections
+            .iter()
+            .map(|section| SectionReport {
+                name: section.name.clone(),
+                rva: section.virtual_address,
+                va: section.virtual_address_va(image.image_base()),
+                file_offset: section.pointer_to_raw_data,
+                virtual_size: section.virtual_size,
+                raw_size: section.size_of_raw_data,
+                permissions: section.permissions(),
+            })
+            .collect(),
+    }
+}
+
+fn raw_input_report(image: &fyida_core::RawImage, bytes: &[u8]) -> InputReport {
+    InputReport {
+        path: image.file().path().display().to_string(),
+        kind: "Raw Binary".to_owned(),
+        size_bytes: image.file().size_bytes(),
+        sha256: sha256_hex(bytes),
+        arch: Some(image.arch.label().to_owned()),
+        base_address: Some(image.base_address),
+        entry_va: Some(image.entry_address),
+        entry_rva_or_offset: image.entry_offset(),
+        image_base: None,
+        machine: None,
+        subsystem: None,
+        sections: Vec::new(),
+    }
+}
+
+fn analysis_report(analysis: &StaticAnalysis) -> AnalysisReport {
+    AnalysisReport {
+        functions: analysis
+            .functions
+            .iter()
+            .map(|function| FunctionRecord {
+                start_va: function.start_va,
+                name: function.name.clone(),
+                size: function.size,
+                instruction_count: function.instruction_count,
+                call_count: function.call_count,
+            })
+            .collect(),
+        strings: analysis
+            .strings
+            .iter()
+            .map(|string| StringRecord {
+                address: string.address,
+                file_offset: string.file_offset,
+                encoding: string.encoding.label().to_owned(),
+                value: string.value.clone(),
+            })
+            .collect(),
+        imports: analysis
+            .imports
+            .iter()
+            .map(|import| ImportRecord {
+                thunk_va: import.thunk_va,
+                thunk_rva: import.thunk_rva,
+                dll: import.dll.clone(),
+                name: import.name.clone(),
+                ordinal: import.ordinal,
+                hint: import.hint,
+                display_name: import.display_name(),
+            })
+            .collect(),
+        exports: analysis
+            .exports
+            .iter()
+            .map(|export| ExportRecord {
+                va: export.va,
+                rva: export.rva,
+                ordinal: export.ordinal,
+                name: export.name.clone(),
+            })
+            .collect(),
+        relocations: analysis
+            .relocations
+            .iter()
+            .map(|relocation| RelocationRecord {
+                va: relocation.va,
+                rva: relocation.rva,
+                page_rva: relocation.page_rva,
+                kind: relocation.kind_label().to_owned(),
+            })
+            .collect(),
+        xrefs: analysis
+            .xrefs
+            .iter()
+            .map(|xref| XrefRecord {
+                from_va: xref.from_va,
+                to_va: xref.to_va,
+                kind: xref.kind.label().to_owned(),
+                label: xref.label.clone(),
+            })
+            .collect(),
+        cfg_count: analysis.function_cfgs.len(),
+        call_graph_nodes: analysis.call_graph.nodes.len(),
+        call_graph_edges: analysis.call_graph.edges.len(),
+        pdb_records: analysis
+            .pe_pdb_records
+            .iter()
+            .map(|record| PdbRecord {
+                format: record.format.label().to_owned(),
+                path: record.path.clone(),
+                guid: record.guid.clone(),
+                age: record.age,
+                signature: record.signature,
+                debug_rva: record.debug_rva,
+                debug_file_offset: record.debug_file_offset,
+            })
+            .collect(),
+        pdb_symbols: analysis
+            .pdb_symbols
+            .iter()
+            .map(|symbol| PdbSymbolRecord {
+                address: symbol.address,
+                rva: symbol.rva,
+                kind: symbol.kind.label().to_owned(),
+                name: symbol.display_name().to_owned(),
+                original_name: symbol.name.clone(),
+                source: symbol.source.clone(),
+            })
+            .collect(),
+        pdb_types: analysis
+            .pdb_types
+            .iter()
+            .map(|type_item| PdbTypeRecord {
+                name: type_item.name.clone(),
+                kind: type_item.kind.clone(),
+                source: type_item.source.clone(),
+            })
+            .collect(),
+    }
+}
+
+fn type_library_report(types: &[fyida_core::ProjectType]) -> TypeLibraryReport {
+    TypeLibraryReport {
+        count: types.len(),
+        types: types
+            .iter()
+            .map(|type_item| TypeRecord {
+                name: type_item.name.clone(),
+                kind: type_item.kind.clone(),
+                source: type_item.source.clone(),
+                signature: type_item.display_signature(),
+            })
+            .collect(),
+    }
+}
+
+fn emit_single_report(cli: &Cli, report: &HeadlessReport) -> Result<(), String> {
+    let encoded = match cli.export_format {
+        ExportFormat::Text => text_report(report),
+        ExportFormat::Json => serde_json::to_string_pretty(report)
+            .map_err(|error| format!("JSON 编码失败：{error}"))?,
+        ExportFormat::Csv => csv_report(report, cli.export),
+    };
+    emit_output(cli.output.as_deref(), &encoded)
+}
+
+fn emit_batch_report(cli: &Cli, report: &BatchReport) -> Result<(), String> {
+    let encoded = match cli.export_format {
+        ExportFormat::Text => text_batch_report(report),
+        ExportFormat::Json => serde_json::to_string_pretty(report)
+            .map_err(|error| format!("JSON 编码失败：{error}"))?,
+        ExportFormat::Csv => csv_batch_report(report),
+    };
+    emit_output(cli.output.as_deref(), &encoded)
+}
+
+fn emit_output(path: Option<&Path>, encoded: &str) -> Result<(), String> {
+    if let Some(path) = path {
+        std::fs::write(path, encoded)
+            .map_err(|error| format!("无法写入 {}：{error}", path.display()))
+    } else {
+        print!("{encoded}");
+        Ok(())
+    }
+}
+
+fn write_errors(cli: &Cli, errors: &[BatchError]) -> Result<(), String> {
+    if errors.is_empty() {
+        return Ok(());
+    }
+    let Some(path) = &cli.error_report else {
+        return Ok(());
+    };
+    let encoded = serde_json::to_string_pretty(errors)
+        .map_err(|error| format!("错误报告编码失败：{error}"))?;
+    std::fs::write(path, encoded).map_err(|error| format!("无法写入 {}：{error}", path.display()))
+}
+
+fn text_report(report: &HeadlessReport) -> String {
+    let mut text = String::new();
+    let _ = writeln!(
+        text,
+        "{} 加载完成：{}",
+        report.input.kind, report.input.path
+    );
+    if let Some(machine) = &report.input.machine {
+        let _ = writeln!(text, "Machine：{machine}");
+    }
+    if let Some(base) = report.input.base_address {
+        let _ = writeln!(text, "Base：0x{base:016X}");
+    }
+    if let Some(entry) = report.input.entry_va {
+        let _ = writeln!(text, "Entry：0x{entry:016X}");
+    }
+    let _ = writeln!(text, "Size：{}", report.input.size_bytes);
+    for message in &report.messages {
+        let _ = writeln!(text, "{message}");
+    }
+    let _ = writeln!(text, "基础静态分析：");
+    let _ = writeln!(text, "  Functions：{}", report.analysis.functions.len());
+    for function in report.analysis.functions.iter().take(64) {
+        let _ = writeln!(
+            text,
+            "    {:016X} {:<24} size 0x{:X} insns {} calls {}",
+            function.start_va,
+            function.name,
+            function.size,
+            function.instruction_count,
+            function.call_count
+        );
+    }
+    let _ = writeln!(text, "  Strings：{}", report.analysis.strings.len());
+    let _ = writeln!(text, "  Imports：{}", report.analysis.imports.len());
+    let _ = writeln!(text, "  Exports：{}", report.analysis.exports.len());
+    let _ = writeln!(text, "  Relocations：{}", report.analysis.relocations.len());
+    let _ = writeln!(text, "  Xrefs：{}", report.analysis.xrefs.len());
+    let _ = writeln!(text, "  CFGs：{}", report.analysis.cfg_count);
+    let _ = writeln!(
+        text,
+        "  CallGraph：{} nodes / {} edges",
+        report.analysis.call_graph_nodes, report.analysis.call_graph_edges
+    );
+    let _ = writeln!(text, "  PDBRecords：{}", report.analysis.pdb_records.len());
+    let _ = writeln!(text, "  PDBSymbols：{}", report.analysis.pdb_symbols.len());
+    let _ = writeln!(text, "  PDBTypes：{}", report.analysis.pdb_types.len());
+    let _ = writeln!(text, "  TypeLibrary：{}", report.type_library.count);
+    for type_item in report.type_library.types.iter().take(32) {
+        let _ = writeln!(
+            text,
+            "    [{}] {} - {}",
+            type_item.kind, type_item.name, type_item.signature
+        );
+    }
+    text
+}
+
+fn text_batch_report(report: &BatchReport) -> String {
+    let mut text = String::new();
+    let ok_count = report
+        .files
+        .iter()
+        .filter(|entry| entry.status == "ok")
+        .count();
+    let _ = writeln!(
+        text,
+        "批量分析完成：{} / ok {} / errors {}",
+        report.root,
+        ok_count,
+        report.errors.len()
+    );
+    for entry in &report.files {
+        let _ = writeln!(
+            text,
+            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\t{}",
+            entry.status,
+            entry.path,
+            entry.functions,
+            entry.strings,
+            entry.imports,
+            entry.xrefs,
+            entry.error.as_deref().unwrap_or("")
+        );
+    }
+    text
+}
+
+fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
+    match kind {
+        ExportKind::Summary => csv_summary(report),
+        ExportKind::Functions => csv_functions(&report.analysis.functions),
+        ExportKind::Strings => csv_strings(&report.analysis.strings),
+        ExportKind::Imports => csv_imports(&report.analysis.imports),
+        ExportKind::Exports => csv_exports(&report.analysis.exports),
+        ExportKind::Xrefs => csv_xrefs(&report.analysis.xrefs),
+        ExportKind::Types => csv_types(&report.type_library.types),
+        ExportKind::All => {
+            let mut csv = String::new();
+            csv.push_str("section,key,value\n");
+            push_csv_row(&mut csv, &["summary", "path", &report.input.path]);
+            push_csv_row(&mut csv, &["summary", "kind", &report.input.kind]);
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "functions",
+                    &report.analysis.functions.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "strings",
+                    &report.analysis.strings.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "imports",
+                    &report.analysis.imports.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &["summary", "xrefs", &report.analysis.xrefs.len().to_string()],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "type_library",
+                    &report.type_library.count.to_string(),
+                ],
+            );
+            csv
+        }
+    }
+}
+
+fn csv_summary(report: &HeadlessReport) -> String {
+    let mut csv = String::from("key,value\n");
+    push_csv_row(&mut csv, &["path", &report.input.path]);
+    push_csv_row(&mut csv, &["kind", &report.input.kind]);
+    push_csv_row(
+        &mut csv,
+        &["functions", &report.analysis.functions.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &["strings", &report.analysis.strings.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &["imports", &report.analysis.imports.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &["xrefs", &report.analysis.xrefs.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &["type_library", &report.type_library.count.to_string()],
+    );
+    csv
+}
+
+fn csv_functions(functions: &[FunctionRecord]) -> String {
+    let mut csv = String::from("start_va,name,size,instruction_count,call_count\n");
+    for function in functions {
+        push_csv_row(
+            &mut csv,
+            &[
+                &format!("{:016X}", function.start_va),
+                &function.name,
+                &format!("0x{:X}", function.size),
+                &function.instruction_count.to_string(),
+                &function.call_count.to_string(),
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_strings(strings: &[StringRecord]) -> String {
+    let mut csv = String::from("address,file_offset,encoding,value\n");
+    for string in strings {
+        push_csv_row(
+            &mut csv,
+            &[
+                &format!("{:016X}", string.address),
+                &format!("{:08X}", string.file_offset),
+                &string.encoding,
+                &string.value,
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_imports(imports: &[ImportRecord]) -> String {
+    let mut csv = String::from("thunk_va,dll,name,ordinal,hint,display_name\n");
+    for import in imports {
+        push_csv_row(
+            &mut csv,
+            &[
+                &format!("{:016X}", import.thunk_va),
+                &import.dll,
+                import.name.as_deref().unwrap_or(""),
+                &import
+                    .ordinal
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                &import
+                    .hint
+                    .map(|value| value.to_string())
+                    .unwrap_or_default(),
+                &import.display_name,
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_exports(exports: &[ExportRecord]) -> String {
+    let mut csv = String::from("va,rva,ordinal,name\n");
+    for export in exports {
+        push_csv_row(
+            &mut csv,
+            &[
+                &format!("{:016X}", export.va),
+                &format!("{:08X}", export.rva),
+                &export.ordinal.to_string(),
+                &export.name,
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_xrefs(xrefs: &[XrefRecord]) -> String {
+    let mut csv = String::from("from_va,to_va,kind,label\n");
+    for xref in xrefs {
+        push_csv_row(
+            &mut csv,
+            &[
+                &format!("{:016X}", xref.from_va),
+                &format!("{:016X}", xref.to_va),
+                &xref.kind,
+                &xref.label,
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_types(types: &[TypeRecord]) -> String {
+    let mut csv = String::from("name,kind,source,signature\n");
+    for type_item in types {
+        push_csv_row(
+            &mut csv,
+            &[
+                &type_item.name,
+                &type_item.kind,
+                &type_item.source,
+                &type_item.signature,
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_batch_report(report: &BatchReport) -> String {
+    let mut csv = String::from(
+        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,pdb_symbols,pdb_types,error\n",
+    );
+    for entry in &report.files {
+        push_csv_row(
+            &mut csv,
+            &[
+                &entry.path,
+                &entry.status,
+                &entry.elapsed_ms.to_string(),
+                &entry.functions.to_string(),
+                &entry.strings.to_string(),
+                &entry.imports.to_string(),
+                &entry.exports.to_string(),
+                &entry.xrefs.to_string(),
+                &entry.pdb_symbols.to_string(),
+                &entry.pdb_types.to_string(),
+                entry.error.as_deref().unwrap_or(""),
+            ],
+        );
+    }
+    csv
+}
+
+fn push_csv_row(csv: &mut String, cells: &[&str]) {
+    for (index, cell) in cells.iter().enumerate() {
+        if index > 0 {
+            csv.push(',');
+        }
+        csv.push_str(&csv_escape(cell));
+    }
+    csv.push('\n');
+}
+
+fn csv_escape(value: &str) -> String {
+    if value.contains(',') || value.contains('"') || value.contains('\n') || value.contains('\r') {
+        format!("\"{}\"", value.replace('"', "\"\""))
+    } else {
+        value.to_owned()
+    }
+}
+
+fn collect_batch_files(root: &Path, recursive: bool) -> Result<Vec<PathBuf>, String> {
+    let metadata = std::fs::metadata(root)
+        .map_err(|error| format!("无法读取目录 {}：{error}", root.display()))?;
+    if !metadata.is_dir() {
+        return Err(format!("不是目录：{}", root.display()));
+    }
+
+    let mut files = Vec::new();
+    let mut stack = vec![root.to_path_buf()];
+    while let Some(directory) = stack.pop() {
+        let entries = std::fs::read_dir(&directory)
+            .map_err(|error| format!("无法枚举目录 {}：{error}", directory.display()))?;
+        for entry in entries {
+            let entry = entry.map_err(|error| format!("枚举目录失败：{error}"))?;
+            let path = entry.path();
+            let metadata = entry
+                .metadata()
+                .map_err(|error| format!("无法读取 {}：{error}", path.display()))?;
+            if metadata.is_file() {
+                files.push(path);
+            } else if recursive && metadata.is_dir() {
+                stack.push(path);
+            }
+        }
+    }
+    files.sort();
+    Ok(files)
+}
+
+fn load_cli_types(cli: &Cli) -> Result<CliTypeLoad, String> {
     let mut types = fyida_core::builtin_type_library();
+    let mut messages = Vec::new();
     if let Some(header_path) = &cli.type_header {
         let text = std::fs::read_to_string(header_path)
             .map_err(|source| format!("无法读取 C Header {}：{source}", header_path.display()))?;
@@ -210,21 +1097,21 @@ fn load_cli_types(cli: &Cli) -> Result<Vec<fyida_core::ProjectType>, String> {
             &mut types,
             fyida_core::import_c_header_types(source_name, &text),
         );
-        println!(
+        messages.push(format!(
             "C Header 类型已导入：{} / total {}",
             header_path.display(),
             types.len()
-        );
+        ));
     }
 
     if let Some(export_path) = &cli.export_types {
         let header = fyida_core::export_c_header_types(&types);
         std::fs::write(export_path, header)
             .map_err(|source| format!("无法导出 C Header {}：{source}", export_path.display()))?;
-        println!("C Header 类型已导出：{}", export_path.display());
+        messages.push(format!("C Header 类型已导出：{}", export_path.display()));
     }
 
-    Ok(types)
+    Ok(CliTypeLoad { types, messages })
 }
 
 fn merge_types(
@@ -268,116 +1155,4 @@ fn parse_number(text: &str) -> Option<u64> {
     u64::from_str_radix(hex, 16)
         .ok()
         .or_else(|| text.parse::<u64>().ok())
-}
-
-fn print_static_analysis(analysis: &fyida_analysis::StaticAnalysis) {
-    println!("基础静态分析：");
-    println!("  Functions：{}", analysis.functions.len());
-    for function in &analysis.functions {
-        println!(
-            "    {:016X} {:<24} size 0x{:X} insns {} calls {}",
-            function.start_va,
-            function.name,
-            function.size,
-            function.instruction_count,
-            function.call_count
-        );
-    }
-    println!("  Strings：{}", analysis.strings.len());
-    for string in analysis.strings.iter().take(32) {
-        println!(
-            "    {:016X} [{}] {}",
-            string.address,
-            string.encoding.label(),
-            string.value
-        );
-    }
-    println!("  Imports：{}", analysis.imports.len());
-    for import in analysis.imports.iter().take(64) {
-        println!("    {:016X} {}", import.thunk_va, import.display_name());
-    }
-    println!("  Exports：{}", analysis.exports.len());
-    for export in analysis.exports.iter().take(64) {
-        println!(
-            "    {:016X} ordinal {} {}",
-            export.va, export.ordinal, export.name
-        );
-    }
-    println!("  Relocations：{}", analysis.relocations.len());
-    for relocation in analysis.relocations.iter().take(32) {
-        println!(
-            "    {:016X} RVA 0x{:08X} {}",
-            relocation.va,
-            relocation.rva,
-            relocation.kind_label()
-        );
-    }
-    println!("  Xrefs：{}", analysis.xrefs.len());
-    for xref in analysis.xrefs.iter().take(64) {
-        println!(
-            "    {:016X} -> {:016X} {}",
-            xref.from_va,
-            xref.to_va,
-            xref.kind.label()
-        );
-    }
-    println!("  CFGs：{}", analysis.function_cfgs.len());
-    for cfg in analysis.function_cfgs.iter().take(16) {
-        println!(
-            "    {:016X} blocks {} edges {}",
-            cfg.function_start,
-            cfg.blocks.len(),
-            cfg.edges.len()
-        );
-    }
-    println!(
-        "  CallGraph：{} nodes / {} edges",
-        analysis.call_graph.nodes.len(),
-        analysis.call_graph.edges.len()
-    );
-    for edge in analysis.call_graph.edges.iter().take(64) {
-        println!(
-            "    {:016X} -> {:016X} callsite {:016X}",
-            edge.caller_va, edge.callee_va, edge.callsite_va
-        );
-    }
-    println!("  PDBRecords：{}", analysis.pe_pdb_records.len());
-    for record in &analysis.pe_pdb_records {
-        println!(
-            "    {} age {} guid {} path {}",
-            record.format.label(),
-            record.age.unwrap_or(0),
-            record.guid.as_deref().unwrap_or("-"),
-            record.path
-        );
-    }
-    println!("  PDBSymbols：{}", analysis.pdb_symbols.len());
-    for symbol in analysis.pdb_symbols.iter().take(64) {
-        let address = symbol
-            .address
-            .map(|address| format!("{address:016X}"))
-            .unwrap_or_else(|| "----------------".to_owned());
-        println!(
-            "    {} {:<18} {}",
-            address,
-            symbol.kind.label(),
-            symbol.display_name()
-        );
-    }
-    println!("  PDBTypes：{}", analysis.pdb_types.len());
-    for type_item in analysis.pdb_types.iter().take(64) {
-        println!("    [{}] {}", type_item.kind, type_item.name);
-    }
-}
-
-fn print_type_library(types: &[fyida_core::ProjectType]) {
-    println!("  TypeLibrary：{}", types.len());
-    for type_item in types.iter().take(64) {
-        println!(
-            "    [{}] {} - {}",
-            type_item.kind,
-            type_item.name,
-            type_item.display_signature()
-        );
-    }
 }

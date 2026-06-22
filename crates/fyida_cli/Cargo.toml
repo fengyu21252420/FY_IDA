@@ -11,6 +11,8 @@ fyida_analysis.workspace = true
 fyida_core.workspace = true
 fyida_disasm.workspace = true
 fyida_loader.workspace = true
+serde.workspace = true
+serde_json.workspace = true
 
 [lib]
 path = "src/lib.rs"
