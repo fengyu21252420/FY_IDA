@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.31.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added per-file applied annotation counts to batch JSON reports.
+- Added applied annotation counts to batch text and CSV reports for names, comments, function comments, bookmarks, and manual definitions.
+- Added CLI unit coverage for batch annotation count propagation and CSV output.
+
+### Changed
+
+- Updated the workspace version to `0.31.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the batch annotation summary checkpoint.
+
+### Fixed
+
+- Batch users can now identify which files received script/plugin annotations without opening each nested full JSON report.
+
+### Known Issues
+
+- Batch reports still embed complete per-file reports for successful files in JSON, so large recursive scans can produce large JSON output.
+- Batch raw mode still applies the same Raw Binary base/entry/arch options to every file in the directory.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.31.0-alpha.1`.
+- Roll back with: `git checkout v0.31.0-alpha.1`.
+
 ## v0.30.0-alpha.1 - 2026-06-23
 
 ### Added

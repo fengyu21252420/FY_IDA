@@ -23,7 +23,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.30.0-alpha.1 已支持 headless 用户标注专用 `--export annotations` text/CSV 导出、headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python annotations/PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.31.0-alpha.1 已支持 batch 报告中的用户标注计数汇总、headless 用户标注专用 `--export annotations` text/CSV 导出、headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python annotations/PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -509,6 +509,11 @@ struct BatchFileReport {
     xrefs: usize,
     search_results: usize,
     automation_runs: usize,
+    annotation_names: usize,
+    annotation_comments: usize,
+    annotation_function_comments: usize,
+    bookmarks: usize,
+    manual_definitions: usize,
     pdb_symbols: usize,
     pdb_types: usize,
     error: Option<String>,
@@ -701,6 +706,11 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                         xrefs: 0,
                         search_results: 0,
                         automation_runs: 0,
+                        annotation_names: 0,
+                        annotation_comments: 0,
+                        annotation_function_comments: 0,
+                        bookmarks: 0,
+                        manual_definitions: 0,
                         pdb_symbols: 0,
                         pdb_types: 0,
                         error: Some(message),
@@ -731,6 +741,11 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                     xrefs: 0,
                     search_results: 0,
                     automation_runs: 0,
+                    annotation_names: 0,
+                    annotation_comments: 0,
+                    annotation_function_comments: 0,
+                    bookmarks: 0,
+                    manual_definitions: 0,
                     pdb_symbols: 0,
                     pdb_types: 0,
                     error: Some(message),
@@ -778,6 +793,11 @@ fn batch_success(path: String, elapsed_ms: u128, report: HeadlessReport) -> Batc
             .map(|search| search.result_count)
             .unwrap_or(0),
         automation_runs: report.automation.run_count,
+        annotation_names: report.annotations.names.len(),
+        annotation_comments: report.annotations.comments.len(),
+        annotation_function_comments: report.annotations.function_comments.len(),
+        bookmarks: report.annotations.bookmarks.len(),
+        manual_definitions: report.annotations.manual_definitions.len(),
         pdb_symbols: report.analysis.pdb_symbols.len(),
         pdb_types: report.analysis.pdb_types.len(),
         error: None,
@@ -2931,7 +2951,7 @@ fn text_batch_report(report: &BatchReport) -> String {
     for entry in &report.files {
         let _ = writeln!(
             text,
-            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\tsearch {}\tautomation {}\t{}",
+            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\tsearch {}\tautomation {}\tannotations names {} comments {} function_comments {} bookmarks {} manual_definitions {}\t{}",
             entry.status,
             entry.path,
             entry.functions,
@@ -2940,6 +2960,11 @@ fn text_batch_report(report: &BatchReport) -> String {
             entry.xrefs,
             entry.search_results,
             entry.automation_runs,
+            entry.annotation_names,
+            entry.annotation_comments,
+            entry.annotation_function_comments,
+            entry.bookmarks,
+            entry.manual_definitions,
             entry.error.as_deref().unwrap_or("")
         );
     }
@@ -3912,7 +3937,7 @@ fn csv_annotations(annotations: &UserAnnotations) -> String {
 
 fn csv_batch_report(report: &BatchReport) -> String {
     let mut csv = String::from(
-        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,pdb_symbols,pdb_types,error\n",
+        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,annotation_names,annotation_comments,annotation_function_comments,bookmarks,manual_definitions,pdb_symbols,pdb_types,error\n",
     );
     for entry in &report.files {
         push_csv_row(
@@ -3928,6 +3953,11 @@ fn csv_batch_report(report: &BatchReport) -> String {
                 &entry.xrefs.to_string(),
                 &entry.search_results.to_string(),
                 &entry.automation_runs.to_string(),
+                &entry.annotation_names.to_string(),
+                &entry.annotation_comments.to_string(),
+                &entry.annotation_function_comments.to_string(),
+                &entry.bookmarks.to_string(),
+                &entry.manual_definitions.to_string(),
                 &entry.pdb_symbols.to_string(),
                 &entry.pdb_types.to_string(),
                 entry.error.as_deref().unwrap_or(""),
@@ -4561,6 +4591,37 @@ mod tests {
     }
 
     #[test]
+    fn batch_success_and_csv_include_annotation_counts() {
+        let entry = batch_success(
+            "sample.exe".to_owned(),
+            9,
+            sample_headless_report_with_automation(),
+        );
+        let report = BatchReport {
+            version: "0.31.0-alpha.1".to_owned(),
+            root: "samples".to_owned(),
+            recursive: false,
+            files: vec![entry],
+            errors: Vec::new(),
+            elapsed_ms: 9,
+        };
+
+        let text = text_batch_report(&report);
+        let csv = csv_batch_report(&report);
+
+        assert_eq!(report.files[0].annotation_names, 1);
+        assert_eq!(report.files[0].annotation_comments, 1);
+        assert_eq!(report.files[0].annotation_function_comments, 1);
+        assert_eq!(report.files[0].bookmarks, 1);
+        assert_eq!(report.files[0].manual_definitions, 1);
+        assert!(text.contains(
+            "annotations names 1 comments 1 function_comments 1 bookmarks 1 manual_definitions 1"
+        ));
+        assert!(csv.starts_with("path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,annotation_names,annotation_comments,annotation_function_comments,bookmarks,manual_definitions,pdb_symbols,pdb_types,error\n"));
+        assert!(csv.contains("sample.exe,ok,9,1,1,1,0,1,0,1,1,1,1,1,1,1,1,"));
+    }
+
+    #[test]
     fn parses_and_applies_python_annotation_actions() {
         let value = serde_json::json!([
             {"action": "rename", "address": "0x140001000", "name": "entry_main"},
@@ -4599,7 +4660,7 @@ mod tests {
 
         let document = project_document_from_report(&report).unwrap();
 
-        assert_eq!(document.app_version, "0.30.0-alpha.1");
+        assert_eq!(document.app_version, "0.31.0-alpha.1");
         assert_eq!(document.functions[0].name, "renamed_func");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         assert_eq!(document.annotations.comments[0].text, "automation note");
@@ -4856,7 +4917,7 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.30.0-alpha.1".to_owned(),
+            version: "0.31.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),
