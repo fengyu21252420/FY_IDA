@@ -4,6 +4,37 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.30.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added `--export annotations` for dedicated text and CSV output of applied user annotations.
+- Added annotation counts for names, comments, function comments, bookmarks, and manual definitions to text/CSV summary output.
+- Added `names(query=None)`, `comments(query=None)`, `function_comments(query=None)`, `bookmarks(query=None)`, and `manual_definitions(query=None)` to `examples/python/fyida.py`.
+- Added `examples/scripts/list_annotations.py` for applied-annotation scripting examples.
+- Added CLI unit coverage for annotation export parsing and text/CSV annotation output.
+
+### Changed
+
+- Updated the workspace version to `0.30.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the headless annotations export checkpoint.
+- Headless `--export all --export-format csv` now includes applied annotation counts in its summary rows.
+
+### Fixed
+
+- Analysts can now export the final applied annotation state directly instead of inferring it from JSON reports or automation action rows.
+
+### Known Issues
+
+- Annotation export reports applied project/report metadata only; it does not alter analysis recovery or force manual code/data definitions to reshape disassembly yet.
+- GUI console runs still do not write saved-project annotations; applied annotation export is primarily for headless script/plugin runs and saved report state.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.30.0-alpha.1`.
+- Roll back with: `git checkout v0.30.0-alpha.1`.
+
 ## v0.29.0-alpha.1 - 2026-06-23
 
 ### Added

@@ -31,6 +31,7 @@ class Project:
         self.type_library = report.get("type_library", {})
         self.search = report.get("search")
         self.automation = report.get("automation", {})
+        self.annotations = report.get("annotations", {})
         self.actions_path = os.environ.get("FYIDA_ACTIONS_JSON")
 
     def functions(self):
@@ -236,6 +237,23 @@ class Project:
                 matches.append(item)
         return matches
 
+    def names(self, query=None):
+        return self._filter_annotation_records("names", query, "address", "name")
+
+    def comments(self, query=None):
+        return self._filter_annotation_records("comments", query, "address", "text")
+
+    def function_comments(self, query=None):
+        return self._filter_annotation_records(
+            "function_comments", query, "function_start", "text"
+        )
+
+    def bookmarks(self, query=None):
+        return self._filter_annotation_records("bookmarks", query, "address")
+
+    def manual_definitions(self, query=None):
+        return self._filter_annotation_records("manual_definitions", query, "address", "kind")
+
     def set_name(self, address, name):
         self._append_action({"action": "rename", "address": parse_address(address), "name": name})
 
@@ -269,6 +287,20 @@ class Project:
 
     def _filter_records(self, key, query, *fields):
         records = self._records(key)
+        if not query:
+            return records
+        needle = query.casefold()
+        return [
+            item
+            for item in records
+            if needle in " ".join(str(item.get(field, "")) for field in fields).casefold()
+        ]
+
+    def _annotation_records(self, key):
+        return [Record(item) for item in self.annotations.get(key, [])]
+
+    def _filter_annotation_records(self, key, query, *fields):
+        records = self._annotation_records(key)
         if not query:
             return records
         needle = query.casefold()

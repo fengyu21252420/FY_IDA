@@ -23,7 +23,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.29.0-alpha.1 已支持 headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.30.0-alpha.1 已支持 headless 用户标注专用 `--export annotations` text/CSV 导出、headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python annotations/PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -184,6 +184,7 @@ pub enum ExportKind {
     Ir,
     Search,
     Automation,
+    Annotations,
     Types,
 }
 
@@ -2273,6 +2274,7 @@ fn text_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Ir => text_ir(&report.analysis.pseudocode_functions),
         ExportKind::Search => text_search(report.search.as_ref()),
         ExportKind::Automation => text_automation(&report.automation),
+        ExportKind::Annotations => text_annotations(&report.annotations),
         ExportKind::Types => text_types(&report.type_library.types),
     }
 }
@@ -2375,6 +2377,15 @@ fn text_full_report(report: &HeadlessReport) -> String {
         "  Automation: {} runs / {} actions",
         report.automation.run_count, report.automation.action_count
     );
+    let _ = writeln!(
+        text,
+        "  Annotations: {} names / {} comments / {} function comments / {} bookmarks / {} manual definitions",
+        report.annotations.names.len(),
+        report.annotations.comments.len(),
+        report.annotations.function_comments.len(),
+        report.annotations.bookmarks.len(),
+        report.annotations.manual_definitions.len()
+    );
     for run in report.automation.runs.iter().take(16) {
         let _ = writeln!(
             text,
@@ -2451,6 +2462,23 @@ fn text_summary_report(report: &HeadlessReport) -> String {
         text,
         "AutomationActions: {}",
         report.automation.action_count
+    );
+    let _ = writeln!(text, "AnnotationNames: {}", report.annotations.names.len());
+    let _ = writeln!(
+        text,
+        "AnnotationComments: {}",
+        report.annotations.comments.len()
+    );
+    let _ = writeln!(
+        text,
+        "AnnotationFunctionComments: {}",
+        report.annotations.function_comments.len()
+    );
+    let _ = writeln!(text, "Bookmarks: {}", report.annotations.bookmarks.len());
+    let _ = writeln!(
+        text,
+        "ManualDefinitions: {}",
+        report.annotations.manual_definitions.len()
     );
     let _ = writeln!(text, "TypeLibrary: {}", report.type_library.count);
     text
@@ -2838,6 +2866,54 @@ fn text_automation(automation: &AutomationReport) -> String {
     text
 }
 
+fn text_annotations(annotations: &UserAnnotations) -> String {
+    let mut text = String::from("Annotations\n");
+    let _ = writeln!(text, "Names: {}", annotations.names.len());
+    for name in &annotations.names {
+        let _ = writeln!(text, "name\t{}\t{}", format_va(name.address), name.name);
+    }
+    let _ = writeln!(text, "Comments: {}", annotations.comments.len());
+    for comment in &annotations.comments {
+        let _ = writeln!(
+            text,
+            "comment\t{}\t{}",
+            format_va(comment.address),
+            comment.text
+        );
+    }
+    let _ = writeln!(
+        text,
+        "FunctionComments: {}",
+        annotations.function_comments.len()
+    );
+    for comment in &annotations.function_comments {
+        let _ = writeln!(
+            text,
+            "function_comment\t{}\t{}",
+            format_va(comment.function_start),
+            comment.text
+        );
+    }
+    let _ = writeln!(text, "Bookmarks: {}", annotations.bookmarks.len());
+    for bookmark in &annotations.bookmarks {
+        let _ = writeln!(text, "bookmark\t{}", format_va(bookmark.address));
+    }
+    let _ = writeln!(
+        text,
+        "ManualDefinitions: {}",
+        annotations.manual_definitions.len()
+    );
+    for definition in &annotations.manual_definitions {
+        let _ = writeln!(
+            text,
+            "manual_definition\t{}\t{}",
+            format_va(definition.address),
+            manual_definition_kind_text(definition.kind)
+        );
+    }
+    text
+}
+
 fn text_batch_report(report: &BatchReport) -> String {
     let mut text = String::new();
     let ok_count = report
@@ -2898,6 +2974,7 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Ir => csv_ir(&report.analysis.pseudocode_functions),
         ExportKind::Search => csv_search(report.search.as_ref()),
         ExportKind::Automation => csv_automation(&report.automation),
+        ExportKind::Annotations => csv_annotations(&report.annotations),
         ExportKind::Types => csv_types(&report.type_library.types),
         ExportKind::All => {
             let mut csv = String::new();
@@ -3054,6 +3131,46 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
                 &mut csv,
                 &[
                     "summary",
+                    "annotation_names",
+                    &report.annotations.names.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "annotation_comments",
+                    &report.annotations.comments.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "annotation_function_comments",
+                    &report.annotations.function_comments.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "bookmarks",
+                    &report.annotations.bookmarks.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "manual_definitions",
+                    &report.annotations.manual_definitions.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
                     "type_library",
                     &report.type_library.count.to_string(),
                 ],
@@ -3167,6 +3284,38 @@ fn csv_summary(report: &HeadlessReport) -> String {
         &[
             "automation_actions",
             &report.automation.action_count.to_string(),
+        ],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "annotation_names",
+            &report.annotations.names.len().to_string(),
+        ],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "annotation_comments",
+            &report.annotations.comments.len().to_string(),
+        ],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "annotation_function_comments",
+            &report.annotations.function_comments.len().to_string(),
+        ],
+    );
+    push_csv_row(
+        &mut csv,
+        &["bookmarks", &report.annotations.bookmarks.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "manual_definitions",
+            &report.annotations.manual_definitions.len().to_string(),
         ],
     );
     push_csv_row(
@@ -3705,6 +3854,62 @@ fn csv_automation(automation: &AutomationReport) -> String {
     csv
 }
 
+fn csv_annotations(annotations: &UserAnnotations) -> String {
+    let mut csv = String::from("record,address,function_start,name,text,kind\n");
+    for name in &annotations.names {
+        push_csv_row(
+            &mut csv,
+            &["name", &format_va(name.address), "", &name.name, "", ""],
+        );
+    }
+    for comment in &annotations.comments {
+        push_csv_row(
+            &mut csv,
+            &[
+                "comment",
+                &format_va(comment.address),
+                "",
+                "",
+                &comment.text,
+                "",
+            ],
+        );
+    }
+    for comment in &annotations.function_comments {
+        push_csv_row(
+            &mut csv,
+            &[
+                "function_comment",
+                "",
+                &format_va(comment.function_start),
+                "",
+                &comment.text,
+                "",
+            ],
+        );
+    }
+    for bookmark in &annotations.bookmarks {
+        push_csv_row(
+            &mut csv,
+            &["bookmark", &format_va(bookmark.address), "", "", "", ""],
+        );
+    }
+    for definition in &annotations.manual_definitions {
+        push_csv_row(
+            &mut csv,
+            &[
+                "manual_definition",
+                &format_va(definition.address),
+                "",
+                "",
+                "",
+                manual_definition_kind_text(definition.kind),
+            ],
+        );
+    }
+    csv
+}
+
 fn csv_batch_report(report: &BatchReport) -> String {
     let mut csv = String::from(
         "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,pdb_symbols,pdb_types,error\n",
@@ -3752,6 +3957,13 @@ fn csv_escape(value: &str) -> String {
 
 fn format_va(address: u64) -> String {
     format!("{address:016X}")
+}
+
+fn manual_definition_kind_text(kind: ManualDefinitionKind) -> &'static str {
+    match kind {
+        ManualDefinitionKind::Code => "code",
+        ManualDefinitionKind::Data => "data",
+    }
 }
 
 fn instruction_flow_label(flow: InstructionFlow) -> &'static str {
@@ -4170,6 +4382,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_annotations_export_kind() {
+        let cli = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--export",
+            "annotations",
+            "sample.exe",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.export, ExportKind::Annotations);
+    }
+
+    #[test]
     fn parses_save_project_path() {
         let cli = Cli::try_parse_from([
             "fy_ida",
@@ -4312,6 +4538,29 @@ mod tests {
     }
 
     #[test]
+    fn annotations_text_csv_and_summary_include_applied_records() {
+        let report = sample_headless_report_with_automation();
+
+        let summary = text_summary_report(&report);
+        let text = text_annotations(&report.annotations);
+        let csv = csv_annotations(&report.annotations);
+
+        assert!(summary.contains("AnnotationNames: 1"));
+        assert!(summary.contains("AnnotationFunctionComments: 1"));
+        assert!(summary.contains("ManualDefinitions: 1"));
+        assert!(text.starts_with("Annotations\n"));
+        assert!(text.contains("name\t0000000140001000\trenamed_func"));
+        assert!(text.contains("comment\t0000000140001004\tautomation note"));
+        assert!(text.contains("function_comment\t0000000140001000\tentry wrapper"));
+        assert!(text.contains("bookmark\t0000000140001004"));
+        assert!(text.contains("manual_definition\t0000000140001004\tcode"));
+        assert!(csv.starts_with("record,address,function_start,name,text,kind\n"));
+        assert!(csv.contains("name,0000000140001000,,renamed_func,,"));
+        assert!(csv.contains("function_comment,,0000000140001000,,entry wrapper,"));
+        assert!(csv.contains("manual_definition,0000000140001004,,,,code"));
+    }
+
+    #[test]
     fn parses_and_applies_python_annotation_actions() {
         let value = serde_json::json!([
             {"action": "rename", "address": "0x140001000", "name": "entry_main"},
@@ -4350,7 +4599,7 @@ mod tests {
 
         let document = project_document_from_report(&report).unwrap();
 
-        assert_eq!(document.app_version, "0.29.0-alpha.1");
+        assert_eq!(document.app_version, "0.30.0-alpha.1");
         assert_eq!(document.functions[0].name, "renamed_func");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         assert_eq!(document.annotations.comments[0].text, "automation note");
@@ -4607,7 +4856,7 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.29.0-alpha.1".to_owned(),
+            version: "0.30.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),
@@ -4649,11 +4898,17 @@ mod tests {
                     address: 0x0000_0001_4000_1004,
                     text: "automation note".to_owned(),
                 }],
-                function_comments: Vec::new(),
+                function_comments: vec![FunctionComment {
+                    function_start: 0x0000_0001_4000_1000,
+                    text: "entry wrapper".to_owned(),
+                }],
                 bookmarks: vec![Bookmark {
                     address: 0x0000_0001_4000_1004,
                 }],
-                manual_definitions: Vec::new(),
+                manual_definitions: vec![ManualDefinition {
+                    address: 0x0000_0001_4000_1004,
+                    kind: ManualDefinitionKind::Code,
+                }],
             },
             messages: Vec::new(),
             elapsed_ms: 11,

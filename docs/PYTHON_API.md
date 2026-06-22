@@ -1,6 +1,6 @@
 # FY_IDA Python API
 
-FY_IDA v0.29.0-alpha.1 and later expose a lightweight script API through environment variables, the headless JSON report model, and a JSON action file for saved annotations.
+FY_IDA v0.30.0-alpha.1 and later expose a lightweight script API through environment variables, the headless JSON report model, and a JSON action file for saved annotations.
 
 ## Headless Scripts
 
@@ -21,9 +21,9 @@ The script receives:
 - `FYIDA_AUTOMATION_LABEL`: `script` for direct scripts, or a plugin label.
 - `FYIDA_AUTOMATION_KIND`: `script` or `plugin`.
 
-The JSON report contains input metadata, sections, functions, strings, imports, exports, relocations, xrefs, PDB records/symbols/types, the current type library, optional headless search results, current annotations, and structured Python automation results. In v0.23.0-alpha.1 and later, xrefs include recovered x64 RIP-relative or absolute memory references to strings, import IAT thunks, relocations, and data sections. In v0.24.0-alpha.1 and later, resolved IAT indirect calls and import-thunk jumps also contribute import API edges to the generated call graph and pseudo-C/IR call targets. In v0.25.0-alpha.1 and later, `analysis.call_graph_node_records` and `analysis.call_graph_edge_records` expose detailed call graph nodes and edges in JSON, and `--export call-graph` emits text/CSV call graph rows. In v0.26.0-alpha.1 and later, `analysis.cfg_records` exposes function CFGs with blocks, edges, and per-block instructions; `--export cfg` emits text/CSV CFG rows, and headless search can match `cfg_block`, `cfg_instruction`, and `cfg_edge` records. In v0.27.0-alpha.1 and later, `analysis.instruction_records` exposes a flat decoded-instruction list with function and basic-block context; `--export instructions` emits text/CSV instruction rows, and headless search can match `instruction` records directly. In v0.28.0-alpha.1 and later, `--export sections` and `--export relocations` emit dedicated text/CSV rows for loader sections and relocation records. In v0.29.0-alpha.1 and later, `--export pdb` emits dedicated text/CSV rows for PE CodeView PDB records, loaded PDB symbols, and PDB type summaries.
+The JSON report contains input metadata, sections, functions, strings, imports, exports, relocations, xrefs, PDB records/symbols/types, the current type library, optional headless search results, current annotations, and structured Python automation results. In v0.23.0-alpha.1 and later, xrefs include recovered x64 RIP-relative or absolute memory references to strings, import IAT thunks, relocations, and data sections. In v0.24.0-alpha.1 and later, resolved IAT indirect calls and import-thunk jumps also contribute import API edges to the generated call graph and pseudo-C/IR call targets. In v0.25.0-alpha.1 and later, `analysis.call_graph_node_records` and `analysis.call_graph_edge_records` expose detailed call graph nodes and edges in JSON, and `--export call-graph` emits text/CSV call graph rows. In v0.26.0-alpha.1 and later, `analysis.cfg_records` exposes function CFGs with blocks, edges, and per-block instructions; `--export cfg` emits text/CSV CFG rows, and headless search can match `cfg_block`, `cfg_instruction`, and `cfg_edge` records. In v0.27.0-alpha.1 and later, `analysis.instruction_records` exposes a flat decoded-instruction list with function and basic-block context; `--export instructions` emits text/CSV instruction rows, and headless search can match `instruction` records directly. In v0.28.0-alpha.1 and later, `--export sections` and `--export relocations` emit dedicated text/CSV rows for loader sections and relocation records. In v0.29.0-alpha.1 and later, `--export pdb` emits dedicated text/CSV rows for PE CodeView PDB records, loaded PDB symbols, and PDB type summaries. In v0.30.0-alpha.1 and later, `--export annotations` emits dedicated text/CSV rows for applied user names, comments, function comments, bookmarks, and manual code/data definitions.
 
-Successful Python runs are recorded under `automation.runs` with label, kind, plugin metadata, script path, status, exit code, elapsed time, stdout, stderr, and output-truncation flags. Annotation actions are recorded under `automation.actions`, summarized by `automation.action_count`, applied to report `annotations`, and saved by `--save-project`. Use `--export automation --export-format text` or `--export automation --export-format csv` to emit only automation run/action records.
+Successful Python runs are recorded under `automation.runs` with label, kind, plugin metadata, script path, status, exit code, elapsed time, stdout, stderr, and output-truncation flags. Annotation actions are recorded under `automation.actions`, summarized by `automation.action_count`, applied to report `annotations`, and saved by `--save-project`. Use `--export automation --export-format text` or `--export automation --export-format csv` to emit only automation run/action records. Use `--export annotations --export-format text` or `--export annotations --export-format csv` to emit the applied annotation state.
 
 ## Helper Module
 
@@ -59,6 +59,15 @@ for symbol in project.pdb_symbols("main"):
 for type_item in project.pdb_types():
     print(type_item.kind, type_item.name)
 
+for name in project.names():
+    print(hex(name.address), name.name)
+
+for comment in project.comments():
+    print(hex(comment.address), comment.text)
+
+for bookmark in project.bookmarks():
+    print(hex(bookmark.address))
+
 project.set_name(0x140001000, "entry_main")
 project.set_comment(0x140001004, "references URL string")
 project.set_function_comment(0x140001000, "entry wrapper")
@@ -66,7 +75,7 @@ project.add_bookmark(0x140001000)
 project.mark_code(0x140001000)
 ```
 
-Example scripts add `examples\python` to `sys.path` before importing the helper. `examples\scripts\find_string_xrefs.py` searches strings and prints their xrefs; `examples\scripts\list_pdb.py` prints PDB records, symbols, and type summaries; `examples\scripts\list_sections.py` prints loader section metadata; `examples\scripts\list_instructions.py` prints flat decoded instruction rows; `examples\scripts\list_call_graph.py` prints call graph edges; `examples\scripts\list_cfg.py` prints function CFG blocks, edges, and instruction previews; set `FYIDA_QUERY` or pass a first script argument when running these scripts directly. `examples\scripts\batch_rename_import_callers.py` demonstrates queuing names, function comments, and bookmarks for functions that reference imports; `project.xrefs_to(import.thunk_va)` includes recovered IAT memory references when the decoded x64 instruction targets the import thunk.
+Example scripts add `examples\python` to `sys.path` before importing the helper. `examples\scripts\find_string_xrefs.py` searches strings and prints their xrefs; `examples\scripts\list_annotations.py` prints applied names, comments, function comments, bookmarks, and manual definitions; `examples\scripts\list_pdb.py` prints PDB records, symbols, and type summaries; `examples\scripts\list_sections.py` prints loader section metadata; `examples\scripts\list_instructions.py` prints flat decoded instruction rows; `examples\scripts\list_call_graph.py` prints call graph edges; `examples\scripts\list_cfg.py` prints function CFG blocks, edges, and instruction previews; set `FYIDA_QUERY` or pass a first script argument when running these scripts directly. `examples\scripts\batch_rename_import_callers.py` demonstrates queuing names, function comments, and bookmarks for functions that reference imports; `project.xrefs_to(import.thunk_va)` includes recovered IAT memory references when the decoded x64 instruction targets the import thunk.
 
 To persist script-requested annotations into a FY_IDA project file, run:
 
