@@ -17,7 +17,7 @@ The project intentionally does not copy IDA code, icons, database formats, or pr
 
 ## Current Status
 
-`v0.6.0-alpha.1` contains the first GUI analysis-experience checkpoint. It can start `fy_ida.exe`, open a Windows x64 PE or x64 Raw Binary, show real EntryPoint-near instructions, list discovered functions/strings/imports/exports/relocations/xrefs, save or reopen FY_IDA project files with user annotations, navigate backward/forward through jumps, search addresses/text/byte sequences/annotations, and keep the Hex View synchronized with the current address.
+`v0.7.0-alpha.1` contains the first CFG and call graph checkpoint. It can start `fy_ida.exe`, open a Windows x64 PE or x64 Raw Binary, show real EntryPoint-near instructions, list discovered functions/strings/imports/exports/relocations/xrefs, save or reopen FY_IDA project files with user annotations, navigate and search through analysis views, render byte-synchronized Hex rows, and display generated function CFG and direct-call graph data in the GUI.
 
 ## Recovery Strategy
 

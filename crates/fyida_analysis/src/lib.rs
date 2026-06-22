@@ -1,4 +1,4 @@
-use std::collections::{HashSet, VecDeque};
+use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
 
 use fyida_core::{
     FileSelection, PeImage, PeKind, RawImage, PE_DIRECTORY_BASERELOC, PE_DIRECTORY_EXPORT,
@@ -42,6 +42,8 @@ pub struct StaticAnalysis {
     pub exports: Vec<ExportSymbol>,
     pub relocations: Vec<RelocationEntry>,
     pub xrefs: Vec<XrefSummary>,
+    pub function_cfgs: Vec<FunctionCfg>,
+    pub call_graph: CallGraph,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -51,6 +53,88 @@ pub struct FunctionSummary {
     pub size: u64,
     pub instruction_count: usize,
     pub call_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FunctionCfg {
+    pub function_start: u64,
+    pub blocks: Vec<BasicBlock>,
+    pub edges: Vec<CfgEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BasicBlock {
+    pub start_va: u64,
+    pub end_va: u64,
+    pub instruction_count: usize,
+    pub call_count: usize,
+    pub instructions: Vec<BlockInstruction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BlockInstruction {
+    pub address: u64,
+    pub bytes: String,
+    pub mnemonic: String,
+    pub operands: String,
+    pub flow: InstructionFlow,
+    pub branch_target: Option<u64>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum CfgEdgeKind {
+    ConditionalTrue,
+    ConditionalFalse,
+    Unconditional,
+    Fallthrough,
+}
+
+impl CfgEdgeKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::ConditionalTrue => "条件真分支",
+            Self::ConditionalFalse => "条件假分支",
+            Self::Unconditional => "无条件跳转",
+            Self::Fallthrough => "顺序流",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CfgEdge {
+    pub from_va: u64,
+    pub to_va: u64,
+    pub kind: CfgEdgeKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct CallGraph {
+    pub nodes: Vec<CallGraphNode>,
+    pub edges: Vec<CallGraphEdge>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallGraphNode {
+    pub start_va: u64,
+    pub name: String,
+    pub is_external: bool,
+    pub call_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct CallGraphEdge {
+    pub caller_va: u64,
+    pub callee_va: u64,
+    pub callsite_va: u64,
+    pub label: String,
+}
+
+struct DecodedFunctionAnalysis {
+    function: FunctionSummary,
+    cfg: FunctionCfg,
+    xrefs: Vec<XrefSummary>,
+    calls: Vec<CallGraphEdge>,
+    discovered_call_targets: Vec<u64>,
 }
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -123,7 +207,7 @@ impl RelocationEntry {
     }
 }
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
 pub enum XrefKind {
     CodeCall,
     CodeJump,
@@ -159,21 +243,25 @@ pub fn analyze_pe(image: &PeImage, bytes: &[u8]) -> StaticAnalysis {
         ..StaticAnalysis::default()
     };
 
-    let (functions, xrefs) = discover_functions_and_xrefs(image, bytes);
-    analysis.functions = functions;
-    analysis.xrefs = xrefs;
+    let discovery = discover_functions_and_xrefs(image, bytes);
+    analysis.functions = discovery.functions;
+    analysis.xrefs = discovery.xrefs;
+    analysis.function_cfgs = discovery.function_cfgs;
+    analysis.call_graph = discovery.call_graph;
     analysis
 }
 
 pub fn analyze_raw(image: &RawImage, bytes: &[u8]) -> StaticAnalysis {
-    let (functions, xrefs) = discover_raw_functions_and_xrefs(image, bytes);
+    let discovery = discover_raw_functions_and_xrefs(image, bytes);
     StaticAnalysis {
-        functions,
+        functions: discovery.functions,
         strings: scan_raw_strings(image, bytes),
         imports: Vec::new(),
         exports: Vec::new(),
         relocations: Vec::new(),
-        xrefs,
+        xrefs: discovery.xrefs,
+        function_cfgs: discovery.function_cfgs,
+        call_graph: discovery.call_graph,
     }
 }
 
@@ -185,6 +273,12 @@ pub fn static_analysis_log_lines(analysis: &StaticAnalysis) -> Vec<String> {
         format!("导出表解析：{} 个导出符号。", analysis.exports.len()),
         format!("重定位解析：{} 条。", analysis.relocations.len()),
         format!("代码交叉引用：{} 条。", analysis.xrefs.len()),
+        format!("CFG 生成：{} 个函数图。", analysis.function_cfgs.len()),
+        format!(
+            "调用图：{} 个节点 / {} 条边。",
+            analysis.call_graph.nodes.len(),
+            analysis.call_graph.edges.len()
+        ),
     ]
 }
 
@@ -275,8 +369,8 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.6.0-alpha.1，GUI 搜索、跳转、导航历史和 Hex 同步已接入。".to_owned(),
-        "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串和基础引用。"
+        "当前版本：v0.7.0-alpha.1，基础 CFG 与 direct-call 调用图已接入。".to_owned(),
+        "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串、基础引用和图数据。"
             .to_owned(),
     ]
 }
@@ -323,22 +417,28 @@ pub fn file_error_log_lines(file: &FileSelection, message: &str) -> Vec<String> 
     ]
 }
 
-fn discover_functions_and_xrefs(
-    image: &PeImage,
-    bytes: &[u8],
-) -> (Vec<FunctionSummary>, Vec<XrefSummary>) {
+#[derive(Debug, Clone, Default)]
+struct DiscoveryResult {
+    functions: Vec<FunctionSummary>,
+    xrefs: Vec<XrefSummary>,
+    function_cfgs: Vec<FunctionCfg>,
+    call_graph: CallGraph,
+}
+
+fn discover_functions_and_xrefs(image: &PeImage, bytes: &[u8]) -> DiscoveryResult {
     if image.nt_headers.file_header.machine != 0x8664
         || image.nt_headers.optional_header.kind != PeKind::Pe32Plus
     {
-        return (Vec::new(), Vec::new());
+        return DiscoveryResult::default();
     }
 
     let mut worklist = VecDeque::from([image.entry_point_va()]);
     let mut discovered = HashSet::from([image.entry_point_va()]);
     let mut processed = HashSet::new();
-    let mut xref_keys = HashSet::new();
     let mut functions = Vec::new();
     let mut xrefs = Vec::new();
+    let mut function_cfgs = Vec::new();
+    let mut call_edges = Vec::new();
 
     while let Some(start_va) = worklist.pop_front() {
         if processed.contains(&start_va) || !image.is_executable_va(start_va) {
@@ -354,80 +454,48 @@ fn discover_functions_and_xrefs(
             continue;
         }
 
-        let mut last_end = start_va;
-        let mut call_count = 0usize;
-        let mut instruction_count = 0usize;
-        for instruction in &instructions {
-            instruction_count += 1;
-            let instruction_end = instruction
-                .address
-                .saturating_add(u64::try_from(instruction.bytes.len()).unwrap_or(0));
-            last_end = last_end.max(instruction_end);
-
-            if let Some(target) = instruction.near_branch_target {
-                let kind = match instruction.flow {
-                    InstructionFlow::DirectCall => Some(XrefKind::CodeCall),
-                    InstructionFlow::UnconditionalBranch | InstructionFlow::ConditionalBranch => {
-                        Some(XrefKind::CodeJump)
-                    }
-                    _ => None,
-                };
-
-                if let Some(kind) = kind {
-                    if xref_keys.insert((instruction.address, target, kind)) {
-                        xrefs.push(XrefSummary {
-                            from_va: instruction.address,
-                            to_va: target,
-                            kind,
-                            label: format!("{} -> 0x{target:016X}", kind.label()),
-                        });
-                    }
-                }
-
-                if instruction.flow == InstructionFlow::DirectCall && image.is_executable_va(target)
-                {
-                    call_count += 1;
-                    if discovered.len() < MAX_FUNCTIONS && discovered.insert(target) {
-                        worklist.push_back(target);
-                    }
-                }
-            }
-
-            if instruction.flow == InstructionFlow::Return {
-                break;
-            }
-        }
-
         let name = if start_va == image.entry_point_va() {
             "入口点".to_owned()
         } else {
             format!("sub_{start_va:016X}")
         };
 
-        functions.push(FunctionSummary {
-            start_va,
-            name,
-            size: last_end.saturating_sub(start_va),
-            instruction_count,
-            call_count,
+        let decoded = analyze_decoded_function(start_va, name, &instructions, |target| {
+            image.is_executable_va(target)
         });
+        for target in &decoded.discovered_call_targets {
+            if discovered.len() < MAX_FUNCTIONS && discovered.insert(*target) {
+                worklist.push_back(*target);
+            }
+        }
+
+        functions.push(decoded.function);
+        function_cfgs.push(decoded.cfg);
+        xrefs.extend(decoded.xrefs);
+        call_edges.extend(decoded.calls);
     }
 
     functions.sort_by_key(|function| function.start_va);
-    xrefs.sort_by_key(|xref| (xref.from_va, xref.to_va));
-    (functions, xrefs)
+    function_cfgs.sort_by_key(|cfg| cfg.function_start);
+    dedup_xrefs(&mut xrefs);
+    let call_graph = build_call_graph(&functions, call_edges);
+
+    DiscoveryResult {
+        functions,
+        xrefs,
+        function_cfgs,
+        call_graph,
+    }
 }
 
-fn discover_raw_functions_and_xrefs(
-    image: &RawImage,
-    bytes: &[u8],
-) -> (Vec<FunctionSummary>, Vec<XrefSummary>) {
+fn discover_raw_functions_and_xrefs(image: &RawImage, bytes: &[u8]) -> DiscoveryResult {
     let mut worklist = VecDeque::from([image.entry_address]);
     let mut discovered = HashSet::from([image.entry_address]);
     let mut processed = HashSet::new();
-    let mut xref_keys = HashSet::new();
     let mut functions = Vec::new();
     let mut xrefs = Vec::new();
+    let mut function_cfgs = Vec::new();
+    let mut call_edges = Vec::new();
 
     while let Some(start_va) = worklist.pop_front() {
         if processed.contains(&start_va) || !image.contains_va(start_va) {
@@ -444,66 +512,325 @@ fn discover_raw_functions_and_xrefs(
             continue;
         }
 
-        let mut last_end = start_va;
-        let mut call_count = 0usize;
-        let mut instruction_count = 0usize;
-        for instruction in &instructions {
-            instruction_count += 1;
-            let instruction_end = instruction
-                .address
-                .saturating_add(u64::try_from(instruction.bytes.len()).unwrap_or(0));
-            last_end = last_end.max(instruction_end);
-
-            if let Some(target) = instruction.near_branch_target {
-                let kind = match instruction.flow {
-                    InstructionFlow::DirectCall => Some(XrefKind::CodeCall),
-                    InstructionFlow::UnconditionalBranch | InstructionFlow::ConditionalBranch => {
-                        Some(XrefKind::CodeJump)
-                    }
-                    _ => None,
-                };
-
-                if let Some(kind) = kind {
-                    if xref_keys.insert((instruction.address, target, kind)) {
-                        xrefs.push(XrefSummary {
-                            from_va: instruction.address,
-                            to_va: target,
-                            kind,
-                            label: format!("{} -> 0x{target:016X}", kind.label()),
-                        });
-                    }
-                }
-
-                if instruction.flow == InstructionFlow::DirectCall && image.contains_va(target) {
-                    call_count += 1;
-                    if discovered.len() < MAX_FUNCTIONS && discovered.insert(target) {
-                        worklist.push_back(target);
-                    }
-                }
-            }
-
-            if instruction.flow == InstructionFlow::Return {
-                break;
-            }
-        }
-
         let name = if start_va == image.entry_address {
             "raw_entry".to_owned()
         } else {
             format!("sub_{start_va:016X}")
         };
-        functions.push(FunctionSummary {
-            start_va,
-            name,
-            size: last_end.saturating_sub(start_va),
-            instruction_count,
-            call_count,
+        let decoded = analyze_decoded_function(start_va, name, &instructions, |target| {
+            image.contains_va(target)
         });
+        for target in &decoded.discovered_call_targets {
+            if discovered.len() < MAX_FUNCTIONS && discovered.insert(*target) {
+                worklist.push_back(*target);
+            }
+        }
+
+        functions.push(decoded.function);
+        function_cfgs.push(decoded.cfg);
+        xrefs.extend(decoded.xrefs);
+        call_edges.extend(decoded.calls);
     }
 
     functions.sort_by_key(|function| function.start_va);
-    xrefs.sort_by_key(|xref| (xref.from_va, xref.to_va));
-    (functions, xrefs)
+    function_cfgs.sort_by_key(|cfg| cfg.function_start);
+    dedup_xrefs(&mut xrefs);
+    let call_graph = build_call_graph(&functions, call_edges);
+
+    DiscoveryResult {
+        functions,
+        xrefs,
+        function_cfgs,
+        call_graph,
+    }
+}
+
+fn analyze_decoded_function(
+    start_va: u64,
+    name: String,
+    instructions: &[DecodedInstruction],
+    target_allowed: impl Fn(u64) -> bool,
+) -> DecodedFunctionAnalysis {
+    let mut truncated = Vec::new();
+    for instruction in instructions {
+        truncated.push(instruction.clone());
+        if instruction.flow == InstructionFlow::Return {
+            break;
+        }
+    }
+
+    let mut last_end = start_va;
+    let mut call_count = 0usize;
+    let mut xrefs = Vec::new();
+    let mut calls = Vec::new();
+    let mut discovered_call_targets = Vec::new();
+
+    for instruction in &truncated {
+        last_end = last_end.max(instruction_end(instruction));
+
+        if let Some(target) = instruction.near_branch_target {
+            let kind = match instruction.flow {
+                InstructionFlow::DirectCall => Some(XrefKind::CodeCall),
+                InstructionFlow::UnconditionalBranch | InstructionFlow::ConditionalBranch => {
+                    Some(XrefKind::CodeJump)
+                }
+                _ => None,
+            };
+
+            if let Some(kind) = kind {
+                xrefs.push(XrefSummary {
+                    from_va: instruction.address,
+                    to_va: target,
+                    kind,
+                    label: format!("{} -> 0x{target:016X}", kind.label()),
+                });
+            }
+
+            if instruction.flow == InstructionFlow::DirectCall && target_allowed(target) {
+                call_count += 1;
+                discovered_call_targets.push(target);
+                calls.push(CallGraphEdge {
+                    caller_va: start_va,
+                    callee_va: target,
+                    callsite_va: instruction.address,
+                    label: "direct call".to_owned(),
+                });
+            }
+        }
+    }
+
+    let cfg = build_function_cfg(start_va, &truncated);
+    let function = FunctionSummary {
+        start_va,
+        name,
+        size: last_end.saturating_sub(start_va),
+        instruction_count: truncated.len(),
+        call_count,
+    };
+
+    DecodedFunctionAnalysis {
+        function,
+        cfg,
+        xrefs,
+        calls,
+        discovered_call_targets,
+    }
+}
+
+fn build_function_cfg(function_start: u64, instructions: &[DecodedInstruction]) -> FunctionCfg {
+    if instructions.is_empty() {
+        return FunctionCfg {
+            function_start,
+            blocks: Vec::new(),
+            edges: Vec::new(),
+        };
+    }
+
+    let instruction_addresses = instructions
+        .iter()
+        .map(|instruction| instruction.address)
+        .collect::<BTreeSet<_>>();
+    let function_end = instructions
+        .iter()
+        .map(instruction_end)
+        .max()
+        .unwrap_or(function_start);
+    let mut leaders = BTreeSet::from([function_start]);
+
+    for instruction in instructions {
+        let next = instruction_end(instruction);
+        if let Some(target) = instruction.near_branch_target {
+            if target >= function_start
+                && target < function_end
+                && instruction_addresses.contains(&target)
+            {
+                leaders.insert(target);
+            }
+        }
+
+        if matches!(
+            instruction.flow,
+            InstructionFlow::ConditionalBranch | InstructionFlow::UnconditionalBranch
+        ) && instruction_addresses.contains(&next)
+        {
+            leaders.insert(next);
+        }
+    }
+
+    let mut blocks = Vec::new();
+    let mut current: Vec<DecodedInstruction> = Vec::new();
+    for instruction in instructions {
+        if leaders.contains(&instruction.address) && !current.is_empty() {
+            blocks.push(decoded_block(&current));
+            current.clear();
+        }
+        current.push(instruction.clone());
+    }
+    if !current.is_empty() {
+        blocks.push(decoded_block(&current));
+    }
+
+    let block_starts = blocks
+        .iter()
+        .map(|block| block.start_va)
+        .collect::<BTreeSet<_>>();
+    let mut edges = Vec::new();
+    let mut edge_keys = HashSet::new();
+    for (index, block) in blocks.iter().enumerate() {
+        let Some(last) = block.instructions.last() else {
+            continue;
+        };
+        let next_block = blocks.get(index + 1).map(|next| next.start_va);
+
+        match last.flow {
+            InstructionFlow::ConditionalBranch => {
+                if let Some(target) = last
+                    .branch_target
+                    .filter(|target| block_starts.contains(target))
+                {
+                    push_cfg_edge(
+                        &mut edges,
+                        &mut edge_keys,
+                        block.start_va,
+                        target,
+                        CfgEdgeKind::ConditionalTrue,
+                    );
+                }
+                if let Some(target) = next_block {
+                    push_cfg_edge(
+                        &mut edges,
+                        &mut edge_keys,
+                        block.start_va,
+                        target,
+                        CfgEdgeKind::ConditionalFalse,
+                    );
+                }
+            }
+            InstructionFlow::UnconditionalBranch => {
+                if let Some(target) = last
+                    .branch_target
+                    .filter(|target| block_starts.contains(target))
+                {
+                    push_cfg_edge(
+                        &mut edges,
+                        &mut edge_keys,
+                        block.start_va,
+                        target,
+                        CfgEdgeKind::Unconditional,
+                    );
+                }
+            }
+            InstructionFlow::Return => {}
+            _ => {
+                if let Some(target) = next_block {
+                    push_cfg_edge(
+                        &mut edges,
+                        &mut edge_keys,
+                        block.start_va,
+                        target,
+                        CfgEdgeKind::Fallthrough,
+                    );
+                }
+            }
+        }
+    }
+
+    FunctionCfg {
+        function_start,
+        blocks,
+        edges,
+    }
+}
+
+fn decoded_block(instructions: &[DecodedInstruction]) -> BasicBlock {
+    let start_va = instructions
+        .first()
+        .map(|instruction| instruction.address)
+        .unwrap_or(0);
+    let end_va = instructions.last().map(instruction_end).unwrap_or(start_va);
+    let call_count = instructions
+        .iter()
+        .filter(|instruction| instruction.flow == InstructionFlow::DirectCall)
+        .count();
+    let block_instructions = instructions
+        .iter()
+        .map(|instruction| BlockInstruction {
+            address: instruction.address,
+            bytes: instruction.bytes_text(),
+            mnemonic: instruction.mnemonic.clone(),
+            operands: instruction.operands.clone(),
+            flow: instruction.flow,
+            branch_target: instruction.near_branch_target,
+        })
+        .collect::<Vec<_>>();
+
+    BasicBlock {
+        start_va,
+        end_va,
+        instruction_count: instructions.len(),
+        call_count,
+        instructions: block_instructions,
+    }
+}
+
+fn push_cfg_edge(
+    edges: &mut Vec<CfgEdge>,
+    edge_keys: &mut HashSet<(u64, u64, CfgEdgeKind)>,
+    from_va: u64,
+    to_va: u64,
+    kind: CfgEdgeKind,
+) {
+    if edge_keys.insert((from_va, to_va, kind)) {
+        edges.push(CfgEdge {
+            from_va,
+            to_va,
+            kind,
+        });
+    }
+}
+
+fn build_call_graph(functions: &[FunctionSummary], mut edges: Vec<CallGraphEdge>) -> CallGraph {
+    let mut nodes = BTreeMap::new();
+    for function in functions {
+        nodes.insert(
+            function.start_va,
+            CallGraphNode {
+                start_va: function.start_va,
+                name: function.name.clone(),
+                is_external: false,
+                call_count: function.call_count,
+            },
+        );
+    }
+
+    edges.sort_by_key(|edge| (edge.caller_va, edge.callee_va, edge.callsite_va));
+    edges.dedup_by_key(|edge| (edge.caller_va, edge.callee_va, edge.callsite_va));
+    for edge in &edges {
+        nodes
+            .entry(edge.callee_va)
+            .or_insert_with(|| CallGraphNode {
+                start_va: edge.callee_va,
+                name: format!("sub_{:016X}", edge.callee_va),
+                is_external: true,
+                call_count: 0,
+            });
+    }
+
+    CallGraph {
+        nodes: nodes.into_values().collect(),
+        edges,
+    }
+}
+
+fn dedup_xrefs(xrefs: &mut Vec<XrefSummary>) {
+    xrefs.sort_by_key(|xref| (xref.from_va, xref.to_va, xref.kind));
+    xrefs.dedup_by_key(|xref| (xref.from_va, xref.to_va, xref.kind));
+}
+
+fn instruction_end(instruction: &DecodedInstruction) -> u64 {
+    instruction
+        .address
+        .saturating_add(u64::try_from(instruction.bytes.len()).unwrap_or(0))
 }
 
 fn parse_imports(image: &PeImage, bytes: &[u8]) -> Vec<ImportSymbol> {
@@ -1269,6 +1596,15 @@ mod tests {
         assert_eq!(analysis.exports[0].va, 0x1400_01000);
         assert_eq!(analysis.relocations[0].rva, 0x1020);
         assert_eq!(analysis.relocations[0].kind_label(), "DIR64");
+        assert!(analysis
+            .function_cfgs
+            .iter()
+            .any(|cfg| cfg.function_start == 0x1400_01000 && !cfg.blocks.is_empty()));
+        assert!(analysis
+            .call_graph
+            .edges
+            .iter()
+            .any(|edge| { edge.caller_va == 0x1400_01000 && edge.callee_va == 0x1400_01010 }));
     }
 
     #[test]
@@ -1297,5 +1633,38 @@ mod tests {
         assert!(analysis.imports.is_empty());
         assert!(analysis.exports.is_empty());
         assert!(analysis.relocations.is_empty());
+        assert!(analysis
+            .function_cfgs
+            .iter()
+            .any(|cfg| cfg.function_start == 0x1800_00000 && !cfg.blocks.is_empty()));
+        assert!(analysis
+            .call_graph
+            .edges
+            .iter()
+            .any(|edge| { edge.caller_va == 0x1800_00000 && edge.callee_va == 0x1800_00010 }));
+    }
+
+    #[test]
+    fn builds_cfg_edges_for_conditional_branch() {
+        let instructions = disassemble_x64(0x1800_00000, &[0x75, 0x01, 0x90, 0xC3], 8);
+
+        let cfg = build_function_cfg(0x1800_00000, &instructions);
+
+        assert_eq!(cfg.blocks.len(), 3);
+        assert!(cfg.edges.iter().any(|edge| {
+            edge.from_va == 0x1800_00000
+                && edge.to_va == 0x1800_00003
+                && edge.kind == CfgEdgeKind::ConditionalTrue
+        }));
+        assert!(cfg.edges.iter().any(|edge| {
+            edge.from_va == 0x1800_00000
+                && edge.to_va == 0x1800_00002
+                && edge.kind == CfgEdgeKind::ConditionalFalse
+        }));
+        assert!(cfg.edges.iter().any(|edge| {
+            edge.from_va == 0x1800_00002
+                && edge.to_va == 0x1800_00003
+                && edge.kind == CfgEdgeKind::Fallthrough
+        }));
     }
 }

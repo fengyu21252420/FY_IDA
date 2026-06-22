@@ -8,7 +8,7 @@ use iced_x86::{
 const DEFAULT_MAX_BYTES: usize = 256;
 pub const DEFAULT_MAX_INSTRUCTIONS: usize = 64;
 
-#[derive(Debug, Clone, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum InstructionFlow {
     Next,
     DirectCall,

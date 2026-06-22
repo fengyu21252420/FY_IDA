@@ -2,9 +2,9 @@ use std::collections::VecDeque;
 use std::path::PathBuf;
 
 use eframe::egui::{
-    self, Align, CentralPanel, Color32, Context, FontData, FontDefinitions, FontFamily, Frame,
-    Grid, Key, Layout, RichText, ScrollArea, SidePanel, Stroke, TextEdit, TopBottomPanel, Ui,
-    Visuals, Window,
+    self, Align, CentralPanel, Color32, Context, DragValue, FontData, FontDefinitions, FontFamily,
+    Frame, Grid, Key, Layout, RichText, ScrollArea, SidePanel, Stroke, TextEdit, TopBottomPanel,
+    Ui, Visuals, Window,
 };
 use fyida_analysis::{
     analyze_pe, analyze_raw, empty_workspace_disassembly, file_error_log_lines,
@@ -61,6 +61,9 @@ struct FyIdaApp {
     quick_jump_text: String,
     search_open: bool,
     search_text: String,
+    graph_zoom: f32,
+    graph_pan_x: f32,
+    graph_pan_y: f32,
     raw_dialog_open: bool,
     pending_raw_selection: Option<FileSelection>,
     raw_base_text: String,
@@ -127,6 +130,9 @@ impl FyIdaApp {
             quick_jump_text: String::new(),
             search_open: false,
             search_text: String::new(),
+            graph_zoom: 1.0,
+            graph_pan_x: 0.0,
+            graph_pan_y: 0.0,
             raw_dialog_open: false,
             pending_raw_selection: None,
             raw_base_text: "0x140000000".to_owned(),
@@ -761,8 +767,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.6.0-alpha.1");
-                        ui.label("GUI 分析体验增强 MVP。");
+                        ui.label("FY_IDA v0.7.0-alpha.1");
+                        ui.label("CFG 与调用图 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -831,10 +837,19 @@ impl FyIdaApp {
                     if toolbar_button(ui, "注释", "添加注释 (;)").clicked() {
                         self.open_comment_dialog();
                     }
-                    toolbar_button(ui, "交叉引用", "查看交叉引用");
-                    toolbar_button(ui, "重新分析", "重新分析当前目标");
-                    toolbar_button(ui, "函数图", "切换到函数图");
-                    toolbar_button(ui, "伪代码", "切换到伪代码");
+                    if toolbar_button(ui, "交叉引用", "查看交叉引用").clicked() {
+                        self.right_tab = 0;
+                    }
+                    if toolbar_button(ui, "重新分析", "重新分析当前目标").clicked() {
+                        self.logs.push("当前版本自动分析在加载时执行。".to_owned());
+                        self.bottom_tab = 0;
+                    }
+                    if toolbar_button(ui, "函数图", "切换到函数图").clicked() {
+                        self.center_tab = 3;
+                    }
+                    if toolbar_button(ui, "伪代码", "切换到伪代码").clicked() {
+                        self.center_tab = 2;
+                    }
                 });
             });
     }
@@ -897,12 +912,8 @@ impl FyIdaApp {
                     0 => self.disassembly_view(ui),
                     1 => self.hex_view(ui),
                     2 => placeholder_center(ui, "伪代码", "反编译器将在后续版本启用。"),
-                    3 => placeholder_center(
-                        ui,
-                        "函数图",
-                        "CFG 图视图将在反汇编与 basic block 识别后启用。",
-                    ),
-                    4 => placeholder_center(ui, "调用图", "调用关系图将在分析引擎完成后启用。"),
+                    3 => self.function_graph_view(ui),
+                    4 => self.call_graph_view(ui),
                     _ => placeholder_center(ui, "IR 视图", "中间表示视图将在反编译器阶段启用。"),
                 }
             });
@@ -926,6 +937,12 @@ impl FyIdaApp {
                 .functions
                 .iter()
                 .map(|function| {
+                    let block_count = analysis
+                        .function_cfgs
+                        .iter()
+                        .find(|cfg| cfg.function_start == function.start_va)
+                        .map(|cfg| cfg.blocks.len())
+                        .unwrap_or(0);
                     (
                         function.start_va,
                         format!("{:016X}", function.start_va),
@@ -934,8 +951,8 @@ impl FyIdaApp {
                             .unwrap_or(&function.name)
                             .to_owned(),
                         format!(
-                            "{} 条指令 / {} 次调用",
-                            function.instruction_count, function.call_count
+                            "{} 条指令 / {} 个块 / {} 次调用",
+                            function.instruction_count, block_count, function.call_count
                         ),
                     )
                 })
@@ -1545,6 +1562,296 @@ impl FyIdaApp {
                 }
             }
         });
+    }
+
+    fn function_graph_view(&mut self, ui: &mut Ui) {
+        let Some(analysis) = &self.analysis else {
+            placeholder_center(ui, "函数图", "打开 PE 或 Raw Binary 后生成 CFG。");
+            return;
+        };
+        let Some(function_start) = self.current_function_start() else {
+            placeholder_center(ui, "函数图", "当前地址没有匹配到函数。");
+            return;
+        };
+        let Some(cfg) = analysis
+            .function_cfgs
+            .iter()
+            .find(|cfg| cfg.function_start == function_start)
+            .cloned()
+        else {
+            placeholder_center(ui, "函数图", "当前函数尚未生成 basic block。");
+            return;
+        };
+        let function_name = self
+            .project
+            .name_for(function_start)
+            .or_else(|| {
+                analysis
+                    .functions
+                    .iter()
+                    .find(|function| function.start_va == function_start)
+                    .map(|function| function.name.as_str())
+            })
+            .unwrap_or("函数")
+            .to_owned();
+
+        ui.horizontal(|ui| {
+            ui.strong(format!("函数图：{} 0x{function_start:016X}", function_name));
+            ui.separator();
+            ui.label(format!("Basic blocks：{}", cfg.blocks.len()));
+            ui.label(format!("Edges：{}", cfg.edges.len()));
+        });
+        self.graph_controls(ui);
+        ui.separator();
+
+        let text_size = 12.0 * self.graph_zoom;
+        ScrollArea::both().show(ui, |ui| {
+            ui.add_space(self.graph_pan_y.max(0.0));
+            ui.horizontal(|ui| {
+                ui.add_space(self.graph_pan_x.max(0.0));
+                ui.vertical(|ui| {
+                    for block in &cfg.blocks {
+                        Frame::group(ui.style())
+                            .fill(panel_color())
+                            .stroke(Stroke::new(1.0, Color32::from_rgb(200, 205, 210)))
+                            .show(ui, |ui| {
+                                ui.set_min_width(520.0 * self.graph_zoom);
+                                if ui
+                                    .selectable_label(
+                                        false,
+                                        RichText::new(format!(
+                                            "BB 0x{:016X} - 0x{:016X}  / {} 条指令 / {} 次调用",
+                                            block.start_va,
+                                            block.end_va,
+                                            block.instruction_count,
+                                            block.call_count
+                                        ))
+                                        .color(address_color())
+                                        .size(text_size)
+                                        .strong(),
+                                    )
+                                    .clicked()
+                                {
+                                    self.project
+                                        .jump_to(block.start_va, Some("Basic block".to_owned()));
+                                    self.center_tab = 0;
+                                }
+                                for instruction in block.instructions.iter().take(8) {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "{:016X}  {:<18} {:<8} {}",
+                                            instruction.address,
+                                            instruction.bytes,
+                                            instruction.mnemonic,
+                                            instruction.operands
+                                        ))
+                                        .size(text_size)
+                                        .monospace(),
+                                    );
+                                }
+                                if block.instructions.len() > 8 {
+                                    ui.label(
+                                        RichText::new(format!(
+                                            "... 还有 {} 条指令",
+                                            block.instructions.len() - 8
+                                        ))
+                                        .color(comment_color()),
+                                    );
+                                }
+                            });
+                        ui.add_space(8.0 * self.graph_zoom);
+                    }
+
+                    ui.separator();
+                    ui.strong("CFG 边");
+                    if cfg.edges.is_empty() {
+                        ui.label("当前函数没有可显示 CFG 边。");
+                    } else {
+                        Grid::new("function_cfg_edges")
+                            .num_columns(3)
+                            .striped(true)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("来源");
+                                ui.strong("目标");
+                                ui.strong("类型");
+                                ui.end_row();
+                                for edge in &cfg.edges {
+                                    if ui
+                                        .selectable_label(false, format!("{:016X}", edge.from_va))
+                                        .clicked()
+                                    {
+                                        self.project
+                                            .jump_to(edge.from_va, Some("CFG 来源".to_owned()));
+                                        self.center_tab = 0;
+                                    }
+                                    if ui
+                                        .selectable_label(false, format!("{:016X}", edge.to_va))
+                                        .clicked()
+                                    {
+                                        self.project
+                                            .jump_to(edge.to_va, Some("CFG 目标".to_owned()));
+                                        self.center_tab = 0;
+                                    }
+                                    ui.label(edge.kind.label());
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                });
+            });
+        });
+    }
+
+    fn call_graph_view(&mut self, ui: &mut Ui) {
+        let Some(analysis) = &self.analysis else {
+            placeholder_center(ui, "调用图", "打开 PE 或 Raw Binary 后生成调用关系。");
+            return;
+        };
+        let call_graph = analysis.call_graph.clone();
+
+        ui.horizontal(|ui| {
+            ui.strong("调用图");
+            ui.separator();
+            ui.label(format!("节点：{}", call_graph.nodes.len()));
+            ui.label(format!("边：{}", call_graph.edges.len()));
+        });
+        self.graph_controls(ui);
+        ui.separator();
+
+        ScrollArea::both().show(ui, |ui| {
+            ui.add_space(self.graph_pan_y.max(0.0));
+            ui.horizontal(|ui| {
+                ui.add_space(self.graph_pan_x.max(0.0));
+                ui.vertical(|ui| {
+                    ui.strong("函数节点");
+                    Grid::new("call_graph_nodes")
+                        .num_columns(4)
+                        .striped(true)
+                        .spacing([12.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.strong("地址");
+                            ui.strong("名称");
+                            ui.strong("类型");
+                            ui.strong("调用数");
+                            ui.end_row();
+                            for node in &call_graph.nodes {
+                                if ui
+                                    .selectable_label(false, format!("{:016X}", node.start_va))
+                                    .clicked()
+                                {
+                                    self.project.jump_to(node.start_va, Some(node.name.clone()));
+                                    self.center_tab = 0;
+                                }
+                                let name =
+                                    self.project.name_for(node.start_va).unwrap_or(&node.name);
+                                if ui.selectable_label(false, name).clicked() {
+                                    self.project.jump_to(node.start_va, Some(name.to_owned()));
+                                    self.center_tab = 0;
+                                }
+                                ui.label(if node.is_external {
+                                    "预留/外部"
+                                } else {
+                                    "已发现"
+                                });
+                                ui.label(node.call_count.to_string());
+                                ui.end_row();
+                            }
+                        });
+
+                    ui.separator();
+                    ui.strong("调用边");
+                    if call_graph.edges.is_empty() {
+                        ui.label("当前样本没有 direct call 边，或尚未识别到可解析调用目标。");
+                    } else {
+                        Grid::new("call_graph_edges")
+                            .num_columns(4)
+                            .striped(true)
+                            .spacing([12.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.strong("Caller");
+                                ui.strong("Callee");
+                                ui.strong("Callsite");
+                                ui.strong("类型");
+                                ui.end_row();
+                                for edge in &call_graph.edges {
+                                    if ui
+                                        .selectable_label(false, format!("{:016X}", edge.caller_va))
+                                        .clicked()
+                                    {
+                                        self.project
+                                            .jump_to(edge.caller_va, Some("调用者".to_owned()));
+                                        self.center_tab = 0;
+                                    }
+                                    if ui
+                                        .selectable_label(false, format!("{:016X}", edge.callee_va))
+                                        .clicked()
+                                    {
+                                        self.project
+                                            .jump_to(edge.callee_va, Some("被调用函数".to_owned()));
+                                        self.center_tab = 0;
+                                    }
+                                    if ui
+                                        .selectable_label(
+                                            false,
+                                            format!("{:016X}", edge.callsite_va),
+                                        )
+                                        .clicked()
+                                    {
+                                        self.project
+                                            .jump_to(edge.callsite_va, Some("callsite".to_owned()));
+                                        self.center_tab = 0;
+                                    }
+                                    ui.label(&edge.label);
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                });
+            });
+        });
+    }
+
+    fn graph_controls(&mut self, ui: &mut Ui) {
+        ui.horizontal(|ui| {
+            ui.label("缩放");
+            ui.add(
+                DragValue::new(&mut self.graph_zoom)
+                    .speed(0.05)
+                    .clamp_range(0.6..=1.8),
+            );
+            ui.label("平移 X");
+            ui.add(DragValue::new(&mut self.graph_pan_x).speed(4.0));
+            ui.label("平移 Y");
+            ui.add(DragValue::new(&mut self.graph_pan_y).speed(4.0));
+            if ui.button("重置").clicked() {
+                self.graph_zoom = 1.0;
+                self.graph_pan_x = 0.0;
+                self.graph_pan_y = 0.0;
+            }
+        });
+    }
+
+    fn current_function_start(&self) -> Option<u64> {
+        let analysis = self.analysis.as_ref()?;
+        let address = self.project.current_address()?;
+        analysis
+            .functions
+            .iter()
+            .find(|function| {
+                let end = function.start_va.saturating_add(function.size.max(1));
+                address >= function.start_va && address < end
+            })
+            .map(|function| function.start_va)
+            .or_else(|| {
+                analysis
+                    .functions
+                    .iter()
+                    .filter(|function| function.start_va <= address)
+                    .max_by_key(|function| function.start_va)
+                    .map(|function| function.start_va)
+            })
+            .or_else(|| analysis.function_cfgs.first().map(|cfg| cfg.function_start))
     }
 
     fn disassembly_view(&mut self, ui: &mut Ui) {

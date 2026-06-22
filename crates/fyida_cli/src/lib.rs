@@ -9,7 +9,7 @@ use fyida_loader::RawLoadOptions;
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.6.0-alpha.1 已增强 GUI 搜索、跳转、导航历史和 Hex 同步体验。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.7.0-alpha.1 已提供基础 CFG 与 direct-call 调用图能力。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -237,6 +237,26 @@ fn print_static_analysis(analysis: &fyida_analysis::StaticAnalysis) {
             xref.from_va,
             xref.to_va,
             xref.kind.label()
+        );
+    }
+    println!("  CFGs：{}", analysis.function_cfgs.len());
+    for cfg in analysis.function_cfgs.iter().take(16) {
+        println!(
+            "    {:016X} blocks {} edges {}",
+            cfg.function_start,
+            cfg.blocks.len(),
+            cfg.edges.len()
+        );
+    }
+    println!(
+        "  CallGraph：{} nodes / {} edges",
+        analysis.call_graph.nodes.len(),
+        analysis.call_graph.edges.len()
+    );
+    for edge in analysis.call_graph.edges.iter().take(64) {
+        println!(
+            "    {:016X} -> {:016X} callsite {:016X}",
+            edge.caller_va, edge.callee_va, edge.callsite_va
         );
     }
 }

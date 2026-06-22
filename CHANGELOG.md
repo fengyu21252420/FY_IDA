@@ -4,6 +4,39 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.7.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added basic block, function CFG, CFG edge, call graph node, and call graph edge models to `StaticAnalysis`.
+- Added CFG generation for discovered PE and Raw Binary functions using decoded x64 branch, fallthrough, and return flow.
+- Added direct-call graph construction from discovered function callsites.
+- Added CFG and call graph summary lines to GUI analysis logs and headless output.
+- Added a real GUI Function Graph tab with clickable basic block summaries, instruction previews, CFG edges, and zoom/pan/reset controls.
+- Added a real GUI Call Graph tab with clickable function nodes, direct-call edges, callsites, and zoom/pan/reset controls.
+- Added clickable graph navigation back into the disassembly view.
+- Added unit coverage for CFG true/false/fallthrough edges and call graph generation from PE/Raw samples.
+
+### Changed
+
+- Updated the workspace version to `0.7.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and function-list summaries for the CFG/call graph checkpoint.
+
+### Fixed
+
+- The Function Graph and Call Graph center tabs now display real analysis data instead of placeholders.
+
+### Known Issues
+
+- CFG generation is based on the current conservative linear decode per discovered function; recursive intra-function block discovery and jump table expansion remain future work.
+- The graph views are high-density clickable summaries with zoom/pan controls, not yet a full freeform node-layout canvas.
+- Call graph edges currently cover direct calls discovered by the x64 decoder; indirect calls, import thunk resolution, library filtering, and thunk classification remain future work.
+
+### Recovery
+
+- Source tag: `v0.7.0-alpha.1`.
+- Roll back with: `git checkout v0.7.0-alpha.1`.
+
 ## v0.6.0-alpha.1 - 2026-06-23
 
 ### Added
