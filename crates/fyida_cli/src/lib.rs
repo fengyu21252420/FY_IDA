@@ -23,7 +23,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.28.0-alpha.1 已支持 headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.29.0-alpha.1 已支持 headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -179,6 +179,7 @@ pub enum ExportKind {
     Instructions,
     CallGraph,
     RuntimeSignatures,
+    Pdb,
     Pseudocode,
     Ir,
     Search,
@@ -2263,6 +2264,11 @@ fn text_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::RuntimeSignatures => {
             text_runtime_signatures(&report.analysis.runtime_signatures)
         }
+        ExportKind::Pdb => text_pdb(
+            &report.analysis.pdb_records,
+            &report.analysis.pdb_symbols,
+            &report.analysis.pdb_types,
+        ),
         ExportKind::Pseudocode => text_pseudocode(&report.analysis.pseudocode_functions),
         ExportKind::Ir => text_ir(&report.analysis.pseudocode_functions),
         ExportKind::Search => text_search(report.search.as_ref()),
@@ -2429,6 +2435,9 @@ fn text_summary_report(report: &HeadlessReport) -> String {
         "Pseudocode: {}",
         report.analysis.pseudocode_functions.len()
     );
+    let _ = writeln!(text, "PDBRecords: {}", report.analysis.pdb_records.len());
+    let _ = writeln!(text, "PDBSymbols: {}", report.analysis.pdb_symbols.len());
+    let _ = writeln!(text, "PDBTypes: {}", report.analysis.pdb_types.len());
     let _ = writeln!(
         text,
         "RuntimeSignatures: {}",
@@ -2651,6 +2660,56 @@ fn text_runtime_signatures(signatures: &[RuntimeSignatureRecord]) -> String {
     text
 }
 
+fn text_pdb(records: &[PdbRecord], symbols: &[PdbSymbolRecord], types: &[PdbTypeRecord]) -> String {
+    let mut text = String::from("PDB\nRecords\n");
+    for record in records {
+        let age = record
+            .age
+            .map(|value| value.to_string())
+            .unwrap_or_else(|| "-".to_owned());
+        let signature = record
+            .signature
+            .map(|value| format!("{value:08X}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let _ = writeln!(
+            text,
+            "{}\t{}\tguid {}\tage {}\tsignature {}\tRVA {:08X}\tFO {:08X}",
+            record.format,
+            record.path,
+            record.guid.as_deref().unwrap_or("-"),
+            age,
+            signature,
+            record.debug_rva,
+            record.debug_file_offset
+        );
+    }
+    text.push_str("Symbols\n");
+    for symbol in symbols {
+        let address = symbol
+            .address
+            .map(format_va)
+            .unwrap_or_else(|| "-".to_owned());
+        let rva = symbol
+            .rva
+            .map(|value| format!("{value:08X}"))
+            .unwrap_or_else(|| "-".to_owned());
+        let _ = writeln!(
+            text,
+            "{}\t{}\t{}\t{}\t{}\t{}",
+            address, rva, symbol.kind, symbol.name, symbol.original_name, symbol.source
+        );
+    }
+    text.push_str("Types\n");
+    for type_item in types {
+        let _ = writeln!(
+            text,
+            "{}\t{}\t{}",
+            type_item.kind, type_item.name, type_item.source
+        );
+    }
+    text
+}
+
 fn text_pseudocode(functions: &[PseudocodeRecord]) -> String {
     let mut text = String::from("Pseudocode\n");
     for function in functions {
@@ -2830,6 +2889,11 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::RuntimeSignatures => {
             csv_runtime_signatures(&report.analysis.runtime_signatures)
         }
+        ExportKind::Pdb => csv_pdb(
+            &report.analysis.pdb_records,
+            &report.analysis.pdb_symbols,
+            &report.analysis.pdb_types,
+        ),
         ExportKind::Pseudocode => csv_pseudocode(&report.analysis.pseudocode_functions),
         ExportKind::Ir => csv_ir(&report.analysis.pseudocode_functions),
         ExportKind::Search => csv_search(report.search.as_ref()),
@@ -2926,6 +2990,30 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
                     "summary",
                     "pseudocode_functions",
                     &report.analysis.pseudocode_functions.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "pdb_records",
+                    &report.analysis.pdb_records.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "pdb_symbols",
+                    &report.analysis.pdb_symbols.len().to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "pdb_types",
+                    &report.analysis.pdb_types.len().to_string(),
                 ],
             );
             push_csv_row(
@@ -3038,6 +3126,24 @@ fn csv_summary(report: &HeadlessReport) -> String {
             "pseudocode_functions",
             &report.analysis.pseudocode_functions.len().to_string(),
         ],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "pdb_records",
+            &report.analysis.pdb_records.len().to_string(),
+        ],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "pdb_symbols",
+            &report.analysis.pdb_symbols.len().to_string(),
+        ],
+    );
+    push_csv_row(
+        &mut csv,
+        &["pdb_types", &report.analysis.pdb_types.len().to_string()],
     );
     push_csv_row(
         &mut csv,
@@ -3366,6 +3472,89 @@ fn csv_runtime_signatures(signatures: &[RuntimeSignatureRecord]) -> String {
                 &signature.library,
                 &signature.evidence,
                 &signature.confidence.to_string(),
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_pdb(records: &[PdbRecord], symbols: &[PdbSymbolRecord], types: &[PdbTypeRecord]) -> String {
+    let mut csv = String::from(
+        "record,format,path,guid,age,signature,debug_rva,debug_file_offset,address,rva,kind,name,original_name,source\n",
+    );
+    for record in records {
+        let age = record
+            .age
+            .map(|value| value.to_string())
+            .unwrap_or_default();
+        let signature = record
+            .signature
+            .map(|value| format!("{value:08X}"))
+            .unwrap_or_default();
+        push_csv_row(
+            &mut csv,
+            &[
+                "record",
+                &record.format,
+                &record.path,
+                record.guid.as_deref().unwrap_or(""),
+                &age,
+                &signature,
+                &format!("{:08X}", record.debug_rva),
+                &format!("{:08X}", record.debug_file_offset),
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+        );
+    }
+    for symbol in symbols {
+        let address = symbol.address.map(format_va).unwrap_or_default();
+        let rva = symbol
+            .rva
+            .map(|value| format!("{value:08X}"))
+            .unwrap_or_default();
+        push_csv_row(
+            &mut csv,
+            &[
+                "symbol",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                &address,
+                &rva,
+                &symbol.kind,
+                &symbol.name,
+                &symbol.original_name,
+                &symbol.source,
+            ],
+        );
+    }
+    for type_item in types {
+        push_csv_row(
+            &mut csv,
+            &[
+                "type",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                &type_item.kind,
+                &type_item.name,
+                "",
+                &type_item.source,
             ],
         );
     }
@@ -3942,6 +4131,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_pdb_export_kind() {
+        let cli =
+            Cli::try_parse_from(["fy_ida", "--headless", "--export", "pdb", "sample.exe"]).unwrap();
+
+        assert_eq!(cli.export, ExportKind::Pdb);
+    }
+
+    #[test]
     fn parses_search_query_and_export_kind() {
         let cli = Cli::try_parse_from([
             "fy_ida",
@@ -4153,7 +4350,7 @@ mod tests {
 
         let document = project_document_from_report(&report).unwrap();
 
-        assert_eq!(document.app_version, "0.28.0-alpha.1");
+        assert_eq!(document.app_version, "0.29.0-alpha.1");
         assert_eq!(document.functions[0].name, "renamed_func");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         assert_eq!(document.annotations.comments[0].text, "automation note");
@@ -4364,6 +4561,31 @@ mod tests {
         assert!(relocations_csv.contains("0000000140003000,00003000,00003000,DIR64"));
     }
 
+    #[test]
+    fn pdb_text_and_csv_exports_are_structured() {
+        let analysis = sample_analysis_report();
+
+        let text = text_pdb(
+            &analysis.pdb_records,
+            &analysis.pdb_symbols,
+            &analysis.pdb_types,
+        );
+        let csv = csv_pdb(
+            &analysis.pdb_records,
+            &analysis.pdb_symbols,
+            &analysis.pdb_types,
+        );
+
+        assert!(text.starts_with("PDB\nRecords\n"));
+        assert!(text.contains("RSDS"));
+        assert!(text.contains("quoted_symbol"));
+        assert!(text.contains("QUOTED_STRUCT"));
+        assert!(csv.starts_with("record,format,path,guid,age,signature,debug_rva"));
+        assert!(csv.contains("record,RSDS,C:\\symbols\\quoted.pdb"));
+        assert!(csv.contains("symbol,,,,,,,,0000000140001000,00001000,public"));
+        assert!(csv.contains("type,,,,,,,,,,UDT,QUOTED_STRUCT,,pdb"));
+    }
+
     fn sample_pseudocode_record() -> PseudocodeRecord {
         PseudocodeRecord {
             function_start: 0x0000_0001_4000_1000,
@@ -4385,7 +4607,7 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.28.0-alpha.1".to_owned(),
+            version: "0.29.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),
@@ -4592,9 +4814,28 @@ mod tests {
                 evidence: "quoted evidence".to_owned(),
                 confidence: 80,
             }],
-            pdb_records: Vec::new(),
-            pdb_symbols: Vec::new(),
-            pdb_types: Vec::new(),
+            pdb_records: vec![PdbRecord {
+                format: "RSDS".to_owned(),
+                path: "C:\\symbols\\quoted.pdb".to_owned(),
+                guid: Some("01234567-89AB-CDEF-0123-456789ABCDEF".to_owned()),
+                age: Some(1),
+                signature: None,
+                debug_rva: 0x4000,
+                debug_file_offset: 0x600,
+            }],
+            pdb_symbols: vec![PdbSymbolRecord {
+                address: Some(0x0000_0001_4000_1000),
+                rva: Some(0x1000),
+                kind: "public".to_owned(),
+                name: "quoted_symbol".to_owned(),
+                original_name: "?quoted_symbol@@YAXXZ".to_owned(),
+                source: "pdb".to_owned(),
+            }],
+            pdb_types: vec![PdbTypeRecord {
+                name: "QUOTED_STRUCT".to_owned(),
+                kind: "UDT".to_owned(),
+                source: "pdb".to_owned(),
+            }],
         }
     }
 

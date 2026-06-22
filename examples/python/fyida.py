@@ -63,6 +63,17 @@ class Project:
     def relocations(self):
         return self._records("relocations")
 
+    def pdb_records(self, query=None):
+        return self._filter_records("pdb_records", query, "format", "path", "guid")
+
+    def pdb_symbols(self, query=None):
+        return self._filter_records(
+            "pdb_symbols", query, "kind", "name", "original_name", "source"
+        )
+
+    def pdb_types(self, query=None):
+        return self._filter_records("pdb_types", query, "kind", "name", "source")
+
     def xrefs(self):
         return self._records("xrefs")
 

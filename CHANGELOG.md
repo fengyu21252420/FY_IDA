@@ -4,6 +4,37 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.29.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added `--export pdb` for dedicated text and CSV PDB metadata output.
+- Added PDB record, PDB symbol, and PDB type counts to text/CSV summary output.
+- Added `pdb_records(query=None)`, `pdb_symbols(query=None)`, and `pdb_types(query=None)` to `examples/python/fyida.py`.
+- Added `examples/scripts/list_pdb.py` for PDB scripting examples.
+- Added CLI unit coverage for PDB export parsing and text/CSV PDB output.
+
+### Changed
+
+- Updated the workspace version to `0.29.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the headless PDB export checkpoint.
+- Headless `--export all --export-format csv` now includes PDB record, symbol, and type counts in its summary rows.
+
+### Fixed
+
+- Analysts no longer need to consume full JSON reports or search rows just to export PE CodeView PDB records, loaded PDB symbols, or PDB type summaries as text/CSV.
+
+### Known Issues
+
+- `--export pdb` reports the current PDB metadata model; full PDB TPI/IPI layouts, enum members, class fields, and function prototype recovery remain future work.
+- PDB symbol and type rows are present only when the PE contains CodeView data or an external PDB is supplied and parsed successfully.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.29.0-alpha.1`.
+- Roll back with: `git checkout v0.29.0-alpha.1`.
+
 ## v0.28.0-alpha.1 - 2026-06-23
 
 ### Added
