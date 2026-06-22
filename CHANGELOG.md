@@ -4,6 +4,35 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.24.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added an `IndirectBranch` instruction-flow classification for x64 indirect branch instructions.
+- Added import API call graph edges for resolved `call qword ptr [rip+IAT]` memory operands.
+- Added import-thunk call graph edges for resolved `jmp qword ptr [rip+IAT]` thunks.
+- Added import API external-node names to the call graph so pseudo-C and IR call targets can show DLL/API names.
+- Added unit coverage for indirect branch memory targets, IAT indirect calls, import-thunk edges, external import nodes, and pseudo-C import names.
+
+### Changed
+
+- Updated the workspace version to `0.24.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the import-call graph checkpoint.
+- Indirect branch instructions now terminate conservative function decoding and CFG fallthrough, improving import-thunk boundaries.
+- The GUI call graph labels external nodes backed by import names as "导入 API".
+
+### Known Issues
+
+- Import call graph recovery still requires the IAT memory operand to resolve to a parsed import thunk VA.
+- Register-computed indirect calls and non-IAT virtual dispatch remain unresolved.
+- Headless JSON currently exports call graph counts but not detailed call graph node/edge rows.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.24.0-alpha.1`.
+- Roll back with: `git checkout v0.24.0-alpha.1`.
+
 ## v0.23.0-alpha.1 - 2026-06-23
 
 ### Added

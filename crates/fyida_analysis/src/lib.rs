@@ -357,6 +357,13 @@ struct DecodedFunctionAnalysis {
     discovered_call_targets: Vec<u64>,
 }
 
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct MemoryXrefClassification {
+    kind: XrefKind,
+    label: String,
+    import_name: Option<String>,
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum StringEncoding {
     Ascii,
@@ -657,7 +664,7 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.23.0-alpha.1，x64 RIP-relative/absolute 内存 xref、Python 标注动作写入、headless 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、本地签名库、Runtime 识别、运行库过滤和基础 x64 伪 C/IR 已接入。".to_owned(),
+        "当前版本：v0.24.0-alpha.1，IAT 间接调用/import thunk 调用图、x64 RIP-relative/absolute 内存 xref、Python 标注动作写入、headless 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、本地签名库、Runtime 识别、运行库过滤和基础 x64 伪 C/IR 已接入。".to_owned(),
         "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串、基础引用和图数据。"
             .to_owned(),
     ]
@@ -888,7 +895,7 @@ fn discover_functions_and_xrefs(
     functions.sort_by_key(|function| function.start_va);
     function_cfgs.sort_by_key(|cfg| cfg.function_start);
     dedup_xrefs(&mut xrefs);
-    let call_graph = build_call_graph(&functions, call_edges);
+    let call_graph = build_call_graph(&functions, call_edges, imports);
 
     DiscoveryResult {
         functions,
@@ -953,7 +960,7 @@ fn discover_raw_functions_and_xrefs(
     functions.sort_by_key(|function| function.start_va);
     function_cfgs.sort_by_key(|cfg| cfg.function_start);
     dedup_xrefs(&mut xrefs);
-    let call_graph = build_call_graph(&functions, call_edges);
+    let call_graph = build_call_graph(&functions, call_edges, &[]);
 
     DiscoveryResult {
         functions,
@@ -968,12 +975,15 @@ fn analyze_decoded_function(
     name: String,
     instructions: &[DecodedInstruction],
     target_allowed: impl Fn(u64) -> bool,
-    memory_xref: impl Fn(u64) -> Option<(XrefKind, String)>,
+    memory_xref: impl Fn(u64) -> Option<MemoryXrefClassification>,
 ) -> DecodedFunctionAnalysis {
     let mut truncated = Vec::new();
     for instruction in instructions {
         truncated.push(instruction.clone());
-        if instruction.flow == InstructionFlow::Return {
+        if matches!(
+            instruction.flow,
+            InstructionFlow::Return | InstructionFlow::IndirectBranch
+        ) {
             break;
         }
     }
@@ -1018,13 +1028,36 @@ fn analyze_decoded_function(
         }
 
         for target in &instruction.memory_targets {
-            if let Some((kind, label)) = memory_xref(*target) {
+            if let Some(classification) = memory_xref(*target) {
                 xrefs.push(XrefSummary {
                     from_va: instruction.address,
                     to_va: *target,
-                    kind,
-                    label,
+                    kind: classification.kind,
+                    label: classification.label.clone(),
                 });
+                if let Some(import_name) = classification.import_name {
+                    match instruction.flow {
+                        InstructionFlow::IndirectCall => {
+                            call_count += 1;
+                            calls.push(CallGraphEdge {
+                                caller_va: start_va,
+                                callee_va: *target,
+                                callsite_va: instruction.address,
+                                label: format!("import call -> {import_name}"),
+                            });
+                        }
+                        InstructionFlow::IndirectBranch => {
+                            call_count += 1;
+                            calls.push(CallGraphEdge {
+                                caller_va: start_va,
+                                callee_va: *target,
+                                callsite_va: instruction.address,
+                                label: format!("import thunk -> {import_name}"),
+                            });
+                        }
+                        _ => {}
+                    }
+                }
             }
         }
     }
@@ -1053,75 +1086,83 @@ fn classify_pe_memory_xref(
     strings: &[ExtractedString],
     imports: &[ImportSymbol],
     relocations: &[RelocationEntry],
-) -> Option<(XrefKind, String)> {
+) -> Option<MemoryXrefClassification> {
     if let Some(import) = imports.iter().find(|import| import.thunk_va == target) {
-        return Some((
-            XrefKind::Import,
-            format!("{} -> {}", XrefKind::Import.label(), import.display_name()),
-        ));
+        let import_name = import.display_name();
+        return Some(MemoryXrefClassification {
+            kind: XrefKind::Import,
+            label: format!("{} -> {}", XrefKind::Import.label(), import_name),
+            import_name: Some(import_name),
+        });
     }
 
     if let Some(string) = strings
         .iter()
         .find(|string| string_contains_address(string, target))
     {
-        return Some((
-            XrefKind::String,
-            format!(
+        return Some(MemoryXrefClassification {
+            kind: XrefKind::String,
+            label: format!(
                 "{} -> {} {}",
                 XrefKind::String.label(),
                 string.encoding.label(),
                 bounded_xref_text(&string.value)
             ),
-        ));
+            import_name: None,
+        });
     }
 
     if let Some(relocation) = relocations
         .iter()
         .find(|relocation| relocation.va == target)
     {
-        return Some((
-            XrefKind::Relocation,
-            format!(
+        return Some(MemoryXrefClassification {
+            kind: XrefKind::Relocation,
+            label: format!(
                 "{} -> RVA 0x{:08X} {}",
                 XrefKind::Relocation.label(),
                 relocation.rva,
                 relocation.kind_label()
             ),
-        ));
+            import_name: None,
+        });
     }
 
-    image.section_containing_va(target).map(|section| {
-        (
-            XrefKind::Data,
-            format!("{} -> section {}", XrefKind::Data.label(), section.name),
-        )
-    })
+    image
+        .section_containing_va(target)
+        .map(|section| MemoryXrefClassification {
+            kind: XrefKind::Data,
+            label: format!("{} -> section {}", XrefKind::Data.label(), section.name),
+            import_name: None,
+        })
 }
 
 fn classify_raw_memory_xref(
     target: u64,
     image: &RawImage,
     strings: &[ExtractedString],
-) -> Option<(XrefKind, String)> {
+) -> Option<MemoryXrefClassification> {
     if let Some(string) = strings
         .iter()
         .find(|string| string_contains_address(string, target))
     {
-        return Some((
-            XrefKind::String,
-            format!(
+        return Some(MemoryXrefClassification {
+            kind: XrefKind::String,
+            label: format!(
                 "{} -> {} {}",
                 XrefKind::String.label(),
                 string.encoding.label(),
                 bounded_xref_text(&string.value)
             ),
-        ));
+            import_name: None,
+        });
     }
 
-    image
-        .contains_va(target)
-        .then(|| (XrefKind::Data, XrefKind::Data.label().to_owned()))
+    image.contains_va(target).then(|| MemoryXrefClassification {
+        kind: XrefKind::Data,
+        label: XrefKind::Data.label().to_owned(),
+        import_name: None,
+    })
 }
 
 fn string_contains_address(string: &ExtractedString, address: u64) -> bool {
@@ -1177,7 +1218,9 @@ fn build_function_cfg(function_start: u64, instructions: &[DecodedInstruction]) 
 
         if matches!(
             instruction.flow,
-            InstructionFlow::ConditionalBranch | InstructionFlow::UnconditionalBranch
+            InstructionFlow::ConditionalBranch
+                | InstructionFlow::UnconditionalBranch
+                | InstructionFlow::IndirectBranch
         ) && instruction_addresses.contains(&next)
         {
             leaders.insert(next);
@@ -1247,7 +1290,7 @@ fn build_function_cfg(function_start: u64, instructions: &[DecodedInstruction]) 
                     );
                 }
             }
-            InstructionFlow::Return => {}
+            InstructionFlow::IndirectBranch | InstructionFlow::Return => {}
             _ => {
                 if let Some(target) = next_block {
                     push_cfg_edge(
@@ -1277,7 +1320,12 @@ fn decoded_block(instructions: &[DecodedInstruction]) -> BasicBlock {
     let end_va = instructions.last().map(instruction_end).unwrap_or(start_va);
     let call_count = instructions
         .iter()
-        .filter(|instruction| instruction.flow == InstructionFlow::DirectCall)
+        .filter(|instruction| {
+            matches!(
+                instruction.flow,
+                InstructionFlow::DirectCall | InstructionFlow::IndirectCall
+            )
+        })
         .count();
     let block_instructions = instructions
         .iter()
@@ -1316,7 +1364,20 @@ fn push_cfg_edge(
     }
 }
 
-fn build_call_graph(functions: &[FunctionSummary], mut edges: Vec<CallGraphEdge>) -> CallGraph {
+fn build_call_graph(
+    functions: &[FunctionSummary],
+    mut edges: Vec<CallGraphEdge>,
+    imports: &[ImportSymbol],
+) -> CallGraph {
+    let import_names = imports
+        .iter()
+        .map(|import| (import.thunk_va, import.display_name()))
+        .collect::<BTreeMap<_, _>>();
+    let mut incoming_counts = BTreeMap::new();
+    for edge in &edges {
+        *incoming_counts.entry(edge.callee_va).or_insert(0usize) += 1;
+    }
+
     let mut nodes = BTreeMap::new();
     for function in functions {
         nodes.insert(
@@ -1337,9 +1398,12 @@ fn build_call_graph(functions: &[FunctionSummary], mut edges: Vec<CallGraphEdge>
             .entry(edge.callee_va)
             .or_insert_with(|| CallGraphNode {
                 start_va: edge.callee_va,
-                name: format!("sub_{:016X}", edge.callee_va),
+                name: import_names
+                    .get(&edge.callee_va)
+                    .cloned()
+                    .unwrap_or_else(|| format!("sub_{:016X}", edge.callee_va)),
                 is_external: true,
-                call_count: 0,
+                call_count: incoming_counts.get(&edge.callee_va).copied().unwrap_or(0),
             });
     }
 
@@ -1802,10 +1866,15 @@ fn build_pseudocode_functions(
     cfgs: &[FunctionCfg],
     call_graph: &CallGraph,
 ) -> Vec<PseudocodeFunction> {
-    let names = functions
+    let mut names = functions
         .iter()
         .map(|function| (function.start_va, function.name.clone()))
         .collect::<BTreeMap<_, _>>();
+    for node in &call_graph.nodes {
+        names
+            .entry(node.start_va)
+            .or_insert_with(|| node.name.clone());
+    }
     let call_targets = call_graph
         .edges
         .iter()
@@ -1882,6 +1951,17 @@ fn pseudo_for_instruction(
                 });
             format!("{}();", sanitize_identifier(&callee))
         }
+        InstructionFlow::IndirectBranch => {
+            if let Some(target) = call_targets.get(&instruction.address).copied() {
+                let callee = names
+                    .get(&target)
+                    .cloned()
+                    .unwrap_or_else(|| format!("sub_{target:016X}"));
+                format!("return {}();", sanitize_identifier(&callee))
+            } else {
+                "goto /* indirect */;".to_owned()
+            }
+        }
         InstructionFlow::ConditionalBranch => {
             let target = instruction
                 .branch_target
@@ -1939,6 +2019,13 @@ fn ir_for_instruction(
         InstructionFlow::DirectCall | InstructionFlow::IndirectCall => "call",
         InstructionFlow::ConditionalBranch => "branch_if",
         InstructionFlow::UnconditionalBranch => "jump",
+        InstructionFlow::IndirectBranch => {
+            if call_targets.contains_key(&instruction.address) {
+                "tailcall"
+            } else {
+                "jump_indirect"
+            }
+        }
         InstructionFlow::Return => "return",
         _ => instruction.mnemonic.as_str(),
     }
@@ -3127,13 +3214,18 @@ mod tests {
     fn sample_bytes() -> Vec<u8> {
         let mut bytes = vec![0u8; 0x900];
 
-        bytes[0x200..0x214].copy_from_slice(&[
+        bytes[0x200..0x21F].copy_from_slice(&[
             0xE8, 0x1B, 0x00, 0x00, 0x00, // call 0x140001020
             0x48, 0x8D, 0x0D, 0xF4, 0x0F, 0x00, 0x00, // lea rcx, [rip+0xFF4]
             0x48, 0x8B, 0x05, 0x4D, 0x11, 0x00, 0x00, // mov rax, [rip+0x114D]
+            0xE8, 0x18, 0x00, 0x00, 0x00, // call 0x140001030
+            0xFF, 0x15, 0x42, 0x11, 0x00, 0x00, // call qword ptr [rip+0x1142]
             0xC3,
         ]);
         bytes[0x220] = 0xC3;
+        bytes[0x230..0x236].copy_from_slice(&[
+            0xFF, 0x25, 0x2A, 0x11, 0x00, 0x00, // jmp qword ptr [rip+0x112A]
+        ]);
 
         write_c_string(&mut bytes, 0x400, "hello world");
         let utf16 = "wide";
@@ -3215,6 +3307,10 @@ mod tests {
             .iter()
             .any(|function| function.start_va == 0x1400_01020));
         assert!(analysis
+            .functions
+            .iter()
+            .any(|function| function.start_va == 0x1400_01030));
+        assert!(analysis
             .xrefs
             .iter()
             .any(|xref| xref.from_va == 0x1400_01000 && xref.to_va == 0x1400_01020));
@@ -3225,6 +3321,12 @@ mod tests {
         }));
         assert!(analysis.xrefs.iter().any(|xref| {
             xref.from_va == 0x1400_0100C
+                && xref.to_va == 0x1400_02160
+                && xref.kind == XrefKind::Import
+                && xref.label.contains("CreateFileW")
+        }));
+        assert!(analysis.xrefs.iter().any(|xref| {
+            xref.from_va == 0x1400_01018
                 && xref.to_va == 0x1400_02160
                 && xref.kind == XrefKind::Import
                 && xref.label.contains("CreateFileW")
@@ -3260,9 +3362,35 @@ mod tests {
             .edges
             .iter()
             .any(|edge| { edge.caller_va == 0x1400_01000 && edge.callee_va == 0x1400_01020 }));
+        assert!(analysis.call_graph.edges.iter().any(|edge| {
+            edge.caller_va == 0x1400_01000
+                && edge.callee_va == 0x1400_01030
+                && edge.label == "direct call"
+        }));
+        assert!(analysis.call_graph.edges.iter().any(|edge| {
+            edge.caller_va == 0x1400_01000
+                && edge.callee_va == 0x1400_02160
+                && edge.callsite_va == 0x1400_01018
+                && edge.label.contains("import call")
+        }));
+        assert!(analysis.call_graph.edges.iter().any(|edge| {
+            edge.caller_va == 0x1400_01030
+                && edge.callee_va == 0x1400_02160
+                && edge.callsite_va == 0x1400_01030
+                && edge.label.contains("import thunk")
+        }));
+        assert!(analysis.call_graph.nodes.iter().any(|node| {
+            node.start_va == 0x1400_02160
+                && node.is_external
+                && node.name == "KERNEL32.dll!CreateFileW"
+        }));
         assert!(analysis.pseudocode_functions.iter().any(|function| {
             function.function_start == 0x1400_01000
                 && function.lines.iter().any(|line| line.text.contains("sub_"))
+                && function
+                    .lines
+                    .iter()
+                    .any(|line| line.text.contains("KERNEL32_dll_CreateFileW"))
                 && !function.ir.is_empty()
         }));
     }

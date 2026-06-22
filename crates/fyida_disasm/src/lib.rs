@@ -15,6 +15,7 @@ pub enum InstructionFlow {
     DirectCall,
     IndirectCall,
     UnconditionalBranch,
+    IndirectBranch,
     ConditionalBranch,
     Return,
     Other,
@@ -287,6 +288,7 @@ fn classify_flow(instruction: &Instruction) -> InstructionFlow {
         FlowControl::Call => InstructionFlow::DirectCall,
         FlowControl::IndirectCall => InstructionFlow::IndirectCall,
         FlowControl::UnconditionalBranch => InstructionFlow::UnconditionalBranch,
+        FlowControl::IndirectBranch => InstructionFlow::IndirectBranch,
         FlowControl::ConditionalBranch => InstructionFlow::ConditionalBranch,
         FlowControl::Return => InstructionFlow::Return,
         _ => InstructionFlow::Other,
@@ -429,6 +431,14 @@ mod tests {
     fn records_rip_relative_memory_targets() {
         let rows = disassemble_x64(0x1400_01000, &[0x48, 0x8B, 0x05, 0xF9, 0x0F, 0x00, 0x00], 1);
 
+        assert_eq!(rows[0].memory_targets, vec![0x1400_02000]);
+    }
+
+    #[test]
+    fn records_indirect_branch_memory_targets() {
+        let rows = disassemble_x64(0x1400_01000, &[0xFF, 0x25, 0xFA, 0x0F, 0x00, 0x00], 1);
+
+        assert_eq!(rows[0].flow, InstructionFlow::IndirectBranch);
         assert_eq!(rows[0].memory_targets, vec![0x1400_02000]);
     }
 

@@ -1444,9 +1444,9 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.23.0-alpha.1");
+                        ui.label("FY_IDA v0.24.0-alpha.1");
                         ui.label(
-                            "x64 RIP-relative/absolute 内存 xref、Python 标注动作写入、headless 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。",
+                            "IAT 间接调用/import thunk 调用图、x64 RIP-relative/absolute 内存 xref、Python 标注动作写入、headless 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。",
                         );
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
@@ -2805,6 +2805,8 @@ impl FyIdaApp {
                                     node.start_va,
                                 ) {
                                     ui.label(format!("运行库 {}", signature.kind.label()));
+                                } else if node.is_external && node.name.contains('!') {
+                                    ui.label("导入 API");
                                 } else if node.is_external {
                                     ui.label("预留/外部");
                                 } else {
