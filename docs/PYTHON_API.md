@@ -1,6 +1,6 @@
 # FY_IDA Python API
 
-FY_IDA v0.11.0-alpha.1 exposes a lightweight script API through environment variables and the headless JSON report model.
+FY_IDA v0.11.0-alpha.1 and later expose a lightweight script API through environment variables and the headless JSON report model.
 
 ## Headless Scripts
 

@@ -1368,8 +1368,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.11.0-alpha.1");
-                        ui.label("Python 脚本 API、插件 manifest 与 GUI 控制台 MVP。");
+                        ui.label("FY_IDA v0.12.0-alpha.1");
+                        ui.label("基础 x64 伪 C 与 IR 输出 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -1512,10 +1512,10 @@ impl FyIdaApp {
                 match self.center_tab {
                     0 => self.disassembly_view(ui),
                     1 => self.hex_view(ui),
-                    2 => placeholder_center(ui, "伪代码", "反编译器将在后续版本启用。"),
+                    2 => self.pseudocode_view(ui),
                     3 => self.function_graph_view(ui),
                     4 => self.call_graph_view(ui),
-                    _ => placeholder_center(ui, "IR 视图", "中间表示视图将在反编译器阶段启用。"),
+                    _ => self.ir_view(ui),
                 }
             });
     }
@@ -2321,6 +2321,96 @@ impl FyIdaApp {
                 }
             }
         });
+    }
+
+    fn pseudocode_view(&mut self, ui: &mut Ui) {
+        let Some(analysis) = &self.analysis else {
+            placeholder_center(ui, "伪代码", "打开 PE 或 Raw Binary 后生成伪 C。");
+            return;
+        };
+        let Some(function_start) = self.current_function_start() else {
+            placeholder_center(ui, "伪代码", "当前地址没有匹配到函数。");
+            return;
+        };
+        let Some(function) = analysis
+            .pseudocode_functions
+            .iter()
+            .find(|function| function.function_start == function_start)
+        else {
+            placeholder_center(ui, "伪代码", "当前函数尚未生成伪 C。");
+            return;
+        };
+
+        ScrollArea::both().show(ui, |ui| {
+            ui.strong(format!(
+                "{} / 0x{:016X}",
+                function.name, function.function_start
+            ));
+            ui.separator();
+            for line in &function.lines {
+                ui.horizontal(|ui| {
+                    if let Some(address) = line.address {
+                        if ui
+                            .selectable_label(
+                                false,
+                                RichText::new(format!("{address:016X}")).color(address_color()),
+                            )
+                            .clicked()
+                        {
+                            self.project.jump_to(address, Some("伪代码".to_owned()));
+                        }
+                    } else {
+                        ui.label("                ");
+                    }
+                    ui.monospace(&line.text);
+                });
+            }
+        });
+    }
+
+    fn ir_view(&mut self, ui: &mut Ui) {
+        let Some(analysis) = &self.analysis else {
+            placeholder_center(ui, "IR 视图", "打开 PE 或 Raw Binary 后生成 IR。");
+            return;
+        };
+        let Some(function_start) = self.current_function_start() else {
+            placeholder_center(ui, "IR 视图", "当前地址没有匹配到函数。");
+            return;
+        };
+        let Some(function) = analysis
+            .pseudocode_functions
+            .iter()
+            .find(|function| function.function_start == function_start)
+        else {
+            placeholder_center(ui, "IR 视图", "当前函数尚未生成 IR。");
+            return;
+        };
+
+        Grid::new("ir_grid")
+            .num_columns(4)
+            .striped(true)
+            .spacing([12.0, 5.0])
+            .show(ui, |ui| {
+                ui.strong("地址");
+                ui.strong("OP");
+                ui.strong("参数");
+                ui.strong("原始指令");
+                ui.end_row();
+
+                for instruction in &function.ir {
+                    if ui
+                        .selectable_label(false, format!("{:016X}", instruction.address))
+                        .clicked()
+                    {
+                        self.project
+                            .jump_to(instruction.address, Some("IR".to_owned()));
+                    }
+                    ui.monospace(&instruction.op);
+                    ui.label(instruction.args.join(", "));
+                    ui.label(&instruction.comment);
+                    ui.end_row();
+                }
+            });
     }
 
     fn function_graph_view(&mut self, ui: &mut Ui) {

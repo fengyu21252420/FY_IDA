@@ -50,6 +50,7 @@ pub struct StaticAnalysis {
     pub xrefs: Vec<XrefSummary>,
     pub function_cfgs: Vec<FunctionCfg>,
     pub call_graph: CallGraph,
+    pub pseudocode_functions: Vec<PseudocodeFunction>,
     pub pe_pdb_records: Vec<PePdbRecord>,
     pub loaded_pdb: Option<LoadedPdbInfo>,
     pub pdb_symbols: Vec<PdbSymbol>,
@@ -138,6 +139,28 @@ pub struct CallGraphEdge {
     pub callee_va: u64,
     pub callsite_va: u64,
     pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PseudocodeFunction {
+    pub function_start: u64,
+    pub name: String,
+    pub lines: Vec<PseudocodeLine>,
+    pub ir: Vec<IrInstruction>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PseudocodeLine {
+    pub address: Option<u64>,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct IrInstruction {
+    pub address: u64,
+    pub op: String,
+    pub args: Vec<String>,
+    pub comment: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -365,12 +388,17 @@ pub fn analyze_pe(image: &PeImage, bytes: &[u8]) -> StaticAnalysis {
     analysis.xrefs = discovery.xrefs;
     analysis.function_cfgs = discovery.function_cfgs;
     analysis.call_graph = discovery.call_graph;
+    analysis.pseudocode_functions = build_pseudocode_functions(
+        &analysis.functions,
+        &analysis.function_cfgs,
+        &analysis.call_graph,
+    );
     analysis
 }
 
 pub fn analyze_raw(image: &RawImage, bytes: &[u8]) -> StaticAnalysis {
     let discovery = discover_raw_functions_and_xrefs(image, bytes);
-    StaticAnalysis {
+    let mut analysis = StaticAnalysis {
         functions: discovery.functions,
         strings: scan_raw_strings(image, bytes),
         imports: Vec::new(),
@@ -380,7 +408,13 @@ pub fn analyze_raw(image: &RawImage, bytes: &[u8]) -> StaticAnalysis {
         function_cfgs: discovery.function_cfgs,
         call_graph: discovery.call_graph,
         ..StaticAnalysis::default()
-    }
+    };
+    analysis.pseudocode_functions = build_pseudocode_functions(
+        &analysis.functions,
+        &analysis.function_cfgs,
+        &analysis.call_graph,
+    );
+    analysis
 }
 
 pub fn static_analysis_log_lines(analysis: &StaticAnalysis) -> Vec<String> {
@@ -392,6 +426,10 @@ pub fn static_analysis_log_lines(analysis: &StaticAnalysis) -> Vec<String> {
         format!("重定位解析：{} 条。", analysis.relocations.len()),
         format!("代码交叉引用：{} 条。", analysis.xrefs.len()),
         format!("CFG 生成：{} 个函数图。", analysis.function_cfgs.len()),
+        format!(
+            "伪 C/IR 生成：{} 个函数。",
+            analysis.pseudocode_functions.len()
+        ),
         format!(
             "调用图：{} 个节点 / {} 条边。",
             analysis.call_graph.nodes.len(),
@@ -517,8 +555,7 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.11.0-alpha.1，Python 脚本 API、插件 manifest 和 GUI Python 控制台已接入。"
-            .to_owned(),
+        "当前版本：v0.12.0-alpha.1，基础 x64 伪 C/IR 输出已接入。".to_owned(),
         "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串、基础引用和图数据。"
             .to_owned(),
     ]
@@ -633,6 +670,7 @@ pub fn apply_pdb_file(
     analysis.pdb_types = types;
     analysis.pdb_sources = sources;
     overlay_pdb_function_names(image, analysis);
+    refresh_pseudocode(analysis);
 
     Ok(PdbLoadSummary {
         loaded,
@@ -654,6 +692,7 @@ pub fn apply_pdb_snapshot(
     analysis.pdb_types = types;
     analysis.pdb_sources = sources;
     overlay_pdb_names_only(analysis);
+    refresh_pseudocode(analysis);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -1058,6 +1097,200 @@ fn build_call_graph(functions: &[FunctionSummary], mut edges: Vec<CallGraphEdge>
     CallGraph {
         nodes: nodes.into_values().collect(),
         edges,
+    }
+}
+
+fn refresh_pseudocode(analysis: &mut StaticAnalysis) {
+    analysis.pseudocode_functions = build_pseudocode_functions(
+        &analysis.functions,
+        &analysis.function_cfgs,
+        &analysis.call_graph,
+    );
+}
+
+fn build_pseudocode_functions(
+    functions: &[FunctionSummary],
+    cfgs: &[FunctionCfg],
+    call_graph: &CallGraph,
+) -> Vec<PseudocodeFunction> {
+    let names = functions
+        .iter()
+        .map(|function| (function.start_va, function.name.clone()))
+        .collect::<BTreeMap<_, _>>();
+    let call_targets = call_graph
+        .edges
+        .iter()
+        .map(|edge| (edge.callsite_va, edge.callee_va))
+        .collect::<BTreeMap<_, _>>();
+
+    functions
+        .iter()
+        .filter_map(|function| {
+            let cfg = cfgs
+                .iter()
+                .find(|cfg| cfg.function_start == function.start_va)?;
+            let mut lines = vec![
+                PseudocodeLine {
+                    address: Some(function.start_va),
+                    text: format!("void {}(void)", sanitize_identifier(&function.name)),
+                },
+                PseudocodeLine {
+                    address: None,
+                    text: "{".to_owned(),
+                },
+            ];
+            let mut ir = Vec::new();
+
+            for block in &cfg.blocks {
+                if cfg.blocks.len() > 1 {
+                    lines.push(PseudocodeLine {
+                        address: Some(block.start_va),
+                        text: format!("loc_{:X}:", block.start_va),
+                    });
+                }
+
+                for instruction in &block.instructions {
+                    let pseudo = pseudo_for_instruction(instruction, &names, &call_targets);
+                    lines.push(PseudocodeLine {
+                        address: Some(instruction.address),
+                        text: format!("    {pseudo}"),
+                    });
+                    ir.push(ir_for_instruction(instruction, &names, &call_targets));
+                }
+            }
+
+            lines.push(PseudocodeLine {
+                address: None,
+                text: "}".to_owned(),
+            });
+            Some(PseudocodeFunction {
+                function_start: function.start_va,
+                name: function.name.clone(),
+                lines,
+                ir,
+            })
+        })
+        .collect()
+}
+
+fn pseudo_for_instruction(
+    instruction: &BlockInstruction,
+    names: &BTreeMap<u64, String>,
+    call_targets: &BTreeMap<u64, u64>,
+) -> String {
+    match instruction.flow {
+        InstructionFlow::DirectCall | InstructionFlow::IndirectCall => {
+            let target = call_targets
+                .get(&instruction.address)
+                .copied()
+                .or(instruction.branch_target);
+            let callee = target
+                .and_then(|address| names.get(&address).cloned())
+                .unwrap_or_else(|| {
+                    target
+                        .map(|address| format!("sub_{address:016X}"))
+                        .unwrap_or_else(|| "indirect_call".to_owned())
+                });
+            format!("{}();", sanitize_identifier(&callee))
+        }
+        InstructionFlow::ConditionalBranch => {
+            let target = instruction
+                .branch_target
+                .map(|address| format!("loc_{address:X}"))
+                .unwrap_or_else(|| "unknown".to_owned());
+            format!(
+                "if (/* {} {} */) goto {};",
+                instruction.mnemonic, instruction.operands, target
+            )
+        }
+        InstructionFlow::UnconditionalBranch => {
+            let target = instruction
+                .branch_target
+                .map(|address| format!("loc_{address:X}"))
+                .unwrap_or_else(|| "unknown".to_owned());
+            format!("goto {target};")
+        }
+        InstructionFlow::Return => "return;".to_owned(),
+        _ => pseudo_for_linear_instruction(instruction),
+    }
+}
+
+fn pseudo_for_linear_instruction(instruction: &BlockInstruction) -> String {
+    let mnemonic = instruction.mnemonic.to_ascii_lowercase();
+    let operands = instruction.operands.trim();
+    if mnemonic == "mov" || mnemonic == "lea" {
+        if let Some((left, right)) = operands.split_once(',') {
+            let operator = if mnemonic == "lea" { "&" } else { "" };
+            return format!("{} = {}{};", left.trim(), operator, right.trim());
+        }
+    }
+    if mnemonic == "xor" {
+        if let Some((left, right)) = operands.split_once(',') {
+            if left.trim().eq_ignore_ascii_case(right.trim()) {
+                return format!("{} = 0;", left.trim());
+            }
+        }
+    }
+    if mnemonic == "cmp" || mnemonic == "test" {
+        return format!("/* condition: {} {} */", instruction.mnemonic, operands);
+    }
+    if operands.is_empty() {
+        format!("/* {} */", instruction.mnemonic)
+    } else {
+        format!("/* {} {} */", instruction.mnemonic, operands)
+    }
+}
+
+fn ir_for_instruction(
+    instruction: &BlockInstruction,
+    names: &BTreeMap<u64, String>,
+    call_targets: &BTreeMap<u64, u64>,
+) -> IrInstruction {
+    let op = match instruction.flow {
+        InstructionFlow::DirectCall | InstructionFlow::IndirectCall => "call",
+        InstructionFlow::ConditionalBranch => "branch_if",
+        InstructionFlow::UnconditionalBranch => "jump",
+        InstructionFlow::Return => "return",
+        _ => instruction.mnemonic.as_str(),
+    }
+    .to_owned();
+    let mut args = Vec::new();
+    if !instruction.operands.trim().is_empty() {
+        args.push(instruction.operands.clone());
+    }
+    if let Some(target) = call_targets
+        .get(&instruction.address)
+        .copied()
+        .or(instruction.branch_target)
+    {
+        args.push(format!("0x{target:016X}"));
+        if let Some(name) = names.get(&target) {
+            args.push(name.clone());
+        }
+    }
+    IrInstruction {
+        address: instruction.address,
+        op,
+        args,
+        comment: format!("{} {}", instruction.mnemonic, instruction.operands)
+            .trim()
+            .to_owned(),
+    }
+}
+
+fn sanitize_identifier(name: &str) -> String {
+    let mut output = String::with_capacity(name.len());
+    for (index, character) in name.chars().enumerate() {
+        let valid = character.is_ascii_alphanumeric() || character == '_';
+        if index == 0 && character.is_ascii_digit() {
+            output.push('_');
+        }
+        output.push(if valid { character } else { '_' });
+    }
+    if output.is_empty() {
+        "sub_unknown".to_owned()
+    } else {
+        output
     }
 }
 
@@ -2318,6 +2551,11 @@ mod tests {
             .edges
             .iter()
             .any(|edge| { edge.caller_va == 0x1400_01000 && edge.callee_va == 0x1400_01010 }));
+        assert!(analysis.pseudocode_functions.iter().any(|function| {
+            function.function_start == 0x1400_01000
+                && function.lines.iter().any(|line| line.text.contains("sub_"))
+                && !function.ir.is_empty()
+        }));
     }
 
     #[test]
@@ -2355,6 +2593,11 @@ mod tests {
             .edges
             .iter()
             .any(|edge| { edge.caller_va == 0x1800_00000 && edge.callee_va == 0x1800_00010 }));
+        assert!(analysis.pseudocode_functions.iter().any(|function| {
+            function.function_start == 0x1800_00000
+                && function.lines.iter().any(|line| line.text.contains("raw_"))
+                && !function.ir.is_empty()
+        }));
     }
 
     #[test]

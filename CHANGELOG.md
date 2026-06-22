@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.12.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a first-pass pseudo-C and IR model derived from discovered function CFGs.
+- Added pseudo-C generation for direct/indirect calls, conditional branches, unconditional jumps, returns, simple assignments, zeroing idioms, and condition comments.
+- Added IR records with address, operation, arguments, and original-instruction comments.
+- Added pseudo-C and IR output to `StaticAnalysis` and headless JSON reports.
+- Added `Pseudocode` count to headless text output.
+- Added real GUI Pseudocode and IR center tabs with clickable addresses back into the disassembly view.
+- Added PDB refresh support so pseudocode function names are regenerated after PDB symbol overlays.
+
+### Changed
+
+- Updated the workspace version to `0.12.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the decompiler/IR checkpoint.
+
+### Known Issues
+
+- The decompiler is intentionally first-pass output; it does not yet perform SSA, variable recovery, stack-variable modeling, expression folding, or structured loop reconstruction.
+- Branch conditions are emitted as annotated instruction comments instead of recovered high-level boolean expressions.
+- Type applications are not yet propagated into pseudo-C declarations.
+
+### Recovery
+
+- Source tag: `v0.12.0-alpha.1`.
+- Roll back with: `git checkout v0.12.0-alpha.1`.
+
 ## v0.11.0-alpha.1 - 2026-06-23
 
 ### Added

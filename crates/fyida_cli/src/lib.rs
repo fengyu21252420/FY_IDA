@@ -15,7 +15,7 @@ use serde::{Deserialize, Serialize};
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.11.0-alpha.1 已提供 Python 脚本 API、插件 manifest 扫描、GUI Python 控制台、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.12.0-alpha.1 已提供基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -161,6 +161,7 @@ struct AnalysisReport {
     cfg_count: usize,
     call_graph_nodes: usize,
     call_graph_edges: usize,
+    pseudocode_functions: Vec<PseudocodeRecord>,
     pdb_records: Vec<PdbRecord>,
     pdb_symbols: Vec<PdbSymbolRecord>,
     pdb_types: Vec<PdbTypeRecord>,
@@ -216,6 +217,22 @@ struct XrefRecord {
     to_va: u64,
     kind: String,
     label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct PseudocodeRecord {
+    function_start: u64,
+    name: String,
+    lines: Vec<String>,
+    ir: Vec<IrRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct IrRecord {
+    address: u64,
+    op: String,
+    args: Vec<String>,
+    comment: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -787,6 +804,29 @@ fn analysis_report(analysis: &StaticAnalysis) -> AnalysisReport {
         cfg_count: analysis.function_cfgs.len(),
         call_graph_nodes: analysis.call_graph.nodes.len(),
         call_graph_edges: analysis.call_graph.edges.len(),
+        pseudocode_functions: analysis
+            .pseudocode_functions
+            .iter()
+            .map(|function| PseudocodeRecord {
+                function_start: function.function_start,
+                name: function.name.clone(),
+                lines: function
+                    .lines
+                    .iter()
+                    .map(|line| line.text.clone())
+                    .collect(),
+                ir: function
+                    .ir
+                    .iter()
+                    .map(|instruction| IrRecord {
+                        address: instruction.address,
+                        op: instruction.op.clone(),
+                        args: instruction.args.clone(),
+                        comment: instruction.comment.clone(),
+                    })
+                    .collect(),
+            })
+            .collect(),
         pdb_records: analysis
             .pe_pdb_records
             .iter()
@@ -924,6 +964,11 @@ fn text_report(report: &HeadlessReport) -> String {
         text,
         "  CallGraph：{} nodes / {} edges",
         report.analysis.call_graph_nodes, report.analysis.call_graph_edges
+    );
+    let _ = writeln!(
+        text,
+        "  Pseudocode：{} functions",
+        report.analysis.pseudocode_functions.len()
     );
     let _ = writeln!(text, "  PDBRecords：{}", report.analysis.pdb_records.len());
     let _ = writeln!(text, "  PDBSymbols：{}", report.analysis.pdb_symbols.len());
