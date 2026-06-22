@@ -1,0 +1,42 @@
+# Build outputs
+/target/
+/dist/
+/out/
+/build/
+
+# Generated binaries and debug artifacts
+*.exe
+*.dll
+*.sys
+*.pdb
+*.ilk
+*.obj
+*.lib
+*.exp
+
+# Local project databases and analysis output
+*.fyidb
+*.sqlite
+*.sqlite3
+*.db
+*.idb
+*.i64
+
+# Logs and temporary files
+*.log
+*.tmp
+*.bak
+*.swp
+*.swo
+
+# Editor and IDE state
+/.vs/
+/.vscode/
+/.idea/
+*.user
+*.suo
+
+# OS files
+Thumbs.db
+Desktop.ini
+
