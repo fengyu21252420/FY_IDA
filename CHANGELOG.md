@@ -4,6 +4,33 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.33.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added `--batch-compact` for batch JSON output that omits nested per-file full reports while keeping per-file status, counts, saved project paths, errors, and top-level compact metadata.
+- Added CLI unit coverage for compact batch flag parsing and compact JSON serialization.
+
+### Changed
+
+- Updated the workspace version to `0.33.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the compact batch report checkpoint.
+
+### Fixed
+
+- Large recursive batch scans can now emit compact JSON manifests without embedding every successful file's full report.
+
+### Known Issues
+
+- Compact batch JSON is a summary manifest; use regular batch JSON when a consumer needs each nested full `HeadlessReport`.
+- Batch raw mode still applies the same Raw Binary base/entry/arch options to every file in the directory.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.33.0-alpha.1`.
+- Roll back with: `git checkout v0.33.0-alpha.1`.
+
 ## v0.32.0-alpha.1 - 2026-06-23
 
 ### Added

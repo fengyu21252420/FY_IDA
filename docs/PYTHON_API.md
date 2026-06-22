@@ -1,6 +1,6 @@
 # FY_IDA Python API
 
-FY_IDA v0.32.0-alpha.1 and later expose a lightweight script API through environment variables, the headless JSON report model, and a JSON action file for saved annotations.
+FY_IDA v0.33.0-alpha.1 and later expose a lightweight script API through environment variables, the headless JSON report model, and a JSON action file for saved annotations.
 
 ## Headless Scripts
 
@@ -24,6 +24,8 @@ The script receives:
 The JSON report contains input metadata, sections, functions, strings, imports, exports, relocations, xrefs, PDB records/symbols/types, the current type library, optional headless search results, current annotations, and structured Python automation results. In v0.23.0-alpha.1 and later, xrefs include recovered x64 RIP-relative or absolute memory references to strings, import IAT thunks, relocations, and data sections. In v0.24.0-alpha.1 and later, resolved IAT indirect calls and import-thunk jumps also contribute import API edges to the generated call graph and pseudo-C/IR call targets. In v0.25.0-alpha.1 and later, `analysis.call_graph_node_records` and `analysis.call_graph_edge_records` expose detailed call graph nodes and edges in JSON, and `--export call-graph` emits text/CSV call graph rows. In v0.26.0-alpha.1 and later, `analysis.cfg_records` exposes function CFGs with blocks, edges, and per-block instructions; `--export cfg` emits text/CSV CFG rows, and headless search can match `cfg_block`, `cfg_instruction`, and `cfg_edge` records. In v0.27.0-alpha.1 and later, `analysis.instruction_records` exposes a flat decoded-instruction list with function and basic-block context; `--export instructions` emits text/CSV instruction rows, and headless search can match `instruction` records directly. In v0.28.0-alpha.1 and later, `--export sections` and `--export relocations` emit dedicated text/CSV rows for loader sections and relocation records. In v0.29.0-alpha.1 and later, `--export pdb` emits dedicated text/CSV rows for PE CodeView PDB records, loaded PDB symbols, and PDB type summaries. In v0.30.0-alpha.1 and later, `--export annotations` emits dedicated text/CSV rows for applied user names, comments, function comments, bookmarks, and manual code/data definitions. In v0.31.0-alpha.1 and later, batch text/JSON/CSV reports include per-file counts for applied annotation names, comments, function comments, bookmarks, and manual definitions.
 
 In v0.32.0-alpha.1 and later, `--save-project <DIR>` in batch mode writes one `.fyida.json` project file per successful input and reports each saved path as `saved_project` in batch JSON/CSV/text output.
+
+In v0.33.0-alpha.1 and later, add `--batch-compact` to batch JSON runs when you need only per-file summary counts, status, saved project paths, and errors. Compact batch JSON omits each successful file's nested full `report` object.
 
 Successful Python runs are recorded under `automation.runs` with label, kind, plugin metadata, script path, status, exit code, elapsed time, stdout, stderr, and output-truncation flags. Annotation actions are recorded under `automation.actions`, summarized by `automation.action_count`, applied to report `annotations`, and saved by `--save-project`. Use `--export automation --export-format text` or `--export automation --export-format csv` to emit only automation run/action records. Use `--export annotations --export-format text` or `--export annotations --export-format csv` to emit the applied annotation state.
 
@@ -89,6 +91,12 @@ To persist script-requested annotations for every successful file in a batch, pa
 
 ```powershell
 target\release\fy_ida.exe --headless analyze --batch-dir C:\path\samples --python-script examples\scripts\batch_rename_import_callers.py --save-project out-projects --export-format json
+```
+
+For a smaller batch JSON manifest while still saving projects, add `--batch-compact`:
+
+```powershell
+target\release\fy_ida.exe --headless analyze --batch-dir C:\path\samples --python-script examples\scripts\batch_rename_import_callers.py --save-project out-projects --batch-compact --export-format json
 ```
 
 Writable helper methods append JSON actions to `FYIDA_ACTIONS_JSON`. FY_IDA currently supports `set_name`, `set_comment`, `set_function_comment`, `add_bookmark`, `mark_code`, and `mark_data`.

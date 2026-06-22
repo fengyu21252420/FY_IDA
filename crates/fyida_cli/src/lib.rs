@@ -23,7 +23,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.32.0-alpha.1 已支持 batch 模式下 `--save-project <DIR>` 为每个成功文件写出 FY_IDA 项目文件、batch 报告中的项目路径和用户标注计数汇总、headless 用户标注专用 `--export annotations` text/CSV 导出、headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python annotations/PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.33.0-alpha.1 已支持 batch JSON 紧凑输出 `--batch-compact`、batch 模式下 `--save-project <DIR>` 为每个成功文件写出 FY_IDA 项目文件、batch 报告中的项目路径和用户标注计数汇总、headless 用户标注专用 `--export annotations` text/CSV 导出、headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python annotations/PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -94,6 +94,12 @@ pub struct Cli {
 
     #[arg(long, help = "批量分析时递归子目录")]
     pub recursive: bool,
+
+    #[arg(
+        long = "batch-compact",
+        help = "批量 JSON 输出不嵌入每个成功文件的完整报告，适合大型目录"
+    )]
+    pub batch_compact: bool,
 
     #[arg(long, default_value_t = 0, help = "单文件分析超时毫秒；0 表示不限制")]
     pub timeout_ms: u64,
@@ -492,6 +498,7 @@ struct BatchReport {
     version: String,
     root: String,
     recursive: bool,
+    compact: bool,
     files: Vec<BatchFileReport>,
     errors: Vec<BatchError>,
     elapsed_ms: u128,
@@ -518,6 +525,7 @@ struct BatchFileReport {
     pdb_types: usize,
     saved_project: Option<String>,
     error: Option<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
     report: Option<HeadlessReport>,
 }
 
@@ -752,6 +760,7 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                         file.display().to_string(),
                         elapsed_ms,
                         saved_project,
+                        !cli.batch_compact,
                         report,
                     ));
                 }
@@ -792,6 +801,7 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
         version: env!("CARGO_PKG_VERSION").to_owned(),
         root: batch_dir.display().to_string(),
         recursive: cli.recursive,
+        compact: cli.batch_compact,
         files: entries,
         errors,
         elapsed_ms: started.elapsed().as_millis(),
@@ -814,6 +824,7 @@ fn batch_success(
     path: String,
     elapsed_ms: u128,
     saved_project: Option<String>,
+    include_report: bool,
     report: HeadlessReport,
 ) -> BatchFileReport {
     BatchFileReport {
@@ -840,7 +851,7 @@ fn batch_success(
         pdb_types: report.analysis.pdb_types.len(),
         saved_project,
         error: None,
-        report: Some(report),
+        report: include_report.then_some(report),
     }
 }
 
@@ -4400,6 +4411,21 @@ mod tests {
     }
 
     #[test]
+    fn parses_batch_compact_flag() {
+        let cli = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "analyze",
+            "--batch-dir",
+            "samples",
+            "--batch-compact",
+        ])
+        .unwrap();
+
+        assert!(cli.batch_compact);
+    }
+
+    #[test]
     fn rejects_unknown_headless_command_shape() {
         let cli = Cli::try_parse_from(["fy_ida", "--headless", "inspect", "sample.exe"]).unwrap();
 
@@ -4701,12 +4727,14 @@ mod tests {
             "sample.exe".to_owned(),
             9,
             Some("projects\\sample.exe.fyida.json".to_owned()),
+            true,
             sample_headless_report_with_automation(),
         );
         let report = BatchReport {
-            version: "0.32.0-alpha.1".to_owned(),
+            version: "0.33.0-alpha.1".to_owned(),
             root: "samples".to_owned(),
             recursive: false,
+            compact: false,
             files: vec![entry],
             errors: Vec::new(),
             elapsed_ms: 9,
@@ -4720,6 +4748,7 @@ mod tests {
         assert_eq!(report.files[0].annotation_function_comments, 1);
         assert_eq!(report.files[0].bookmarks, 1);
         assert_eq!(report.files[0].manual_definitions, 1);
+        assert!(!report.compact);
         assert_eq!(
             report.files[0].saved_project.as_deref(),
             Some("projects\\sample.exe.fyida.json")
@@ -4732,6 +4761,34 @@ mod tests {
         assert!(csv.contains(
             "sample.exe,ok,9,1,1,1,0,1,0,1,1,1,1,1,1,1,1,projects\\sample.exe.fyida.json,"
         ));
+    }
+
+    #[test]
+    fn compact_batch_json_omits_nested_report() {
+        let entry = batch_success(
+            "sample.exe".to_owned(),
+            9,
+            None,
+            false,
+            sample_headless_report_with_automation(),
+        );
+        let report = BatchReport {
+            version: "0.33.0-alpha.1".to_owned(),
+            root: "samples".to_owned(),
+            recursive: false,
+            compact: true,
+            files: vec![entry],
+            errors: Vec::new(),
+            elapsed_ms: 9,
+        };
+
+        let json = serde_json::to_string(&report).unwrap();
+
+        assert!(report.compact);
+        assert_eq!(report.files[0].functions, 1);
+        assert!(json.contains("\"compact\":true"));
+        assert!(json.contains("\"annotation_names\":1"));
+        assert!(!json.contains("\"report\""));
     }
 
     #[test]
@@ -4773,7 +4830,7 @@ mod tests {
 
         let document = project_document_from_report(&report).unwrap();
 
-        assert_eq!(document.app_version, "0.32.0-alpha.1");
+        assert_eq!(document.app_version, "0.33.0-alpha.1");
         assert_eq!(document.functions[0].name, "renamed_func");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         assert_eq!(document.annotations.comments[0].text, "automation note");
@@ -4814,7 +4871,7 @@ mod tests {
         let document = ProjectDocument::load_from_path(&path).unwrap();
 
         assert_eq!(path, directory.join("sample.exe.fyida.json"));
-        assert_eq!(document.app_version, "0.32.0-alpha.1");
+        assert_eq!(document.app_version, "0.33.0-alpha.1");
         assert_eq!(document.input.path, "sample.exe");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         let _ = std::fs::remove_dir_all(directory);
@@ -5067,7 +5124,7 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.32.0-alpha.1".to_owned(),
+            version: "0.33.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),
