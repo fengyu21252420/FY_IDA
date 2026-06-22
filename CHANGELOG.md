@@ -4,6 +4,34 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.21.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added an example `fyida` Python report helper module for functions, strings, imports, exports, relocations, xrefs, type queries, function lookup, and suspicious-import matching.
+- Added `examples/scripts/find_string_xrefs.py` for string keyword searches with xref context.
+- Added an example `malware-triage` plugin that scores suspicious imports, strings, and xrefs from the headless report.
+- Added `FYIDA_SCRIPT_PATH` and `FYIDA_SCRIPT_DIR` environment variables for Python scripts and plugins.
+- Added recursive plugin-root scanning for nested `plugin.json` manifests.
+- Added CLI unit coverage for nested plugin manifest discovery.
+
+### Changed
+
+- Updated the workspace version to `0.21.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the Python helper/examples checkpoint.
+- Updated the existing import-list script and import-summary plugin to use the shared example Python helper.
+
+### Known Issues
+
+- The Python helper is an example module loaded by sample scripts/plugins; FY_IDA still does not embed or install a Python package globally.
+- Python automation remains process-based through the local `python` executable.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.21.0-alpha.1`.
+- Roll back with: `git checkout v0.21.0-alpha.1`.
+
 ## v0.20.0-alpha.1 - 2026-06-23
 
 ### Added

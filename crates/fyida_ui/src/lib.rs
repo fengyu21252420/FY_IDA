@@ -1444,9 +1444,9 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.20.0-alpha.1");
+                        ui.label("FY_IDA v0.21.0-alpha.1");
                         ui.label(
-                            "结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。",
+                            "Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。",
                         );
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);

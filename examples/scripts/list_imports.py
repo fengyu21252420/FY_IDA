@@ -1,11 +1,12 @@
-import json
-import os
+import sys
+from pathlib import Path
 
-report_path = os.environ["FYIDA_REPORT_JSON"]
-with open(report_path, "r", encoding="utf-8") as handle:
-    report = json.load(handle)
+sys.path.insert(0, str(Path(__file__).resolve().parents[1] / "python"))
 
-imports = report["analysis"]["imports"]
-print(f"{report['input']['path']}: {len(imports)} imports")
+import fyida
+
+project = fyida.current_project()
+imports = project.imports()
+print(f"{project.input.path}: {len(imports)} imports")
 for item in imports[:16]:
-    print(item["display_name"])
+    print(item.display_name)

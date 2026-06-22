@@ -17,7 +17,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.20.0-alpha.1 已提供结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、Python 脚本 API、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.21.0-alpha.1 已提供 Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -745,6 +745,7 @@ fn apply_signature_libraries(cli: &Cli, analysis: &mut StaticAnalysis, messages:
 }
 
 const MAX_AUTOMATION_OUTPUT_CHARS: usize = 16 * 1024;
+const MAX_PLUGIN_MANIFESTS: usize = 256;
 
 fn run_python_automation(cli: &Cli, report: &mut HeadlessReport) -> Result<(), String> {
     let mut targets = Vec::new();
@@ -825,15 +826,20 @@ fn selected_plugins(cli: &Cli) -> Result<Vec<PluginManifest>, String> {
 }
 
 fn scan_plugin_manifests(directory: &Path) -> Result<Vec<PluginManifest>, String> {
-    let entries = std::fs::read_dir(directory)
-        .map_err(|error| format!("无法扫描插件目录 {}：{error}", directory.display()))?;
+    let mut paths = Vec::new();
+    collect_plugin_manifest_paths(directory, directory, &mut paths)?;
+    paths.sort();
+    paths.dedup();
+    if paths.len() > MAX_PLUGIN_MANIFESTS {
+        return Err(format!(
+            "插件 manifest 数量超过上限 {}：{}",
+            MAX_PLUGIN_MANIFESTS,
+            directory.display()
+        ));
+    }
+
     let mut manifests = Vec::new();
-    for entry in entries {
-        let entry = entry.map_err(|error| format!("插件目录枚举失败：{error}"))?;
-        let path = entry.path();
-        if path.extension().and_then(|extension| extension.to_str()) != Some("json") {
-            continue;
-        }
+    for path in paths {
         let text = std::fs::read_to_string(&path)
             .map_err(|error| format!("无法读取插件 manifest {}：{error}", path.display()))?;
         let mut manifest: PluginManifest = serde_json::from_str(&text)
@@ -846,6 +852,34 @@ fn scan_plugin_manifests(directory: &Path) -> Result<Vec<PluginManifest>, String
     }
     manifests.sort_by(|left, right| left.id.cmp(&right.id));
     Ok(manifests)
+}
+
+fn collect_plugin_manifest_paths(
+    root: &Path,
+    directory: &Path,
+    manifests: &mut Vec<PathBuf>,
+) -> Result<(), String> {
+    let entries = std::fs::read_dir(directory)
+        .map_err(|error| format!("无法扫描插件目录 {}：{error}", directory.display()))?;
+    for entry in entries {
+        let entry = entry.map_err(|error| format!("插件目录枚举失败：{error}"))?;
+        let path = entry.path();
+        if path.is_dir() {
+            collect_plugin_manifest_paths(root, &path, manifests)?;
+            continue;
+        }
+        let is_plugin_json = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .map(|name| name.eq_ignore_ascii_case("plugin.json"))
+            .unwrap_or(false);
+        let is_legacy_top_level_json = directory == root
+            && path.extension().and_then(|extension| extension.to_str()) == Some("json");
+        if is_plugin_json || is_legacy_top_level_json {
+            manifests.push(path);
+        }
+    }
+    Ok(())
 }
 
 fn run_python_script(
@@ -869,8 +903,12 @@ fn run_python_script(
         .env("FYIDA_REPORT_JSON", &report_path)
         .env("FYIDA_INPUT_PATH", &report.input.path)
         .env("FYIDA_INPUT_KIND", &report.input.kind)
+        .env("FYIDA_SCRIPT_PATH", target.script.display().to_string())
         .env("FYIDA_AUTOMATION_LABEL", &target.label)
         .env("FYIDA_AUTOMATION_KIND", &target.kind);
+    if let Some(script_dir) = target.script.parent() {
+        command.env("FYIDA_SCRIPT_DIR", script_dir.display().to_string());
+    }
     if let Some(id) = &target.id {
         command.env("FYIDA_PLUGIN_ID", id);
     }
@@ -2717,6 +2755,48 @@ mod tests {
         let error = selected_plugins(&cli).unwrap_err();
 
         assert!(error.contains("absent"));
+        let _ = std::fs::remove_dir_all(directory);
+    }
+
+    #[test]
+    fn scans_nested_plugin_manifests_from_plugin_root() {
+        let directory = unique_test_dir("nested-plugins");
+        let first = directory.join("first");
+        let second = directory.join("second");
+        std::fs::create_dir_all(&first).unwrap();
+        std::fs::create_dir_all(&second).unwrap();
+        std::fs::write(
+            first.join("plugin.json"),
+            r#"{
+  "id": "first",
+  "name": "First",
+  "version": "0.1.0",
+  "script": "first.py"
+}"#,
+        )
+        .unwrap();
+        std::fs::write(
+            second.join("plugin.json"),
+            r#"{
+  "id": "second",
+  "name": "Second",
+  "version": "0.2.0",
+  "script": "tools/second.py"
+}"#,
+        )
+        .unwrap();
+
+        let manifests = scan_plugin_manifests(&directory).unwrap();
+
+        assert_eq!(
+            manifests
+                .iter()
+                .map(|manifest| manifest.id.as_str())
+                .collect::<Vec<_>>(),
+            vec!["first", "second"]
+        );
+        assert_eq!(manifests[0].script, first.join("first.py"));
+        assert_eq!(manifests[1].script, second.join("tools").join("second.py"));
         let _ = std::fs::remove_dir_all(directory);
     }
 
