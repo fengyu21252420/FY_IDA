@@ -4,6 +4,46 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.8.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added PE Debug Directory / CodeView parsing for RSDS and NB10 PDB records, including PDB path, GUID, age, signature, RVA, and file offset metadata.
+- Added external PDB loading through the Rust `pdb` crate, with public/code/data/procedure/UDT symbol extraction.
+- Added MSVC and Rust demangle support for recovered PDB symbol display names.
+- Added PDB symbol overlays for discovered function names and call graph nodes.
+- Added PDB-derived function entries for executable public/procedure symbols not reached by the current recursive descent analyzer.
+- Added PDB symbols to the GUI Names list, quick jump, global search, and disassembly row comments.
+- Added automatic GUI PDB candidate lookup from PE CodeView paths and same-directory PDB filenames.
+- Added manual GUI PDB loading through the File menu.
+- Added `--pdb <PDB>` headless support for PE analysis.
+- Added PDB record, symbol, and type summaries to headless output.
+- Added schema v2 project snapshots for PDB debug info, symbols, UDT summaries, and module/source hints.
+- Added project reopen support for restoring saved PDB symbol snapshots when the original PDB is unavailable.
+- Added unit coverage for CodeView PDB record parsing, project PDB snapshot persistence, and MSVC demangling.
+
+### Changed
+
+- Updated the workspace version to `0.8.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and project schema metadata for the PDB/symbol checkpoint.
+- Added `pdb`, `msvc-demangler`, and `rustc-demangle` dependencies.
+
+### Fixed
+
+- Saved FY_IDA projects can now retain symbol information recovered from PDB loading instead of relying only on automatic analysis names.
+
+### Known Issues
+
+- PDB type recovery is currently limited to UDT symbol summaries; full TPI/IPI struct, union, enum, class layout, and function prototype recovery remain future work.
+- Source path recovery is currently based on module and object-file hints; full line-program source file enumeration remains future work.
+- PDB matching checks GUID/age when CodeView data is present, but still allows manual loading of non-matching PDB files for inspection.
+- PDB symbol overlays only rename exact-address function entries; richer thunk/import/library classification is still planned.
+
+### Recovery
+
+- Source tag: `v0.8.0-alpha.1`.
+- Roll back with: `git checkout v0.8.0-alpha.1`.
+
 ## v0.7.0-alpha.1 - 2026-06-23
 
 ### Added

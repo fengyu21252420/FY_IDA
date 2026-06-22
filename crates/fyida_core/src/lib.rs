@@ -6,11 +6,12 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const APP_NAME: &str = "FY_IDA";
-pub const PROJECT_SCHEMA_VERSION: u32 = 1;
+pub const PROJECT_SCHEMA_VERSION: u32 = 2;
 const MAX_NAVIGATION_HISTORY: usize = 128;
 pub const PE_DIRECTORY_EXPORT: usize = 0;
 pub const PE_DIRECTORY_IMPORT: usize = 1;
 pub const PE_DIRECTORY_BASERELOC: usize = 5;
+pub const PE_DIRECTORY_DEBUG: usize = 6;
 pub const PE_DIRECTORY_LIMIT: usize = 16;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
@@ -91,6 +92,39 @@ pub struct ProjectFunction {
     pub instruction_count: usize,
 }
 
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDebugInfo {
+    pub pe_pdb_path: Option<String>,
+    pub pe_pdb_guid: Option<String>,
+    pub pe_pdb_age: Option<u32>,
+    pub loaded_pdb_path: Option<String>,
+    pub loaded_pdb_guid: Option<String>,
+    pub loaded_pdb_age: Option<u32>,
+    pub matched: Option<bool>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSymbol {
+    pub address: Option<u64>,
+    pub rva: Option<u32>,
+    pub name: String,
+    pub original_name: String,
+    pub kind: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectType {
+    pub name: String,
+    pub kind: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectSourceFile {
+    pub path: String,
+}
+
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct UserName {
     pub address: u64,
@@ -150,6 +184,14 @@ pub struct ProjectDocument {
     pub app_version: String,
     pub input: ProjectInput,
     pub functions: Vec<ProjectFunction>,
+    #[serde(default)]
+    pub debug_info: Option<ProjectDebugInfo>,
+    #[serde(default)]
+    pub symbols: Vec<ProjectSymbol>,
+    #[serde(default)]
+    pub types: Vec<ProjectType>,
+    #[serde(default)]
+    pub source_files: Vec<ProjectSourceFile>,
     pub annotations: UserAnnotations,
 }
 
@@ -158,6 +200,10 @@ impl ProjectDocument {
         app_version: impl Into<String>,
         input: ProjectInput,
         functions: Vec<ProjectFunction>,
+        debug_info: Option<ProjectDebugInfo>,
+        symbols: Vec<ProjectSymbol>,
+        types: Vec<ProjectType>,
+        source_files: Vec<ProjectSourceFile>,
         annotations: UserAnnotations,
     ) -> Self {
         Self {
@@ -165,6 +211,10 @@ impl ProjectDocument {
             app_version: app_version.into(),
             input,
             functions,
+            debug_info,
+            symbols,
+            types,
+            source_files,
             annotations,
         }
     }
@@ -1484,6 +1534,31 @@ mod tests {
                 size: 0x20,
                 instruction_count: 4,
             }],
+            Some(ProjectDebugInfo {
+                pe_pdb_path: Some(r"C:\symbols\demo.pdb".to_owned()),
+                pe_pdb_guid: Some("00112233-4455-6677-8899-aabbccddeeff".to_owned()),
+                pe_pdb_age: Some(2),
+                loaded_pdb_path: Some(r"C:\symbols\demo.pdb".to_owned()),
+                loaded_pdb_guid: Some("00112233-4455-6677-8899-aabbccddeeff".to_owned()),
+                loaded_pdb_age: Some(2),
+                matched: Some(true),
+            }),
+            vec![ProjectSymbol {
+                address: Some(0x1400_01000),
+                rva: Some(0x1000),
+                name: "main".to_owned(),
+                original_name: "?main@@YAHXZ".to_owned(),
+                kind: "PDB 函数".to_owned(),
+                source: "public".to_owned(),
+            }],
+            vec![ProjectType {
+                name: "CONFIG".to_owned(),
+                kind: "UDT".to_owned(),
+                source: "udt".to_owned(),
+            }],
+            vec![ProjectSourceFile {
+                path: r"C:\src\demo.cpp".to_owned(),
+            }],
             annotations,
         );
         let path = std::env::temp_dir().join(format!(
@@ -1498,6 +1573,10 @@ mod tests {
         assert_eq!(loaded.schema_version, PROJECT_SCHEMA_VERSION);
         assert_eq!(loaded.input.sha256, sha256_hex(b"demo"));
         assert_eq!(loaded.functions[0].start_va, 0x1400_01000);
+        assert_eq!(loaded.debug_info.as_ref().unwrap().pe_pdb_age, Some(2));
+        assert_eq!(loaded.symbols[0].original_name, "?main@@YAHXZ");
+        assert_eq!(loaded.types[0].name, "CONFIG");
+        assert_eq!(loaded.source_files[0].path, r"C:\src\demo.cpp");
         assert_eq!(loaded.annotations.names[0].name, "main");
         assert_eq!(
             loaded.annotations.manual_definitions[0].kind,

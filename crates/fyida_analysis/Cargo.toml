@@ -8,6 +8,9 @@ publish = false
 [dependencies]
 fyida_core.workspace = true
 fyida_disasm.workspace = true
+msvc-demangler.workspace = true
+pdb.workspace = true
+rustc-demangle.workspace = true
 
 [lib]
 path = "src/lib.rs"

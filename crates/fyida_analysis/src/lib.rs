@@ -1,13 +1,15 @@
 use std::collections::{BTreeMap, BTreeSet, HashSet, VecDeque};
+use std::path::{Path, PathBuf};
 
 use fyida_core::{
-    FileSelection, PeImage, PeKind, RawImage, PE_DIRECTORY_BASERELOC, PE_DIRECTORY_EXPORT,
-    PE_DIRECTORY_IMPORT,
+    FileSelection, PeImage, PeKind, RawImage, PE_DIRECTORY_BASERELOC, PE_DIRECTORY_DEBUG,
+    PE_DIRECTORY_EXPORT, PE_DIRECTORY_IMPORT,
 };
 use fyida_disasm::{
     disassemble_entry_point, disassemble_raw_entry_point, disassemble_x64, DecodedInstruction,
     InstructionFlow,
 };
+use pdb::FallibleIterator;
 
 const MAX_FUNCTIONS: usize = 256;
 const MAX_FUNCTION_BYTES: usize = 4096;
@@ -17,6 +19,10 @@ const MAX_IMPORT_THUNKS_PER_DLL: usize = 4096;
 const MAX_EXPORTS: usize = 4096;
 const MAX_RELOCATIONS: usize = 16384;
 const MAX_STRINGS: usize = 4096;
+const MAX_PDB_SYMBOLS: usize = 8192;
+const MAX_PDB_TYPES: usize = 2048;
+const MAX_PDB_SOURCES: usize = 1024;
+const MAX_DEBUG_DIRECTORY_ENTRIES: usize = 128;
 const MIN_STRING_CHARS: usize = 4;
 
 #[derive(Debug, Clone)]
@@ -44,6 +50,11 @@ pub struct StaticAnalysis {
     pub xrefs: Vec<XrefSummary>,
     pub function_cfgs: Vec<FunctionCfg>,
     pub call_graph: CallGraph,
+    pub pe_pdb_records: Vec<PePdbRecord>,
+    pub loaded_pdb: Option<LoadedPdbInfo>,
+    pub pdb_symbols: Vec<PdbSymbol>,
+    pub pdb_types: Vec<PdbTypeSummary>,
+    pub pdb_sources: Vec<PdbSourceFile>,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -127,6 +138,111 @@ pub struct CallGraphEdge {
     pub callee_va: u64,
     pub callsite_va: u64,
     pub label: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum PePdbFormat {
+    Rsds,
+    Nb10,
+    Unknown(String),
+}
+
+impl PePdbFormat {
+    pub fn label(&self) -> &str {
+        match self {
+            Self::Rsds => "RSDS",
+            Self::Nb10 => "NB10",
+            Self::Unknown(value) => value.as_str(),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PePdbRecord {
+    pub format: PePdbFormat,
+    pub path: String,
+    pub guid: Option<String>,
+    pub age: Option<u32>,
+    pub signature: Option<u32>,
+    pub debug_rva: u32,
+    pub debug_file_offset: u32,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LoadedPdbInfo {
+    pub path: String,
+    pub guid: Option<String>,
+    pub age: u32,
+    pub signature: u32,
+    pub matched_pe: Option<bool>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Hash)]
+pub enum PdbSymbolKind {
+    Function,
+    PublicCode,
+    Data,
+    PublicData,
+    UserDefinedType,
+    ProcedureReference,
+    DataReference,
+}
+
+impl PdbSymbolKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Function => "PDB 函数",
+            Self::PublicCode => "PDB Public Code",
+            Self::Data => "PDB 数据",
+            Self::PublicData => "PDB Public Data",
+            Self::UserDefinedType => "PDB UDT",
+            Self::ProcedureReference => "PDB 过程引用",
+            Self::DataReference => "PDB 数据引用",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdbSymbol {
+    pub address: Option<u64>,
+    pub rva: Option<u32>,
+    pub name: String,
+    pub demangled_name: Option<String>,
+    pub kind: PdbSymbolKind,
+    pub source: String,
+}
+
+impl PdbSymbol {
+    pub fn display_name(&self) -> &str {
+        self.demangled_name.as_deref().unwrap_or(&self.name)
+    }
+
+    pub fn is_function_like(&self) -> bool {
+        matches!(
+            self.kind,
+            PdbSymbolKind::Function | PdbSymbolKind::PublicCode | PdbSymbolKind::ProcedureReference
+        )
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdbTypeSummary {
+    pub name: String,
+    pub kind: String,
+    pub source: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdbSourceFile {
+    pub path: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PdbLoadSummary {
+    pub loaded: LoadedPdbInfo,
+    pub symbol_count: usize,
+    pub type_count: usize,
+    pub source_count: usize,
 }
 
 struct DecodedFunctionAnalysis {
@@ -240,6 +356,7 @@ pub fn analyze_pe(image: &PeImage, bytes: &[u8]) -> StaticAnalysis {
         imports: parse_imports(image, bytes),
         exports: parse_exports(image, bytes),
         relocations: parse_relocations(image, bytes),
+        pe_pdb_records: parse_pe_pdb_records(image, bytes),
         ..StaticAnalysis::default()
     };
 
@@ -262,11 +379,12 @@ pub fn analyze_raw(image: &RawImage, bytes: &[u8]) -> StaticAnalysis {
         xrefs: discovery.xrefs,
         function_cfgs: discovery.function_cfgs,
         call_graph: discovery.call_graph,
+        ..StaticAnalysis::default()
     }
 }
 
 pub fn static_analysis_log_lines(analysis: &StaticAnalysis) -> Vec<String> {
-    vec![
+    let mut lines = vec![
         format!("函数发现：{} 个函数入口。", analysis.functions.len()),
         format!("字符串提取：{} 条。", analysis.strings.len()),
         format!("导入表解析：{} 个导入符号。", analysis.imports.len()),
@@ -279,7 +397,37 @@ pub fn static_analysis_log_lines(analysis: &StaticAnalysis) -> Vec<String> {
             analysis.call_graph.nodes.len(),
             analysis.call_graph.edges.len()
         ),
-    ]
+    ];
+
+    lines.push(format!(
+        "PDB 线索：{} 条 CodeView / {} 个符号 / {} 个类型。",
+        analysis.pe_pdb_records.len(),
+        analysis.pdb_symbols.len(),
+        analysis.pdb_types.len()
+    ));
+    if let Some(record) = analysis.pe_pdb_records.first() {
+        lines.push(format!(
+            "PE Debug Directory PDB：{} age {} {}",
+            record.path,
+            record.age.unwrap_or(0),
+            record.guid.as_deref().unwrap_or(record.format.label())
+        ));
+    }
+    if let Some(loaded) = &analysis.loaded_pdb {
+        lines.push(format!(
+            "外部 PDB 已加载：{} / GUID {} / age {} / 匹配 {}",
+            loaded.path,
+            loaded.guid.as_deref().unwrap_or("-"),
+            loaded.age,
+            match loaded.matched_pe {
+                Some(true) => "是",
+                Some(false) => "否",
+                None => "未知",
+            }
+        ));
+    }
+
+    lines
 }
 
 pub fn pe_entry_disassembly(image: &PeImage, bytes: &[u8]) -> DisassemblyBuild {
@@ -369,7 +517,8 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.7.0-alpha.1，基础 CFG 与 direct-call 调用图已接入。".to_owned(),
+        "当前版本：v0.8.0-alpha.1，PDB 符号线索、外部 PDB public symbols 与 demangle 已接入。"
+            .to_owned(),
         "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串、基础引用和图数据。"
             .to_owned(),
     ]
@@ -415,6 +564,96 @@ pub fn file_error_log_lines(file: &FileSelection, message: &str) -> Vec<String> 
         format!("打开文件失败：{}", file.path().display()),
         format!("错误：{message}"),
     ]
+}
+
+pub fn pdb_candidate_paths(image: &PeImage, analysis: &StaticAnalysis) -> Vec<PathBuf> {
+    let mut paths = Vec::new();
+    for record in &analysis.pe_pdb_records {
+        if record.path.trim().is_empty() {
+            continue;
+        }
+
+        let raw_path = PathBuf::from(&record.path);
+        paths.push(raw_path.clone());
+        if let Some(file_name) = raw_path.file_name() {
+            if let Some(parent) = image.file().path().parent() {
+                paths.push(parent.join(file_name));
+            }
+        }
+    }
+
+    let mut seen = BTreeSet::new();
+    paths
+        .into_iter()
+        .filter(|path| seen.insert(path.display().to_string().to_lowercase()))
+        .collect()
+}
+
+pub fn apply_pdb_file(
+    image: &PeImage,
+    analysis: &mut StaticAnalysis,
+    path: impl AsRef<Path>,
+) -> Result<PdbLoadSummary, String> {
+    let path = path.as_ref();
+    let file = std::fs::File::open(path)
+        .map_err(|source| format!("无法打开 PDB 文件 {}：{source}", path.display()))?;
+    let mut pdb =
+        pdb::PDB::open(file).map_err(|source| format!("PDB 格式无效或不受支持：{source}"))?;
+    let pdb_info = pdb
+        .pdb_information()
+        .map_err(|source| format!("读取 PDB 信息流失败：{source}"))?;
+    let loaded = LoadedPdbInfo {
+        path: path.display().to_string(),
+        guid: Some(pdb_info.guid.to_string()),
+        age: pdb_info.age,
+        signature: pdb_info.signature,
+        matched_pe: match analysis.pe_pdb_records.first() {
+            Some(record) => Some(pdb_matches_pe(
+                record,
+                &pdb_info.guid.to_string(),
+                pdb_info.age,
+            )),
+            None => None,
+        },
+    };
+
+    let address_map = pdb
+        .address_map()
+        .map_err(|source| format!("建立 PDB 地址映射失败：{source}"))?;
+    let mut symbols = collect_global_pdb_symbols(&mut pdb, image, &address_map)?;
+    let (mut module_symbols, module_sources) =
+        collect_module_pdb_symbols(&mut pdb, image, &address_map);
+    symbols.append(&mut module_symbols);
+    dedup_pdb_symbols(&mut symbols);
+    let types = collect_pdb_type_summaries(&symbols);
+    let sources = module_sources;
+
+    analysis.loaded_pdb = Some(loaded.clone());
+    analysis.pdb_symbols = symbols;
+    analysis.pdb_types = types;
+    analysis.pdb_sources = sources;
+    overlay_pdb_function_names(image, analysis);
+
+    Ok(PdbLoadSummary {
+        loaded,
+        symbol_count: analysis.pdb_symbols.len(),
+        type_count: analysis.pdb_types.len(),
+        source_count: analysis.pdb_sources.len(),
+    })
+}
+
+pub fn apply_pdb_snapshot(
+    analysis: &mut StaticAnalysis,
+    loaded: Option<LoadedPdbInfo>,
+    symbols: Vec<PdbSymbol>,
+    types: Vec<PdbTypeSummary>,
+    sources: Vec<PdbSourceFile>,
+) {
+    analysis.loaded_pdb = loaded;
+    analysis.pdb_symbols = symbols;
+    analysis.pdb_types = types;
+    analysis.pdb_sources = sources;
+    overlay_pdb_names_only(analysis);
 }
 
 #[derive(Debug, Clone, Default)]
@@ -820,6 +1059,457 @@ fn build_call_graph(functions: &[FunctionSummary], mut edges: Vec<CallGraphEdge>
         nodes: nodes.into_values().collect(),
         edges,
     }
+}
+
+fn parse_pe_pdb_records(image: &PeImage, bytes: &[u8]) -> Vec<PePdbRecord> {
+    let Some(directory) = image
+        .data_directory(PE_DIRECTORY_DEBUG)
+        .filter(|dir| dir.is_present())
+    else {
+        return Vec::new();
+    };
+
+    let mut records = Vec::new();
+    let entry_count = (directory.size / 28).min(MAX_DEBUG_DIRECTORY_ENTRIES as u32);
+    for index in 0..entry_count {
+        let debug_rva = directory.virtual_address.saturating_add(index * 28);
+        let Some(kind) = read_u32_at_rva(image, bytes, debug_rva + 12) else {
+            break;
+        };
+        if kind != 2 {
+            continue;
+        }
+
+        let Some(size_of_data) = read_u32_at_rva(image, bytes, debug_rva + 16) else {
+            continue;
+        };
+        let Some(address_of_raw_data) = read_u32_at_rva(image, bytes, debug_rva + 20) else {
+            continue;
+        };
+        let Some(pointer_to_raw_data) = read_u32_at_rva(image, bytes, debug_rva + 24) else {
+            continue;
+        };
+        let debug_file_offset = if usize::try_from(pointer_to_raw_data)
+            .ok()
+            .map_or(false, |offset| offset < bytes.len())
+        {
+            Some(pointer_to_raw_data)
+        } else {
+            image
+                .rva_to_file_offset(u64::from(address_of_raw_data))
+                .and_then(|value| u32::try_from(value).ok())
+        };
+
+        let Some(file_offset) = debug_file_offset else {
+            continue;
+        };
+        let Some(record_bytes) = read_bytes_at_file_offset(bytes, file_offset, size_of_data) else {
+            continue;
+        };
+        if let Some(record) =
+            parse_codeview_pdb_record(record_bytes, address_of_raw_data, file_offset)
+        {
+            records.push(record);
+        }
+    }
+
+    records
+}
+
+fn parse_codeview_pdb_record(
+    bytes: &[u8],
+    debug_rva: u32,
+    debug_file_offset: u32,
+) -> Option<PePdbRecord> {
+    let signature = bytes.get(0..4)?;
+    match signature {
+        b"RSDS" => {
+            if bytes.len() < 24 {
+                return None;
+            }
+            let guid = format_rsds_guid(bytes.get(4..20)?);
+            let age = u32::from_le_bytes(bytes.get(20..24)?.try_into().ok()?);
+            let path = read_null_terminated_utf8(bytes.get(24..).unwrap_or_default());
+            Some(PePdbRecord {
+                format: PePdbFormat::Rsds,
+                path,
+                guid: Some(guid),
+                age: Some(age),
+                signature: None,
+                debug_rva,
+                debug_file_offset,
+            })
+        }
+        b"NB10" => {
+            if bytes.len() < 16 {
+                return None;
+            }
+            let signature = u32::from_le_bytes(bytes.get(8..12)?.try_into().ok()?);
+            let age = u32::from_le_bytes(bytes.get(12..16)?.try_into().ok()?);
+            let path = read_null_terminated_utf8(bytes.get(16..).unwrap_or_default());
+            Some(PePdbRecord {
+                format: PePdbFormat::Nb10,
+                path,
+                guid: None,
+                age: Some(age),
+                signature: Some(signature),
+                debug_rva,
+                debug_file_offset,
+            })
+        }
+        other => {
+            let format = String::from_utf8_lossy(other).to_string();
+            Some(PePdbRecord {
+                format: PePdbFormat::Unknown(format),
+                path: String::new(),
+                guid: None,
+                age: None,
+                signature: None,
+                debug_rva,
+                debug_file_offset,
+            })
+        }
+    }
+}
+
+fn collect_global_pdb_symbols(
+    pdb: &mut pdb::PDB<'_, std::fs::File>,
+    image: &PeImage,
+    address_map: &pdb::AddressMap<'_>,
+) -> Result<Vec<PdbSymbol>, String> {
+    let mut symbols = Vec::new();
+    let symbol_table = pdb
+        .global_symbols()
+        .map_err(|source| format!("读取 PDB 全局符号表失败：{source}"))?;
+    let mut iter = symbol_table.iter();
+
+    while let Some(symbol) = iter
+        .next()
+        .map_err(|source| format!("遍历 PDB 全局符号失败：{source}"))?
+    {
+        if symbols.len() >= MAX_PDB_SYMBOLS {
+            break;
+        }
+        let Ok(data) = symbol.parse() else {
+            continue;
+        };
+
+        match data {
+            pdb::SymbolData::Public(public) => {
+                let (rva, address) = offset_to_rva_va(public.offset, image, address_map);
+                let kind = if public.function {
+                    PdbSymbolKind::Function
+                } else if public.code {
+                    PdbSymbolKind::PublicCode
+                } else {
+                    PdbSymbolKind::PublicData
+                };
+                let name = public.name.to_string().into_owned();
+                symbols.push(make_pdb_symbol(address, rva, name, kind, "public"));
+            }
+            pdb::SymbolData::Data(data) => {
+                let (rva, address) = offset_to_rva_va(data.offset, image, address_map);
+                let name = data.name.to_string().into_owned();
+                symbols.push(make_pdb_symbol(
+                    address,
+                    rva,
+                    name,
+                    PdbSymbolKind::Data,
+                    "data",
+                ));
+            }
+            pdb::SymbolData::UserDefinedType(udt) => {
+                let name = udt.name.to_string().into_owned();
+                symbols.push(make_pdb_symbol(
+                    None,
+                    None,
+                    name,
+                    PdbSymbolKind::UserDefinedType,
+                    "udt",
+                ));
+            }
+            pdb::SymbolData::ProcedureReference(reference) => {
+                if let Some(name) = reference.name {
+                    let name = name.to_string().into_owned();
+                    symbols.push(make_pdb_symbol(
+                        None,
+                        None,
+                        name,
+                        PdbSymbolKind::ProcedureReference,
+                        "proc-ref",
+                    ));
+                }
+            }
+            pdb::SymbolData::DataReference(reference) => {
+                if let Some(name) = reference.name {
+                    let name = name.to_string().into_owned();
+                    symbols.push(make_pdb_symbol(
+                        None,
+                        None,
+                        name,
+                        PdbSymbolKind::DataReference,
+                        "data-ref",
+                    ));
+                }
+            }
+            _ => {}
+        }
+    }
+
+    Ok(symbols)
+}
+
+fn collect_module_pdb_symbols(
+    pdb: &mut pdb::PDB<'_, std::fs::File>,
+    image: &PeImage,
+    address_map: &pdb::AddressMap<'_>,
+) -> (Vec<PdbSymbol>, Vec<PdbSourceFile>) {
+    let Ok(debug_info) = pdb.debug_information() else {
+        return (Vec::new(), Vec::new());
+    };
+    let Ok(mut modules) = debug_info.modules() else {
+        return (Vec::new(), Vec::new());
+    };
+
+    let mut symbols = Vec::new();
+    let mut sources = BTreeSet::new();
+    while let Ok(Some(module)) = modules.next() {
+        if sources.len() < MAX_PDB_SOURCES {
+            let module_name = module.module_name().to_string();
+            if !module_name.is_empty() {
+                sources.insert(module_name);
+            }
+            let object_name = module.object_file_name().to_string();
+            if !object_name.is_empty() {
+                sources.insert(object_name);
+            }
+        }
+
+        if symbols.len() >= MAX_PDB_SYMBOLS {
+            continue;
+        }
+        let Ok(Some(info)) = pdb.module_info(&module) else {
+            continue;
+        };
+        let Ok(mut module_symbols) = info.symbols() else {
+            continue;
+        };
+        while let Ok(Some(symbol)) = module_symbols.next() {
+            if symbols.len() >= MAX_PDB_SYMBOLS {
+                break;
+            }
+            let Ok(data) = symbol.parse() else {
+                continue;
+            };
+            match data {
+                pdb::SymbolData::Procedure(proc_symbol) => {
+                    let (rva, address) = offset_to_rva_va(proc_symbol.offset, image, address_map);
+                    let name = proc_symbol.name.to_string().into_owned();
+                    symbols.push(make_pdb_symbol(
+                        address,
+                        rva,
+                        name,
+                        PdbSymbolKind::Function,
+                        "procedure",
+                    ));
+                }
+                pdb::SymbolData::Data(data) => {
+                    let (rva, address) = offset_to_rva_va(data.offset, image, address_map);
+                    let name = data.name.to_string().into_owned();
+                    symbols.push(make_pdb_symbol(
+                        address,
+                        rva,
+                        name,
+                        PdbSymbolKind::Data,
+                        "data",
+                    ));
+                }
+                pdb::SymbolData::UserDefinedType(udt) => {
+                    let name = udt.name.to_string().into_owned();
+                    symbols.push(make_pdb_symbol(
+                        None,
+                        None,
+                        name,
+                        PdbSymbolKind::UserDefinedType,
+                        "udt",
+                    ));
+                }
+                _ => {}
+            }
+        }
+    }
+
+    let source_files = sources
+        .into_iter()
+        .take(MAX_PDB_SOURCES)
+        .map(|path| PdbSourceFile { path })
+        .collect();
+    (symbols, source_files)
+}
+
+fn collect_pdb_type_summaries(symbols: &[PdbSymbol]) -> Vec<PdbTypeSummary> {
+    let mut seen = BTreeSet::new();
+    symbols
+        .iter()
+        .filter(|symbol| symbol.kind == PdbSymbolKind::UserDefinedType)
+        .filter_map(|symbol| {
+            let name = symbol.display_name().to_owned();
+            if seen.insert(name.clone()) {
+                Some(PdbTypeSummary {
+                    name,
+                    kind: "UDT".to_owned(),
+                    source: symbol.source.clone(),
+                })
+            } else {
+                None
+            }
+        })
+        .take(MAX_PDB_TYPES)
+        .collect()
+}
+
+fn overlay_pdb_function_names(image: &PeImage, analysis: &mut StaticAnalysis) {
+    let mut known_functions = analysis
+        .functions
+        .iter()
+        .map(|function| function.start_va)
+        .collect::<BTreeSet<_>>();
+    for symbol in &analysis.pdb_symbols {
+        let Some(address) = symbol.address else {
+            continue;
+        };
+        if !symbol.is_function_like() || !image.is_executable_va(address) {
+            continue;
+        }
+        if known_functions.insert(address) {
+            analysis.functions.push(FunctionSummary {
+                start_va: address,
+                name: symbol.display_name().to_owned(),
+                size: 0,
+                instruction_count: 0,
+                call_count: 0,
+            });
+        }
+    }
+    analysis.functions.sort_by_key(|function| function.start_va);
+    overlay_pdb_names_only(analysis);
+}
+
+fn overlay_pdb_names_only(analysis: &mut StaticAnalysis) {
+    let names = analysis
+        .pdb_symbols
+        .iter()
+        .filter(|symbol| symbol.is_function_like())
+        .filter_map(|symbol| Some((symbol.address?, symbol.display_name().to_owned())))
+        .collect::<BTreeMap<_, _>>();
+
+    for function in &mut analysis.functions {
+        if let Some(name) = names.get(&function.start_va) {
+            function.name = name.clone();
+        }
+    }
+    for node in &mut analysis.call_graph.nodes {
+        if let Some(name) = names.get(&node.start_va) {
+            node.name = name.clone();
+        }
+    }
+}
+
+fn make_pdb_symbol(
+    address: Option<u64>,
+    rva: Option<u32>,
+    name: String,
+    kind: PdbSymbolKind,
+    source: &str,
+) -> PdbSymbol {
+    let demangled_name = demangle_symbol(&name);
+    PdbSymbol {
+        address,
+        rva,
+        name,
+        demangled_name,
+        kind,
+        source: source.to_owned(),
+    }
+}
+
+fn demangle_symbol(name: &str) -> Option<String> {
+    if let Ok(value) = msvc_demangler::demangle(name, msvc_demangler::DemangleFlags::llvm()) {
+        let value = value.to_string();
+        if value != name {
+            return Some(value);
+        }
+    }
+
+    if name.starts_with("_R") || name.starts_with("ZN") || name.starts_with("_ZN") {
+        let value = rustc_demangle::demangle(name).to_string();
+        if value != name {
+            return Some(value);
+        }
+    }
+    None
+}
+
+fn offset_to_rva_va(
+    offset: pdb::PdbInternalSectionOffset,
+    image: &PeImage,
+    address_map: &pdb::AddressMap<'_>,
+) -> (Option<u32>, Option<u64>) {
+    let rva = offset.to_rva(address_map).map(|rva| rva.0);
+    let address = rva.map(|rva| image.rva_to_va(u64::from(rva)));
+    (rva, address)
+}
+
+fn dedup_pdb_symbols(symbols: &mut Vec<PdbSymbol>) {
+    symbols.sort_by(|left, right| {
+        left.address
+            .cmp(&right.address)
+            .then_with(|| left.kind.cmp(&right.kind))
+            .then_with(|| left.display_name().cmp(right.display_name()))
+    });
+    symbols.dedup_by(|left, right| {
+        left.address == right.address
+            && left.kind == right.kind
+            && left.display_name() == right.display_name()
+    });
+    if symbols.len() > MAX_PDB_SYMBOLS {
+        symbols.truncate(MAX_PDB_SYMBOLS);
+    }
+}
+
+fn pdb_matches_pe(record: &PePdbRecord, pdb_guid: &str, pdb_age: u32) -> bool {
+    let guid_matches = record
+        .guid
+        .as_deref()
+        .map(|guid| guid.eq_ignore_ascii_case(pdb_guid))
+        .unwrap_or(true);
+    let age_matches = record.age.map(|age| pdb_age >= age).unwrap_or(true);
+    guid_matches && age_matches
+}
+
+fn format_rsds_guid(bytes: &[u8]) -> String {
+    let d1 = u32::from_le_bytes([bytes[0], bytes[1], bytes[2], bytes[3]]);
+    let d2 = u16::from_le_bytes([bytes[4], bytes[5]]);
+    let d3 = u16::from_le_bytes([bytes[6], bytes[7]]);
+    format!(
+        "{d1:08x}-{d2:04x}-{d3:04x}-{:02x}{:02x}-{:02x}{:02x}{:02x}{:02x}{:02x}{:02x}",
+        bytes[8], bytes[9], bytes[10], bytes[11], bytes[12], bytes[13], bytes[14], bytes[15]
+    )
+}
+
+fn read_null_terminated_utf8(bytes: &[u8]) -> String {
+    let end = bytes
+        .iter()
+        .position(|byte| *byte == 0)
+        .unwrap_or(bytes.len());
+    String::from_utf8_lossy(&bytes[..end]).to_string()
+}
+
+fn read_bytes_at_file_offset(bytes: &[u8], file_offset: u32, size: u32) -> Option<&[u8]> {
+    let start = usize::try_from(file_offset).ok()?;
+    let size = usize::try_from(size).ok()?;
+    let end = start.checked_add(size)?;
+    bytes.get(start..end)
 }
 
 fn dedup_xrefs(xrefs: &mut Vec<XrefSummary>) {
@@ -1411,7 +2101,7 @@ mod tests {
 
     use fyida_core::{
         CoffFileHeader, DosHeader, FileSelection, NtHeaders, PeDataDirectory, PeOptionalHeader,
-        PeSection, RawArch, RawImage,
+        PeSection, RawArch, RawImage, PE_DIRECTORY_DEBUG,
     };
 
     use super::*;
@@ -1453,6 +2143,10 @@ mod tests {
         data_directories[PE_DIRECTORY_BASERELOC] = PeDataDirectory {
             virtual_address: 0x2300,
             size: 0x0C,
+        };
+        data_directories[PE_DIRECTORY_DEBUG] = PeDataDirectory {
+            virtual_address: 0x2400,
+            size: 0x1C,
         };
 
         PeImage::new(
@@ -1545,6 +2239,19 @@ mod tests {
         write_u16(&mut bytes, 0x708, 0xA020);
         write_u16(&mut bytes, 0x70A, 0);
 
+        let pdb_path = b"C:\\symbols\\analysis.pdb";
+        write_u32(&mut bytes, 0x800 + 12, 2);
+        write_u32(&mut bytes, 0x800 + 16, (24 + pdb_path.len() + 1) as u32);
+        write_u32(&mut bytes, 0x800 + 20, 0x2420);
+        write_u32(&mut bytes, 0x800 + 24, 0x820);
+        bytes[0x820..0x824].copy_from_slice(b"RSDS");
+        bytes[0x824..0x834].copy_from_slice(&[
+            0x33, 0x22, 0x11, 0x00, 0x55, 0x44, 0x77, 0x66, 0x88, 0x99, 0xAA, 0xBB, 0xCC, 0xDD,
+            0xEE, 0xFF,
+        ]);
+        write_u32(&mut bytes, 0x834, 2);
+        bytes[0x838..0x838 + pdb_path.len()].copy_from_slice(pdb_path);
+
         bytes
     }
 
@@ -1596,6 +2303,12 @@ mod tests {
         assert_eq!(analysis.exports[0].va, 0x1400_01000);
         assert_eq!(analysis.relocations[0].rva, 0x1020);
         assert_eq!(analysis.relocations[0].kind_label(), "DIR64");
+        assert_eq!(analysis.pe_pdb_records[0].path, r"C:\symbols\analysis.pdb");
+        assert_eq!(
+            analysis.pe_pdb_records[0].guid.as_deref(),
+            Some("00112233-4455-6677-8899-aabbccddeeff")
+        );
+        assert_eq!(analysis.pe_pdb_records[0].age, Some(2));
         assert!(analysis
             .function_cfgs
             .iter()
@@ -1666,5 +2379,13 @@ mod tests {
                 && edge.to_va == 0x1800_00003
                 && edge.kind == CfgEdgeKind::Fallthrough
         }));
+    }
+
+    #[test]
+    fn demangles_msvc_symbol_names() {
+        let demangled = demangle_symbol("??_0klass@@QEAAHH@Z").expect("msvc demangle");
+
+        assert!(demangled.contains("klass"));
+        assert_ne!(demangled, "??_0klass@@QEAAHH@Z");
     }
 }

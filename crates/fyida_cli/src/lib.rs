@@ -9,7 +9,7 @@ use fyida_loader::RawLoadOptions;
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.7.0-alpha.1 已提供基础 CFG 与 direct-call 调用图能力。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.8.0-alpha.1 已提供 PDB 符号线索、外部 PDB public symbols 与 demangle 能力。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -26,6 +26,9 @@ pub struct Cli {
 
     #[arg(long, default_value = "x64", help = "Raw Binary 架构；当前仅支持 x64")]
     pub arch: String,
+
+    #[arg(long, value_name = "PDB", help = "为 PE 手动加载外部 PDB 符号文件")]
+    pub pdb: Option<PathBuf>,
 
     #[arg(value_name = "FILE", help = "启动 GUI 时预选的输入文件路径")]
     pub file: Option<PathBuf>,
@@ -148,7 +151,26 @@ pub fn run_headless(cli: &Cli) -> i32 {
                 }
             }
 
-            let analysis = fyida_analysis::analyze_pe(&image, &loaded.bytes);
+            let mut analysis = fyida_analysis::analyze_pe(&image, &loaded.bytes);
+            if let Some(pdb_path) = &cli.pdb {
+                match fyida_analysis::apply_pdb_file(&image, &mut analysis, pdb_path) {
+                    Ok(summary) => {
+                        println!(
+                            "PDB 已加载：{} / symbols {} / types {} / sources {} / match {}",
+                            summary.loaded.path,
+                            summary.symbol_count,
+                            summary.type_count,
+                            summary.source_count,
+                            match summary.loaded.matched_pe {
+                                Some(true) => "yes",
+                                Some(false) => "no",
+                                None => "unknown",
+                            }
+                        );
+                    }
+                    Err(error) => println!("PDB 加载失败：{error}"),
+                }
+            }
             print_static_analysis(&analysis);
             0
         }
@@ -258,5 +280,32 @@ fn print_static_analysis(analysis: &fyida_analysis::StaticAnalysis) {
             "    {:016X} -> {:016X} callsite {:016X}",
             edge.caller_va, edge.callee_va, edge.callsite_va
         );
+    }
+    println!("  PDBRecords：{}", analysis.pe_pdb_records.len());
+    for record in &analysis.pe_pdb_records {
+        println!(
+            "    {} age {} guid {} path {}",
+            record.format.label(),
+            record.age.unwrap_or(0),
+            record.guid.as_deref().unwrap_or("-"),
+            record.path
+        );
+    }
+    println!("  PDBSymbols：{}", analysis.pdb_symbols.len());
+    for symbol in analysis.pdb_symbols.iter().take(64) {
+        let address = symbol
+            .address
+            .map(|address| format!("{address:016X}"))
+            .unwrap_or_else(|| "----------------".to_owned());
+        println!(
+            "    {} {:<18} {}",
+            address,
+            symbol.kind.label(),
+            symbol.display_name()
+        );
+    }
+    println!("  PDBTypes：{}", analysis.pdb_types.len());
+    for type_item in analysis.pdb_types.iter().take(64) {
+        println!("    [{}] {}", type_item.kind, type_item.name);
     }
 }

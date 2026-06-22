@@ -17,7 +17,7 @@ The project intentionally does not copy IDA code, icons, database formats, or pr
 
 ## Current Status
 
-`v0.7.0-alpha.1` contains the first CFG and call graph checkpoint. It can start `fy_ida.exe`, open a Windows x64 PE or x64 Raw Binary, show real EntryPoint-near instructions, list discovered functions/strings/imports/exports/relocations/xrefs, save or reopen FY_IDA project files with user annotations, navigate and search through analysis views, render byte-synchronized Hex rows, and display generated function CFG and direct-call graph data in the GUI.
+`v0.8.0-alpha.1` contains the first PDB and symbol-system checkpoint. It can start `fy_ida.exe`, open a Windows x64 PE or x64 Raw Binary, show real EntryPoint-near instructions, list discovered functions/strings/imports/exports/relocations/xrefs, save or reopen FY_IDA project files with user annotations and PDB symbol snapshots, navigate and search through analysis views, render byte-synchronized Hex rows, display generated function CFG/call graph data, parse PE CodeView PDB records, and load external PDB public symbols with demangled names in GUI or headless mode.
 
 ## Recovery Strategy
 

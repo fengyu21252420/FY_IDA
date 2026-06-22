@@ -7,13 +7,17 @@ use eframe::egui::{
     Ui, Visuals, Window,
 };
 use fyida_analysis::{
-    analyze_pe, analyze_raw, empty_workspace_disassembly, file_error_log_lines,
-    pe_entry_disassembly, pe_loaded_log_lines, raw_entry_disassembly, raw_loaded_log_lines,
-    startup_log_lines, static_analysis_log_lines, DisassemblyRow, StaticAnalysis,
+    analyze_pe, analyze_raw, apply_pdb_file, apply_pdb_snapshot, empty_workspace_disassembly,
+    file_error_log_lines, pdb_candidate_paths, pe_entry_disassembly, pe_loaded_log_lines,
+    raw_entry_disassembly, raw_loaded_log_lines, startup_log_lines, static_analysis_log_lines,
+    DisassemblyRow, LoadedPdbInfo, PdbSourceFile as AnalysisPdbSourceFile, PdbSymbol,
+    PdbSymbolKind, PdbTypeSummary, StaticAnalysis,
 };
 use fyida_core::{
-    format_address, sha256_hex, FileSelection, ManualDefinitionKind, ProjectDocument,
-    ProjectFunction, ProjectInput, ProjectInputKind, ProjectState, RawArch, RawImage, APP_NAME,
+    format_address, sha256_hex, FileSelection, ManualDefinitionKind, ProjectDebugInfo,
+    ProjectDocument, ProjectFunction, ProjectInput, ProjectInputKind,
+    ProjectSourceFile as ProjectSourceFileRecord, ProjectState, ProjectSymbol, ProjectType,
+    RawArch, RawImage, APP_NAME,
 };
 use fyida_loader::{
     load_file_metadata, load_pe_file_with_bytes, load_pe_from_selection_with_bytes,
@@ -206,6 +210,17 @@ impl FyIdaApp {
         }
     }
 
+    fn open_pdb_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .set_title("加载 PDB")
+            .add_filter("Program Database", &["pdb"])
+            .add_filter("所有文件", &["*"])
+            .pick_file()
+        {
+            self.apply_pdb_path(path);
+        }
+    }
+
     fn open_project_dialog(&mut self) {
         if let Some(path) = FileDialog::new()
             .set_title("打开项目")
@@ -303,6 +318,7 @@ impl FyIdaApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
+        let (debug_info, symbols, types, source_files) = self.current_pdb_project_snapshot();
 
         Ok(ProjectDocument::new(
             env!("CARGO_PKG_VERSION"),
@@ -313,8 +329,71 @@ impl FyIdaApp {
                 kind,
             },
             functions,
+            debug_info,
+            symbols,
+            types,
+            source_files,
             self.project.annotations(),
         ))
+    }
+
+    fn current_pdb_project_snapshot(
+        &self,
+    ) -> (
+        Option<ProjectDebugInfo>,
+        Vec<ProjectSymbol>,
+        Vec<ProjectType>,
+        Vec<ProjectSourceFileRecord>,
+    ) {
+        let Some(analysis) = &self.analysis else {
+            return (None, Vec::new(), Vec::new(), Vec::new());
+        };
+
+        let pe_record = analysis.pe_pdb_records.first();
+        let loaded = analysis.loaded_pdb.as_ref();
+        let debug_info = if pe_record.is_some() || loaded.is_some() {
+            Some(ProjectDebugInfo {
+                pe_pdb_path: pe_record.map(|record| record.path.clone()),
+                pe_pdb_guid: pe_record.and_then(|record| record.guid.clone()),
+                pe_pdb_age: pe_record.and_then(|record| record.age),
+                loaded_pdb_path: loaded.map(|info| info.path.clone()),
+                loaded_pdb_guid: loaded.and_then(|info| info.guid.clone()),
+                loaded_pdb_age: loaded.map(|info| info.age),
+                matched: loaded.and_then(|info| info.matched_pe),
+            })
+        } else {
+            None
+        };
+        let symbols = analysis
+            .pdb_symbols
+            .iter()
+            .map(|symbol| ProjectSymbol {
+                address: symbol.address,
+                rva: symbol.rva,
+                name: symbol.display_name().to_owned(),
+                original_name: symbol.name.clone(),
+                kind: symbol.kind.label().to_owned(),
+                source: symbol.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let types = analysis
+            .pdb_types
+            .iter()
+            .map(|type_item| ProjectType {
+                name: type_item.name.clone(),
+                kind: type_item.kind.clone(),
+                source: type_item.source.clone(),
+            })
+            .collect::<Vec<_>>();
+        let source_files = analysis
+            .pdb_sources
+            .iter()
+            .map(|source| ProjectSourceFileRecord {
+                path: source.path.clone(),
+            })
+            .collect::<Vec<_>>();
+
+        (debug_info, symbols, types, source_files)
     }
 
     fn apply_project_document(&mut self, project_path: PathBuf, document: ProjectDocument) {
@@ -376,7 +455,17 @@ impl FyIdaApp {
         actual_hash: String,
         expected_hash: String,
     ) {
+        let saved_debug_info = document.debug_info.clone();
+        let saved_symbols = document.symbols.clone();
+        let saved_types = document.types.clone();
+        let saved_sources = document.source_files.clone();
         self.project.apply_annotations(document.annotations);
+        self.apply_project_pdb_snapshot(
+            saved_debug_info,
+            saved_symbols,
+            saved_types,
+            saved_sources,
+        );
         self.project_path = Some(project_path.clone());
         self.source_hash = Some(actual_hash.clone());
         self.project.mark_saved();
@@ -388,6 +477,60 @@ impl FyIdaApp {
         self.logs
             .push(format!("项目已打开：{}", project_path.display()));
         self.bottom_tab = 0;
+    }
+
+    fn apply_project_pdb_snapshot(
+        &mut self,
+        debug_info: Option<ProjectDebugInfo>,
+        symbols: Vec<ProjectSymbol>,
+        types: Vec<ProjectType>,
+        sources: Vec<ProjectSourceFileRecord>,
+    ) {
+        if symbols.is_empty() && types.is_empty() && sources.is_empty() {
+            return;
+        }
+        let Some(analysis) = self.analysis.as_mut() else {
+            return;
+        };
+
+        let loaded = debug_info.and_then(|info| {
+            info.loaded_pdb_path.map(|path| LoadedPdbInfo {
+                path,
+                guid: info.loaded_pdb_guid,
+                age: info.loaded_pdb_age.unwrap_or(0),
+                signature: 0,
+                matched_pe: info.matched,
+            })
+        });
+        let symbols = symbols
+            .into_iter()
+            .map(|symbol| {
+                let demangled_name =
+                    (symbol.name != symbol.original_name).then_some(symbol.name.clone());
+                PdbSymbol {
+                    address: symbol.address,
+                    rva: symbol.rva,
+                    name: symbol.original_name,
+                    demangled_name,
+                    kind: pdb_symbol_kind_from_label(&symbol.kind),
+                    source: symbol.source,
+                }
+            })
+            .collect::<Vec<_>>();
+        let types = types
+            .into_iter()
+            .map(|type_item| PdbTypeSummary {
+                name: type_item.name,
+                kind: type_item.kind,
+                source: type_item.source,
+            })
+            .collect::<Vec<_>>();
+        let sources = sources
+            .into_iter()
+            .map(|source| AnalysisPdbSourceFile { path: source.path })
+            .collect::<Vec<_>>();
+        apply_pdb_snapshot(analysis, loaded, symbols, types, sources);
+        self.logs.push("已从项目文件恢复 PDB 符号快照。".to_owned());
     }
 
     fn select_path(&mut self, path: PathBuf) {
@@ -427,19 +570,93 @@ impl FyIdaApp {
     }
 
     fn apply_pe_image(&mut self, image: fyida_core::PeImage, bytes: &[u8]) {
-        let analysis = analyze_pe(&image, bytes);
+        let mut analysis = analyze_pe(&image, bytes);
+        let pdb_logs = self.try_autoload_pdb(&image, &mut analysis);
         let disassembly = pe_entry_disassembly(&image, bytes);
         self.source_hash = Some(sha256_hex(bytes));
         self.input_bytes = bytes.to_vec();
         self.project_path = None;
         self.logs.extend(pe_loaded_log_lines(&image));
         self.logs.extend(static_analysis_log_lines(&analysis));
+        self.logs.extend(pdb_logs);
         self.logs.extend(disassembly.log_lines);
         self.disassembly_rows = disassembly.rows;
         self.analysis = Some(analysis);
         self.project.load_pe(image);
         self.center_tab = 0;
         self.right_tab = 1;
+        self.bottom_tab = 0;
+    }
+
+    fn try_autoload_pdb(
+        &self,
+        image: &fyida_core::PeImage,
+        analysis: &mut StaticAnalysis,
+    ) -> Vec<String> {
+        for path in pdb_candidate_paths(image, analysis) {
+            if !path.is_file() {
+                continue;
+            }
+            return match apply_pdb_file(image, analysis, &path) {
+                Ok(summary) => vec![format!(
+                    "自动加载 PDB：{}（符号 {}，类型 {}，来源 {}）",
+                    summary.loaded.path,
+                    summary.symbol_count,
+                    summary.type_count,
+                    summary.source_count
+                )],
+                Err(error) => vec![format!("自动加载 PDB 失败：{} ({error})", path.display())],
+            };
+        }
+
+        analysis
+            .pe_pdb_records
+            .first()
+            .map(|record| {
+                vec![format!(
+                    "发现 PE PDB 线索：{}，本机未自动找到文件。",
+                    record.path
+                )]
+            })
+            .unwrap_or_default()
+    }
+
+    fn apply_pdb_path(&mut self, path: PathBuf) {
+        let Some(image) = self.project.pe_image().cloned() else {
+            self.logs
+                .push("加载 PDB 失败：请先打开 Windows PE 文件。".to_owned());
+            self.bottom_tab = 0;
+            return;
+        };
+        let Some(analysis) = self.analysis.as_mut() else {
+            self.logs
+                .push("加载 PDB 失败：当前没有可更新的分析结果。".to_owned());
+            self.bottom_tab = 0;
+            return;
+        };
+
+        match apply_pdb_file(&image, analysis, &path) {
+            Ok(summary) => {
+                self.logs.push(format!(
+                    "PDB 已加载：{}（符号 {}，类型 {}，来源 {}，匹配 {}）",
+                    summary.loaded.path,
+                    summary.symbol_count,
+                    summary.type_count,
+                    summary.source_count,
+                    match summary.loaded.matched_pe {
+                        Some(true) => "是",
+                        Some(false) => "否",
+                        None => "未知",
+                    }
+                ));
+                self.left_tab = 1;
+                self.right_tab = 2;
+            }
+            Err(error) => {
+                self.logs
+                    .push(format!("加载 PDB 失败：{} ({error})", path.display()));
+            }
+        }
         self.bottom_tab = 0;
     }
 
@@ -615,6 +832,16 @@ impl FyIdaApp {
                         }
                         if ui
                             .add_enabled(
+                                self.project.pe_image().is_some(),
+                                egui::Button::new("加载 PDB..."),
+                            )
+                            .clicked()
+                        {
+                            self.open_pdb_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
                                 self.project.selected_file().is_some(),
                                 egui::Button::new("保存项目"),
                             )
@@ -767,8 +994,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.7.0-alpha.1");
-                        ui.label("CFG 与调用图 MVP。");
+                        ui.label("FY_IDA v0.8.0-alpha.1");
+                        ui.label("PDB 符号与 demangle MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -1028,6 +1255,14 @@ impl FyIdaApp {
                 .iter()
                 .map(|import| (import.thunk_va, import.display_name(), "导入".to_owned())),
         );
+
+        rows.extend(analysis.pdb_symbols.iter().filter_map(|symbol| {
+            Some((
+                symbol.address?,
+                symbol.display_name().to_owned(),
+                symbol.kind.label().to_owned(),
+            ))
+        }));
 
         if rows.is_empty() {
             placeholder_list(ui, &["当前文件没有可显示名称"]);
@@ -1907,6 +2142,9 @@ impl FyIdaApp {
         if !row.comment.is_empty() {
             parts.push(row.comment.clone());
         }
+        if let Some(symbol) = self.pdb_symbol_at(row.address) {
+            parts.push(format!("PDB: {}", symbol.display_name()));
+        }
         if let Some(comment) = self.project.address_comment(row.address) {
             parts.push(comment.to_owned());
         }
@@ -2268,6 +2506,17 @@ impl FyIdaApp {
             }
         }
 
+        for symbol in &analysis.pdb_symbols {
+            let display_name = symbol.display_name();
+            if display_name.to_lowercase().contains(&query)
+                || symbol.name.to_lowercase().contains(&query)
+            {
+                if let Some(address) = symbol.address {
+                    return Some((address, format!("PDB {display_name}")));
+                }
+            }
+        }
+
         for string in &analysis.strings {
             if string.value.to_lowercase().contains(&query) {
                 return Some((string.address, "字符串".to_owned()));
@@ -2474,6 +2723,47 @@ impl FyIdaApp {
             }
         }
 
+        for symbol in &analysis.pdb_symbols {
+            let display_name = symbol.display_name();
+            let original_name = &symbol.name;
+            if display_name.to_lowercase().contains(&query_lower)
+                || original_name.to_lowercase().contains(&query_lower)
+                || symbol
+                    .address
+                    .map(|address| address_matches(address, query))
+                    .unwrap_or(false)
+            {
+                if let Some(address) = symbol.address {
+                    results.push(SearchResult::jump(
+                        format!(
+                            "PDB 符号 0x{address:016X} {} {}",
+                            symbol.kind.label(),
+                            display_name
+                        ),
+                        address,
+                        symbol.kind.label(),
+                    ));
+                } else {
+                    results.push(SearchResult::plain(format!(
+                        "PDB 符号 {} {}",
+                        symbol.kind.label(),
+                        display_name
+                    )));
+                }
+            }
+        }
+
+        for type_item in &analysis.pdb_types {
+            if type_item.name.to_lowercase().contains(&query_lower)
+                || type_item.kind.to_lowercase().contains(&query_lower)
+            {
+                results.push(SearchResult::plain(format!(
+                    "PDB 类型 [{}] {}",
+                    type_item.kind, type_item.name
+                )));
+            }
+        }
+
         for xref in &analysis.xrefs {
             if address_matches(xref.from_va, query)
                 || address_matches(xref.to_va, query)
@@ -2497,6 +2787,14 @@ impl FyIdaApp {
             results.push(SearchResult::plain("没有匹配结果。"));
         }
         results
+    }
+
+    fn pdb_symbol_at(&self, address: u64) -> Option<&PdbSymbol> {
+        self.analysis
+            .as_ref()?
+            .pdb_symbols
+            .iter()
+            .find(|symbol| symbol.address == Some(address))
     }
 
     fn file_offset_to_va(&self, file_offset: u64) -> Option<u64> {
@@ -2577,6 +2875,21 @@ fn format_byte_pattern(bytes: &[u8]) -> String {
         .map(|byte| format!("{byte:02X}"))
         .collect::<Vec<_>>()
         .join(" ")
+}
+
+fn pdb_symbol_kind_from_label(label: &str) -> PdbSymbolKind {
+    [
+        PdbSymbolKind::Function,
+        PdbSymbolKind::PublicCode,
+        PdbSymbolKind::Data,
+        PdbSymbolKind::PublicData,
+        PdbSymbolKind::UserDefinedType,
+        PdbSymbolKind::ProcedureReference,
+        PdbSymbolKind::DataReference,
+    ]
+    .into_iter()
+    .find(|kind| kind.label() == label)
+    .unwrap_or(PdbSymbolKind::PublicData)
 }
 
 fn hex_bytes(bytes: &[u8]) -> String {

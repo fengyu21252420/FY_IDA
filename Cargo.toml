@@ -11,7 +11,7 @@ members = [
 resolver = "2"
 
 [workspace.package]
-version = "0.7.0-alpha.1"
+version = "0.8.0-alpha.1"
 edition = "2021"
 rust-version = "1.77"
 
@@ -19,7 +19,10 @@ rust-version = "1.77"
 clap = { version = "4.5", features = ["derive"] }
 eframe = { version = "0.27.2", default-features = false, features = ["default_fonts", "glow"] }
 iced-x86 = "1.21"
+msvc-demangler = "0.11"
+pdb = "0.8"
 rfd = "0.14"
+rustc-demangle = "0.1"
 serde = { version = "1", features = ["derive"] }
 serde_json = "1"
 sha2 = "0.10"
