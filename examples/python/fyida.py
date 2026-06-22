@@ -51,6 +51,90 @@ class Project:
     def xrefs(self):
         return self._records("xrefs")
 
+    def cfgs(self, query=None):
+        records = self._records("cfg_records")
+        if not query:
+            return records
+        needle = query.casefold()
+        return [
+            item
+            for item in records
+            if needle in hex(item.get("function_start", 0)).casefold()
+            or any(
+                needle in hex(block.get(field, 0)).casefold()
+                for block in item.get("blocks", [])
+                for field in ("start_va", "end_va")
+            )
+            or any(
+                needle in str(edge.get("kind", "")).casefold()
+                or needle in hex(edge.get("from_va", 0)).casefold()
+                or needle in hex(edge.get("to_va", 0)).casefold()
+                for edge in item.get("edges", [])
+            )
+        ]
+
+    def cfg_for(self, address):
+        target = parse_address(address)
+        for cfg in self.cfgs():
+            if cfg.get("function_start") == target:
+                return cfg
+            for block in cfg.get("blocks", []):
+                start = block.get("start_va")
+                end = block.get("end_va")
+                if start is not None and end is not None and start <= target < end:
+                    return cfg
+        return None
+
+    def basic_blocks(self, function_start=None):
+        blocks = []
+        for cfg in self._selected_cfgs(function_start):
+            for block in cfg.get("blocks", []):
+                item = dict(block)
+                item["function_start"] = cfg.get("function_start")
+                blocks.append(Record(item))
+        return blocks
+
+    def cfg_edges(self, function_start=None, query=None):
+        edges = []
+        for cfg in self._selected_cfgs(function_start):
+            for edge in cfg.get("edges", []):
+                item = dict(edge)
+                item["function_start"] = cfg.get("function_start")
+                edges.append(Record(item))
+        if not query:
+            return edges
+        needle = query.casefold()
+        return [
+            item
+            for item in edges
+            if needle in str(item.get("kind", "")).casefold()
+            or needle in hex(item.get("from_va", 0)).casefold()
+            or needle in hex(item.get("to_va", 0)).casefold()
+        ]
+
+    def instructions(self, function_start=None, query=None):
+        instructions = []
+        for cfg in self._selected_cfgs(function_start):
+            for block in cfg.get("blocks", []):
+                for instruction in block.get("instructions", []):
+                    item = dict(instruction)
+                    item["function_start"] = cfg.get("function_start")
+                    item["block_start"] = block.get("start_va")
+                    item["block_end"] = block.get("end_va")
+                    instructions.append(Record(item))
+        if not query:
+            return instructions
+        needle = query.casefold()
+        return [
+            item
+            for item in instructions
+            if needle
+            in " ".join(
+                str(item.get(field, ""))
+                for field in ("bytes", "mnemonic", "operands", "flow")
+            ).casefold()
+        ]
+
     def call_graph_nodes(self, query=None):
         return self._filter_records("call_graph_node_records", query, "name")
 
@@ -156,6 +240,12 @@ class Project:
             for item in records
             if needle in " ".join(str(item.get(field, "")) for field in fields).casefold()
         ]
+
+    def _selected_cfgs(self, function_start):
+        if function_start is None:
+            return self.cfgs()
+        cfg = self.cfg_for(function_start)
+        return [cfg] if cfg is not None else []
 
     def _append_action(self, action):
         if not self.actions_path:

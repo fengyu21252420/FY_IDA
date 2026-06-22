@@ -12,6 +12,7 @@ use fyida_core::{
     ProjectSourceFile, ProjectSymbol, ProjectType, ProjectTypeApplication, RawArch,
     UserAnnotations, UserComment, UserName,
 };
+use fyida_disasm::InstructionFlow;
 use fyida_loader::RawLoadOptions;
 use serde::{Deserialize, Serialize};
 
@@ -22,7 +23,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.25.0-alpha.1 已支持 headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python 标注动作写入、headless `--save-project` 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.26.0-alpha.1 已支持 headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -74,7 +75,7 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "QUERY",
-        help = "在 headless 报告中搜索函数、字符串、导入导出、xref、调用图、伪代码、IR、类型和字节序列"
+        help = "在 headless 报告中搜索函数、字符串、导入导出、xref、CFG、调用图、伪代码、IR、类型和字节序列"
     )]
     pub search: Option<String>,
 
@@ -172,6 +173,7 @@ pub enum ExportKind {
     Imports,
     Exports,
     Xrefs,
+    Cfg,
     CallGraph,
     RuntimeSignatures,
     Pseudocode,
@@ -266,6 +268,7 @@ struct AnalysisReport {
     relocations: Vec<RelocationRecord>,
     xrefs: Vec<XrefRecord>,
     cfg_count: usize,
+    cfg_records: Vec<CfgRecord>,
     call_graph_nodes: usize,
     call_graph_edges: usize,
     call_graph_node_records: Vec<CallGraphNodeRecord>,
@@ -327,6 +330,41 @@ struct XrefRecord {
     to_va: u64,
     kind: String,
     label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CfgRecord {
+    function_start: u64,
+    block_count: usize,
+    edge_count: usize,
+    blocks: Vec<CfgBlockRecord>,
+    edges: Vec<CfgEdgeRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct CfgBlockRecord {
+    start_va: u64,
+    end_va: u64,
+    instruction_count: usize,
+    call_count: usize,
+    instructions: Vec<CfgInstructionRecord>,
+}
+
+#[derive(Debug, Serialize)]
+struct CfgInstructionRecord {
+    address: u64,
+    bytes: String,
+    mnemonic: String,
+    operands: String,
+    flow: String,
+    branch_target: Option<u64>,
+}
+
+#[derive(Debug, Serialize)]
+struct CfgEdgeRecord {
+    from_va: u64,
+    to_va: u64,
+    kind: String,
 }
 
 #[derive(Debug, Serialize)]
@@ -1422,6 +1460,46 @@ fn analysis_report(analysis: &StaticAnalysis) -> AnalysisReport {
             })
             .collect(),
         cfg_count: analysis.function_cfgs.len(),
+        cfg_records: analysis
+            .function_cfgs
+            .iter()
+            .map(|cfg| CfgRecord {
+                function_start: cfg.function_start,
+                block_count: cfg.blocks.len(),
+                edge_count: cfg.edges.len(),
+                blocks: cfg
+                    .blocks
+                    .iter()
+                    .map(|block| CfgBlockRecord {
+                        start_va: block.start_va,
+                        end_va: block.end_va,
+                        instruction_count: block.instruction_count,
+                        call_count: block.call_count,
+                        instructions: block
+                            .instructions
+                            .iter()
+                            .map(|instruction| CfgInstructionRecord {
+                                address: instruction.address,
+                                bytes: instruction.bytes.clone(),
+                                mnemonic: instruction.mnemonic.clone(),
+                                operands: instruction.operands.clone(),
+                                flow: instruction_flow_label(instruction.flow).to_owned(),
+                                branch_target: instruction.branch_target,
+                            })
+                            .collect(),
+                    })
+                    .collect(),
+                edges: cfg
+                    .edges
+                    .iter()
+                    .map(|edge| CfgEdgeRecord {
+                        from_va: edge.from_va,
+                        to_va: edge.to_va,
+                        kind: edge.kind.label().to_owned(),
+                    })
+                    .collect(),
+            })
+            .collect(),
         call_graph_nodes: analysis.call_graph.nodes.len(),
         call_graph_edges: analysis.call_graph.edges.len(),
         call_graph_node_records: analysis
@@ -1683,6 +1761,85 @@ fn build_search_report(
                 format!("{:016X} -> {:016X}", xref.from_va, xref.to_va),
                 format!("{} {}", xref.kind, xref.label),
             );
+        }
+    }
+
+    for cfg in &analysis.cfg_records {
+        if address_matches(cfg.function_start, query) {
+            push_search(
+                &mut results,
+                "cfg_block",
+                Some(cfg.function_start),
+                format!("{:016X}", cfg.function_start),
+                format!(
+                    "function CFG blocks {} edges {}",
+                    cfg.block_count, cfg.edge_count
+                ),
+            );
+        }
+        for block in &cfg.blocks {
+            if address_matches(block.start_va, query)
+                || address_matches(block.end_va, query)
+                || matches_text(query, ["basic block", "cfg block"])
+            {
+                push_search(
+                    &mut results,
+                    "cfg_block",
+                    Some(block.start_va),
+                    format!("{:016X}-{:016X}", block.start_va, block.end_va),
+                    format!(
+                        "function {:016X}, instructions {}, calls {}",
+                        cfg.function_start, block.instruction_count, block.call_count
+                    ),
+                );
+            }
+            for instruction in &block.instructions {
+                if matches_text(
+                    query,
+                    [
+                        &instruction.bytes,
+                        &instruction.mnemonic,
+                        &instruction.operands,
+                        &instruction.flow,
+                    ],
+                ) || address_matches(instruction.address, query)
+                    || instruction
+                        .branch_target
+                        .map(|target| address_matches(target, query))
+                        .unwrap_or(false)
+                {
+                    push_search(
+                        &mut results,
+                        "cfg_instruction",
+                        Some(instruction.address),
+                        format!("{:016X} {}", instruction.address, instruction.mnemonic),
+                        format!(
+                            "{} {} [{}] target {}",
+                            instruction.bytes,
+                            instruction.operands,
+                            instruction.flow,
+                            instruction
+                                .branch_target
+                                .map(format_va)
+                                .unwrap_or_else(|| "-".to_owned())
+                        ),
+                    );
+                }
+            }
+        }
+        for edge in &cfg.edges {
+            if matches_text(query, [&edge.kind])
+                || address_matches(edge.from_va, query)
+                || address_matches(edge.to_va, query)
+            {
+                push_search(
+                    &mut results,
+                    "cfg_edge",
+                    Some(edge.from_va),
+                    format!("{:016X} -> {:016X}", edge.from_va, edge.to_va),
+                    format!("function {:016X}, {}", cfg.function_start, edge.kind),
+                );
+            }
         }
     }
 
@@ -2019,6 +2176,7 @@ fn text_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Imports => text_imports(&report.analysis.imports),
         ExportKind::Exports => text_exports(&report.analysis.exports),
         ExportKind::Xrefs => text_xrefs(&report.analysis.xrefs),
+        ExportKind::Cfg => text_cfg(&report.analysis.cfg_records),
         ExportKind::CallGraph => text_call_graph(
             &report.analysis.call_graph_node_records,
             &report.analysis.call_graph_edge_records,
@@ -2073,6 +2231,13 @@ fn text_full_report(report: &HeadlessReport) -> String {
     let _ = writeln!(text, "  Relocations：{}", report.analysis.relocations.len());
     let _ = writeln!(text, "  Xrefs：{}", report.analysis.xrefs.len());
     let _ = writeln!(text, "  CFGs：{}", report.analysis.cfg_count);
+    for cfg in report.analysis.cfg_records.iter().take(16) {
+        let _ = writeln!(
+            text,
+            "    {:016X} blocks {} edges {}",
+            cfg.function_start, cfg.block_count, cfg.edge_count
+        );
+    }
     let _ = writeln!(
         text,
         "  CallGraph：{} nodes / {} edges",
@@ -2149,6 +2314,7 @@ fn text_summary_report(report: &HeadlessReport) -> String {
     let _ = writeln!(text, "Imports: {}", report.analysis.imports.len());
     let _ = writeln!(text, "Exports: {}", report.analysis.exports.len());
     let _ = writeln!(text, "Xrefs: {}", report.analysis.xrefs.len());
+    let _ = writeln!(text, "CFGs: {}", report.analysis.cfg_count);
     let _ = writeln!(
         text,
         "CallGraph: {} nodes / {} edges",
@@ -2237,6 +2403,50 @@ fn text_xrefs(xrefs: &[XrefRecord]) -> String {
             "{:016X}\t{:016X}\t{}\t{}",
             xref.from_va, xref.to_va, xref.kind, xref.label
         );
+    }
+    text
+}
+
+fn text_cfg(cfgs: &[CfgRecord]) -> String {
+    let mut text = String::from("CFG\n");
+    for cfg in cfgs {
+        let _ = writeln!(
+            text,
+            "\nFunction {:016X} blocks {} edges {}",
+            cfg.function_start, cfg.block_count, cfg.edge_count
+        );
+        text.push_str("Blocks\n");
+        for block in &cfg.blocks {
+            let _ = writeln!(
+                text,
+                "  {:016X}-{:016X} insns {} calls {}",
+                block.start_va, block.end_va, block.instruction_count, block.call_count
+            );
+            for instruction in &block.instructions {
+                let branch = instruction
+                    .branch_target
+                    .map(format_va)
+                    .unwrap_or_else(|| "-".to_owned());
+                let _ = writeln!(
+                    text,
+                    "    {:016X}\t{}\t{}\t{}\t{}\t{}",
+                    instruction.address,
+                    instruction.bytes,
+                    instruction.mnemonic,
+                    instruction.operands,
+                    instruction.flow,
+                    branch
+                );
+            }
+        }
+        text.push_str("Edges\n");
+        for edge in &cfg.edges {
+            let _ = writeln!(
+                text,
+                "  {:016X}\t{:016X}\t{}",
+                edge.from_va, edge.to_va, edge.kind
+            );
+        }
     }
     text
 }
@@ -2452,6 +2662,7 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Imports => csv_imports(&report.analysis.imports),
         ExportKind::Exports => csv_exports(&report.analysis.exports),
         ExportKind::Xrefs => csv_xrefs(&report.analysis.xrefs),
+        ExportKind::Cfg => csv_cfg(&report.analysis.cfg_records),
         ExportKind::CallGraph => csv_call_graph(
             &report.analysis.call_graph_node_records,
             &report.analysis.call_graph_edge_records,
@@ -2496,6 +2707,10 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
             push_csv_row(
                 &mut csv,
                 &["summary", "xrefs", &report.analysis.xrefs.len().to_string()],
+            );
+            push_csv_row(
+                &mut csv,
+                &["summary", "cfgs", &report.analysis.cfg_count.to_string()],
             );
             push_csv_row(
                 &mut csv,
@@ -2588,6 +2803,7 @@ fn csv_summary(report: &HeadlessReport) -> String {
         &mut csv,
         &["xrefs", &report.analysis.xrefs.len().to_string()],
     );
+    push_csv_row(&mut csv, &["cfgs", &report.analysis.cfg_count.to_string()]);
     push_csv_row(
         &mut csv,
         &[
@@ -2725,6 +2941,102 @@ fn csv_xrefs(xrefs: &[XrefRecord]) -> String {
                 &xref.label,
             ],
         );
+    }
+    csv
+}
+
+fn csv_cfg(cfgs: &[CfgRecord]) -> String {
+    let mut csv = String::from(
+        "record,function_start,block_start,block_end,instruction_count,call_count,address,bytes,mnemonic,operands,flow,branch_target,edge_from,edge_to,edge_kind\n",
+    );
+    for cfg in cfgs {
+        push_csv_row(
+            &mut csv,
+            &[
+                "function",
+                &format_va(cfg.function_start),
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+                "",
+            ],
+        );
+        for block in &cfg.blocks {
+            push_csv_row(
+                &mut csv,
+                &[
+                    "block",
+                    &format_va(cfg.function_start),
+                    &format_va(block.start_va),
+                    &format_va(block.end_va),
+                    &block.instruction_count.to_string(),
+                    &block.call_count.to_string(),
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                ],
+            );
+            for instruction in &block.instructions {
+                let branch_target = instruction.branch_target.map(format_va).unwrap_or_default();
+                push_csv_row(
+                    &mut csv,
+                    &[
+                        "instruction",
+                        &format_va(cfg.function_start),
+                        &format_va(block.start_va),
+                        &format_va(block.end_va),
+                        "",
+                        "",
+                        &format_va(instruction.address),
+                        &instruction.bytes,
+                        &instruction.mnemonic,
+                        &instruction.operands,
+                        &instruction.flow,
+                        &branch_target,
+                        "",
+                        "",
+                        "",
+                    ],
+                );
+            }
+        }
+        for edge in &cfg.edges {
+            push_csv_row(
+                &mut csv,
+                &[
+                    "edge",
+                    &format_va(cfg.function_start),
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    "",
+                    &format_va(edge.from_va),
+                    &format_va(edge.to_va),
+                    &edge.kind,
+                ],
+            );
+        }
     }
     csv
 }
@@ -2978,6 +3290,19 @@ fn csv_escape(value: &str) -> String {
 
 fn format_va(address: u64) -> String {
     format!("{address:016X}")
+}
+
+fn instruction_flow_label(flow: InstructionFlow) -> &'static str {
+    match flow {
+        InstructionFlow::Next => "next",
+        InstructionFlow::DirectCall => "direct call",
+        InstructionFlow::IndirectCall => "indirect call",
+        InstructionFlow::UnconditionalBranch => "unconditional branch",
+        InstructionFlow::IndirectBranch => "indirect branch",
+        InstructionFlow::ConditionalBranch => "conditional branch",
+        InstructionFlow::Return => "return",
+        InstructionFlow::Other => "other",
+    }
 }
 
 fn collect_batch_files(root: &Path, recursive: bool) -> Result<Vec<PathBuf>, String> {
@@ -3304,6 +3629,14 @@ mod tests {
     }
 
     #[test]
+    fn parses_cfg_export_kind() {
+        let cli =
+            Cli::try_parse_from(["fy_ida", "--headless", "--export", "cfg", "sample.exe"]).unwrap();
+
+        assert_eq!(cli.export, ExportKind::Cfg);
+    }
+
+    #[test]
     fn parses_search_query_and_export_kind() {
         let cli = Cli::try_parse_from([
             "fy_ida",
@@ -3376,6 +3709,40 @@ mod tests {
             .results
             .iter()
             .any(|result| result.category == "type" && result.label == "QUOTED_TYPE"));
+    }
+
+    #[test]
+    fn search_report_finds_cfg_blocks_edges_and_instructions() {
+        let input = sample_input_report();
+        let analysis = sample_analysis_report();
+        let types = sample_type_library_report();
+
+        let block_search = build_search_report(
+            Some("0x140001000"),
+            &input,
+            b"MZ\x90\x00",
+            &analysis,
+            &types,
+        )
+        .unwrap();
+        let instruction_search =
+            build_search_report(Some("mov"), &input, b"MZ\x90\x00", &analysis, &types).unwrap();
+        let edge_search =
+            build_search_report(Some("顺序流"), &input, b"MZ\x90\x00", &analysis, &types).unwrap();
+
+        assert!(block_search
+            .results
+            .iter()
+            .any(|result| result.category == "cfg_block"));
+        assert!(instruction_search
+            .results
+            .iter()
+            .any(|result| result.category == "cfg_instruction"
+                && result.address == Some(0x0000_0001_4000_1000)));
+        assert!(edge_search
+            .results
+            .iter()
+            .any(|result| result.category == "cfg_edge"));
     }
 
     #[test]
@@ -3476,7 +3843,7 @@ mod tests {
 
         let document = project_document_from_report(&report).unwrap();
 
-        assert_eq!(document.app_version, "0.25.0-alpha.1");
+        assert_eq!(document.app_version, "0.26.0-alpha.1");
         assert_eq!(document.functions[0].name, "renamed_func");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         assert_eq!(document.annotations.comments[0].text, "automation note");
@@ -3628,6 +3995,21 @@ mod tests {
         assert!(csv.contains("quoted import call"));
     }
 
+    #[test]
+    fn cfg_text_and_csv_include_blocks_edges_and_instructions() {
+        let analysis = sample_analysis_report();
+
+        let text = text_cfg(&analysis.cfg_records);
+        let csv = csv_cfg(&analysis.cfg_records);
+
+        assert!(text.contains("Function 0000000140001000 blocks 2 edges 1"));
+        assert!(text.contains("0000000140001000\t48 8B C1\tmov\trax, rcx\tnext"));
+        assert!(text.contains("顺序流"));
+        assert!(csv.contains("record,function_start,block_start"));
+        assert!(csv.contains("instruction,0000000140001000,0000000140001000"));
+        assert!(csv.contains("edge,0000000140001000"));
+    }
+
     fn sample_pseudocode_record() -> PseudocodeRecord {
         PseudocodeRecord {
             function_start: 0x0000_0001_4000_1000,
@@ -3649,7 +4031,7 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.25.0-alpha.1".to_owned(),
+            version: "0.26.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),
@@ -3760,6 +4142,46 @@ mod tests {
                 label: "quoted import".to_owned(),
             }],
             cfg_count: 1,
+            cfg_records: vec![CfgRecord {
+                function_start: 0x0000_0001_4000_1000,
+                block_count: 2,
+                edge_count: 1,
+                blocks: vec![
+                    CfgBlockRecord {
+                        start_va: 0x0000_0001_4000_1000,
+                        end_va: 0x0000_0001_4000_1004,
+                        instruction_count: 1,
+                        call_count: 0,
+                        instructions: vec![CfgInstructionRecord {
+                            address: 0x0000_0001_4000_1000,
+                            bytes: "48 8B C1".to_owned(),
+                            mnemonic: "mov".to_owned(),
+                            operands: "rax, rcx".to_owned(),
+                            flow: "next".to_owned(),
+                            branch_target: None,
+                        }],
+                    },
+                    CfgBlockRecord {
+                        start_va: 0x0000_0001_4000_1004,
+                        end_va: 0x0000_0001_4000_1005,
+                        instruction_count: 1,
+                        call_count: 0,
+                        instructions: vec![CfgInstructionRecord {
+                            address: 0x0000_0001_4000_1004,
+                            bytes: "C3".to_owned(),
+                            mnemonic: "ret".to_owned(),
+                            operands: String::new(),
+                            flow: "return".to_owned(),
+                            branch_target: None,
+                        }],
+                    },
+                ],
+                edges: vec![CfgEdgeRecord {
+                    from_va: 0x0000_0001_4000_1000,
+                    to_va: 0x0000_0001_4000_1004,
+                    kind: "顺序流".to_owned(),
+                }],
+            }],
             call_graph_nodes: 2,
             call_graph_edges: 1,
             call_graph_node_records: vec![

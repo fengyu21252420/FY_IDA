@@ -4,6 +4,38 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.26.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added detailed `cfg_records` to headless JSON reports with function CFG blocks, edges, and decoded block instructions.
+- Added `--export cfg` for text and CSV CFG output.
+- Added CFG block, instruction, and edge coverage to headless search results.
+- Added `cfgs`, `cfg_for`, `basic_blocks`, `cfg_edges`, and `instructions` helpers to `examples/python/fyida.py`.
+- Added `examples/scripts/list_cfg.py` for CFG scripting examples.
+- Added CLI unit coverage for CFG export parsing, text/CSV output, and CFG search hits.
+
+### Changed
+
+- Updated the workspace version to `0.26.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the headless CFG export checkpoint.
+- Headless summaries now include CFG counts alongside function, string, import, xref, call graph, pseudocode, automation, and type counts.
+
+### Fixed
+
+- Headless JSON no longer exposes only CFG counts; scripts can now consume block, edge, and instruction-level CFG records directly.
+
+### Known Issues
+
+- Detailed CFG export currently covers the generated CFG model, not a rendered graph layout.
+- CFG generation remains based on the current conservative function decode; richer jump-table expansion and recursive intra-function discovery remain future work.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.26.0-alpha.1`.
+- Roll back with: `git checkout v0.26.0-alpha.1`.
+
 ## v0.25.0-alpha.1 - 2026-06-23
 
 ### Added
