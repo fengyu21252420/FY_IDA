@@ -6,7 +6,7 @@ use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 
 pub const APP_NAME: &str = "FY_IDA";
-pub const PROJECT_SCHEMA_VERSION: u32 = 2;
+pub const PROJECT_SCHEMA_VERSION: u32 = 3;
 const MAX_NAVIGATION_HISTORY: usize = 128;
 pub const PE_DIRECTORY_EXPORT: usize = 0;
 pub const PE_DIRECTORY_IMPORT: usize = 1;
@@ -118,6 +118,179 @@ pub struct ProjectType {
     pub name: String,
     pub kind: String,
     pub source: String,
+    #[serde(default)]
+    pub definition: Option<TypeDefinition>,
+}
+
+impl ProjectType {
+    pub fn simple(
+        name: impl Into<String>,
+        kind: impl Into<String>,
+        source: impl Into<String>,
+    ) -> Self {
+        Self {
+            name: name.into(),
+            kind: kind.into(),
+            source: source.into(),
+            definition: None,
+        }
+    }
+
+    pub fn with_definition(
+        name: impl Into<String>,
+        source: impl Into<String>,
+        definition: TypeDefinition,
+    ) -> Self {
+        let kind = definition.label().to_owned();
+        Self {
+            name: name.into(),
+            kind,
+            source: source.into(),
+            definition: Some(definition),
+        }
+    }
+
+    pub fn display_signature(&self) -> String {
+        match &self.definition {
+            Some(definition) => definition.signature(&self.name),
+            None => format!("{} {}", self.kind, self.name),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(tag = "definition_kind", rename_all = "snake_case")]
+pub enum TypeDefinition {
+    Integer {
+        signed: bool,
+        bits: u16,
+    },
+    Pointer {
+        to: String,
+    },
+    Array {
+        element: String,
+        count: u64,
+    },
+    Struct {
+        fields: Vec<TypeField>,
+    },
+    Union {
+        fields: Vec<TypeField>,
+    },
+    Enum {
+        variants: Vec<EnumVariant>,
+    },
+    Typedef {
+        target: String,
+    },
+    Function {
+        return_type: String,
+        calling_convention: String,
+        parameters: Vec<TypeParameter>,
+    },
+    Opaque,
+}
+
+impl TypeDefinition {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Integer { .. } => "integer",
+            Self::Pointer { .. } => "pointer",
+            Self::Array { .. } => "array",
+            Self::Struct { .. } => "struct",
+            Self::Union { .. } => "union",
+            Self::Enum { .. } => "enum",
+            Self::Typedef { .. } => "typedef",
+            Self::Function { .. } => "function",
+            Self::Opaque => "opaque",
+        }
+    }
+
+    pub fn signature(&self, name: &str) -> String {
+        match self {
+            Self::Integer { signed, bits } => {
+                let prefix = if *signed { "int" } else { "uint" };
+                format!("{prefix}{bits}_t {name}")
+            }
+            Self::Pointer { to } => format!("{to} *{name}"),
+            Self::Array { element, count } => format!("{element} {name}[{count}]"),
+            Self::Struct { fields } => format!("struct {name} ({} fields)", fields.len()),
+            Self::Union { fields } => format!("union {name} ({} fields)", fields.len()),
+            Self::Enum { variants } => format!("enum {name} ({} variants)", variants.len()),
+            Self::Typedef { target } => format!("typedef {target} {name}"),
+            Self::Function {
+                return_type,
+                calling_convention,
+                parameters,
+            } => {
+                let params = if parameters.is_empty() {
+                    "void".to_owned()
+                } else {
+                    parameters
+                        .iter()
+                        .map(|parameter| format!("{} {}", parameter.type_name, parameter.name))
+                        .collect::<Vec<_>>()
+                        .join(", ")
+                };
+                if calling_convention.is_empty() {
+                    format!("{return_type} {name}({params})")
+                } else {
+                    format!("{return_type} {calling_convention} {name}({params})")
+                }
+            }
+            Self::Opaque => format!("opaque {name}"),
+        }
+    }
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeField {
+    pub name: String,
+    pub type_name: String,
+    #[serde(default)]
+    pub offset: Option<u64>,
+    #[serde(default)]
+    pub size: Option<u64>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct EnumVariant {
+    pub name: String,
+    pub value: i64,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct TypeParameter {
+    pub name: String,
+    pub type_name: String,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, PartialOrd, Ord, Serialize, Deserialize)]
+pub enum ProjectTypeTarget {
+    Address(u64),
+    Function(u64),
+}
+
+impl ProjectTypeTarget {
+    pub fn address(self) -> u64 {
+        match self {
+            Self::Address(address) | Self::Function(address) => address,
+        }
+    }
+
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Address(_) => "address",
+            Self::Function(_) => "function",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectTypeApplication {
+    pub target: ProjectTypeTarget,
+    pub type_name: String,
 }
 
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -191,6 +364,8 @@ pub struct ProjectDocument {
     #[serde(default)]
     pub types: Vec<ProjectType>,
     #[serde(default)]
+    pub type_applications: Vec<ProjectTypeApplication>,
+    #[serde(default)]
     pub source_files: Vec<ProjectSourceFile>,
     pub annotations: UserAnnotations,
 }
@@ -203,6 +378,7 @@ impl ProjectDocument {
         debug_info: Option<ProjectDebugInfo>,
         symbols: Vec<ProjectSymbol>,
         types: Vec<ProjectType>,
+        type_applications: Vec<ProjectTypeApplication>,
         source_files: Vec<ProjectSourceFile>,
         annotations: UserAnnotations,
     ) -> Self {
@@ -214,6 +390,7 @@ impl ProjectDocument {
             debug_info,
             symbols,
             types,
+            type_applications,
             source_files,
             annotations,
         }
@@ -666,6 +843,8 @@ pub struct ProjectState {
     function_comments: BTreeMap<u64, String>,
     bookmarks: BTreeSet<u64>,
     manual_definitions: BTreeMap<u64, ManualDefinitionKind>,
+    type_definitions: BTreeMap<String, ProjectType>,
+    type_applications: BTreeMap<ProjectTypeTarget, String>,
     undo_stack: Vec<AnnotationCommand>,
     redo_stack: Vec<AnnotationCommand>,
     back_stack: Vec<NavigationPoint>,
@@ -689,6 +868,11 @@ impl Default for ProjectState {
             function_comments: BTreeMap::new(),
             bookmarks: BTreeSet::new(),
             manual_definitions: BTreeMap::new(),
+            type_definitions: builtin_type_library()
+                .into_iter()
+                .map(|item| (item.name.clone(), item))
+                .collect(),
+            type_applications: BTreeMap::new(),
             undo_stack: Vec::new(),
             redo_stack: Vec::new(),
             back_stack: Vec::new(),
@@ -762,6 +946,36 @@ impl ProjectState {
 
     pub fn manual_definition(&self, address: u64) -> Option<ManualDefinitionKind> {
         self.manual_definitions.get(&address).copied()
+    }
+
+    pub fn project_types(&self) -> Vec<ProjectType> {
+        self.type_definitions.values().cloned().collect()
+    }
+
+    pub fn project_type(&self, name: &str) -> Option<&ProjectType> {
+        self.type_definitions.get(name)
+    }
+
+    pub fn type_applications(&self) -> Vec<ProjectTypeApplication> {
+        self.type_applications
+            .iter()
+            .map(|(target, type_name)| ProjectTypeApplication {
+                target: *target,
+                type_name: type_name.clone(),
+            })
+            .collect()
+    }
+
+    pub fn applied_type(&self, target: ProjectTypeTarget) -> Option<&str> {
+        self.type_applications.get(&target).map(String::as_str)
+    }
+
+    pub fn applied_address_type(&self, address: u64) -> Option<&str> {
+        self.applied_type(ProjectTypeTarget::Address(address))
+    }
+
+    pub fn applied_function_type(&self, function_start: u64) -> Option<&str> {
+        self.applied_type(ProjectTypeTarget::Function(function_start))
     }
 
     pub fn can_undo(&self) -> bool {
@@ -1034,6 +1248,71 @@ impl ProjectState {
         self.redo_stack.clear();
     }
 
+    pub fn upsert_project_type(&mut self, type_item: ProjectType) {
+        if type_item.name.trim().is_empty() {
+            return;
+        }
+        self.type_definitions
+            .insert(type_item.name.trim().to_owned(), type_item);
+        self.dirty = true;
+    }
+
+    pub fn upsert_project_types(&mut self, types: impl IntoIterator<Item = ProjectType>) -> usize {
+        let mut count = 0;
+        for type_item in types {
+            if type_item.name.trim().is_empty() {
+                continue;
+            }
+            self.type_definitions
+                .insert(type_item.name.trim().to_owned(), type_item);
+            count += 1;
+        }
+        if count > 0 {
+            self.dirty = true;
+        }
+        count
+    }
+
+    pub fn replace_project_types(&mut self, types: Vec<ProjectType>) {
+        self.type_definitions = builtin_type_library()
+            .into_iter()
+            .map(|item| (item.name.clone(), item))
+            .collect();
+        for type_item in types {
+            if type_item.name.trim().is_empty() {
+                continue;
+            }
+            self.type_definitions
+                .insert(type_item.name.trim().to_owned(), type_item);
+        }
+        self.dirty = false;
+    }
+
+    pub fn apply_type_to_target(
+        &mut self,
+        target: ProjectTypeTarget,
+        type_name: impl Into<String>,
+    ) {
+        let type_name = type_name.into().trim().to_owned();
+        if type_name.is_empty() {
+            self.type_applications.remove(&target);
+        } else {
+            self.type_applications.insert(target, type_name);
+        }
+        self.dirty = true;
+    }
+
+    pub fn replace_type_applications(&mut self, applications: Vec<ProjectTypeApplication>) {
+        self.type_applications = applications
+            .into_iter()
+            .filter_map(|application| {
+                let type_name = application.type_name.trim().to_owned();
+                (!type_name.is_empty()).then_some((application.target, type_name))
+            })
+            .collect();
+        self.dirty = false;
+    }
+
     pub fn undo(&mut self) -> bool {
         let Some(command) = self.undo_stack.pop() else {
             return false;
@@ -1129,6 +1408,11 @@ impl ProjectState {
         self.function_comments.clear();
         self.bookmarks.clear();
         self.manual_definitions.clear();
+        self.type_definitions = builtin_type_library()
+            .into_iter()
+            .map(|item| (item.name.clone(), item))
+            .collect();
+        self.type_applications.clear();
         self.undo_stack.clear();
         self.redo_stack.clear();
     }
@@ -1201,6 +1485,579 @@ impl ProjectState {
         }
         self.dirty = true;
     }
+}
+
+pub fn builtin_type_library() -> Vec<ProjectType> {
+    let mut types = Vec::new();
+    for (name, signed, bits) in [
+        ("int8_t", true, 8),
+        ("uint8_t", false, 8),
+        ("int16_t", true, 16),
+        ("uint16_t", false, 16),
+        ("int32_t", true, 32),
+        ("uint32_t", false, 32),
+        ("int64_t", true, 64),
+        ("uint64_t", false, 64),
+    ] {
+        types.push(ProjectType::with_definition(
+            name,
+            "builtin:crt",
+            TypeDefinition::Integer { signed, bits },
+        ));
+    }
+
+    for (name, target, source) in [
+        ("void", "void", "builtin:c"),
+        ("char", "char", "builtin:c"),
+        ("wchar_t", "wchar_t", "builtin:c"),
+        ("bool", "bool", "builtin:c"),
+        ("BYTE", "uint8_t", "builtin:windows"),
+        ("WORD", "uint16_t", "builtin:windows"),
+        ("DWORD", "uint32_t", "builtin:windows"),
+        ("QWORD", "uint64_t", "builtin:windows"),
+        ("BOOL", "int32_t", "builtin:windows"),
+        ("HRESULT", "int32_t", "builtin:windows"),
+        ("CHAR", "char", "builtin:windows"),
+        ("WCHAR", "wchar_t", "builtin:windows"),
+        ("size_t", "uint64_t", "builtin:crt"),
+        ("intptr_t", "int64_t", "builtin:crt"),
+        ("uintptr_t", "uint64_t", "builtin:crt"),
+        ("errno_t", "int32_t", "builtin:crt"),
+    ] {
+        types.push(ProjectType::with_definition(
+            name,
+            source,
+            TypeDefinition::Typedef {
+                target: target.to_owned(),
+            },
+        ));
+    }
+
+    for (name, to, source) in [
+        ("PVOID", "void", "builtin:windows"),
+        ("LPVOID", "void", "builtin:windows"),
+        ("LPCVOID", "const void", "builtin:windows"),
+        ("LPSTR", "CHAR", "builtin:windows"),
+        ("LPCSTR", "const CHAR", "builtin:windows"),
+        ("LPWSTR", "WCHAR", "builtin:windows"),
+        ("LPCWSTR", "const WCHAR", "builtin:windows"),
+        ("HANDLE", "void", "builtin:windows"),
+        ("HMODULE", "void", "builtin:windows"),
+        ("HWND", "void", "builtin:windows"),
+        ("FILE", "void", "builtin:crt"),
+        ("va_list", "char", "builtin:crt"),
+    ] {
+        types.push(ProjectType::with_definition(
+            name,
+            source,
+            TypeDefinition::Pointer { to: to.to_owned() },
+        ));
+    }
+
+    types.extend([
+        ProjectType::with_definition(
+            "memcpy",
+            "builtin:crt",
+            TypeDefinition::Function {
+                return_type: "void *".to_owned(),
+                calling_convention: "__cdecl".to_owned(),
+                parameters: vec![
+                    TypeParameter {
+                        name: "dest".to_owned(),
+                        type_name: "void *".to_owned(),
+                    },
+                    TypeParameter {
+                        name: "src".to_owned(),
+                        type_name: "const void *".to_owned(),
+                    },
+                    TypeParameter {
+                        name: "count".to_owned(),
+                        type_name: "size_t".to_owned(),
+                    },
+                ],
+            },
+        ),
+        ProjectType::with_definition(
+            "memset",
+            "builtin:crt",
+            TypeDefinition::Function {
+                return_type: "void *".to_owned(),
+                calling_convention: "__cdecl".to_owned(),
+                parameters: vec![
+                    TypeParameter {
+                        name: "dest".to_owned(),
+                        type_name: "void *".to_owned(),
+                    },
+                    TypeParameter {
+                        name: "value".to_owned(),
+                        type_name: "int".to_owned(),
+                    },
+                    TypeParameter {
+                        name: "count".to_owned(),
+                        type_name: "size_t".to_owned(),
+                    },
+                ],
+            },
+        ),
+        ProjectType::with_definition(
+            "memcmp",
+            "builtin:crt",
+            TypeDefinition::Function {
+                return_type: "int".to_owned(),
+                calling_convention: "__cdecl".to_owned(),
+                parameters: vec![
+                    TypeParameter {
+                        name: "left".to_owned(),
+                        type_name: "const void *".to_owned(),
+                    },
+                    TypeParameter {
+                        name: "right".to_owned(),
+                        type_name: "const void *".to_owned(),
+                    },
+                    TypeParameter {
+                        name: "count".to_owned(),
+                        type_name: "size_t".to_owned(),
+                    },
+                ],
+            },
+        ),
+    ]);
+
+    types
+}
+
+pub fn import_c_header_types(source_name: impl Into<String>, text: &str) -> Vec<ProjectType> {
+    let source_name = source_name.into();
+    split_c_declarations(&strip_c_comments(text))
+        .into_iter()
+        .filter_map(|declaration| parse_c_declaration(&source_name, &declaration))
+        .collect()
+}
+
+pub fn export_c_header_types(types: &[ProjectType]) -> String {
+    let mut output = String::new();
+    output.push_str("/* Generated by FY_IDA type system. */\n#pragma once\n\n");
+    for type_item in types {
+        if let Some(declaration) = type_to_c_declaration(type_item) {
+            output.push_str(&declaration);
+            if !declaration.ends_with('\n') {
+                output.push('\n');
+            }
+            output.push('\n');
+        }
+    }
+    output
+}
+
+fn strip_c_comments(text: &str) -> String {
+    let mut output = String::with_capacity(text.len());
+    let mut chars = text.chars().peekable();
+    while let Some(character) = chars.next() {
+        if character == '/' {
+            match chars.peek().copied() {
+                Some('/') => {
+                    chars.next();
+                    for next in chars.by_ref() {
+                        if next == '\n' {
+                            output.push('\n');
+                            break;
+                        }
+                    }
+                }
+                Some('*') => {
+                    chars.next();
+                    let mut previous = '\0';
+                    for next in chars.by_ref() {
+                        if previous == '*' && next == '/' {
+                            break;
+                        }
+                        previous = next;
+                    }
+                }
+                _ => output.push(character),
+            }
+        } else {
+            output.push(character);
+        }
+    }
+    output
+}
+
+fn split_c_declarations(text: &str) -> Vec<String> {
+    let mut declarations = Vec::new();
+    let mut current = String::new();
+    let mut brace_depth = 0usize;
+
+    for character in text.chars() {
+        current.push(character);
+        match character {
+            '{' => brace_depth = brace_depth.saturating_add(1),
+            '}' => brace_depth = brace_depth.saturating_sub(1),
+            ';' if brace_depth == 0 => {
+                let declaration = current.trim();
+                if !declaration.is_empty() {
+                    declarations.push(declaration.to_owned());
+                }
+                current.clear();
+            }
+            _ => {}
+        }
+    }
+
+    let trailing = current.trim();
+    if !trailing.is_empty() {
+        declarations.push(trailing.to_owned());
+    }
+    declarations
+}
+
+fn parse_c_declaration(source_name: &str, declaration: &str) -> Option<ProjectType> {
+    let declaration = declaration.trim().trim_end_matches(';').trim();
+    if declaration.is_empty() || declaration.starts_with('#') {
+        return None;
+    }
+
+    if declaration.contains('{') && declaration.contains('}') {
+        if declaration.contains("struct") {
+            return parse_c_aggregate(source_name, declaration, "struct");
+        }
+        if declaration.contains("union") {
+            return parse_c_aggregate(source_name, declaration, "union");
+        }
+        if declaration.contains("enum") {
+            return parse_c_enum(source_name, declaration);
+        }
+    }
+
+    if declaration.starts_with("typedef ") {
+        return parse_c_typedef(source_name, declaration);
+    }
+
+    parse_c_function_prototype(source_name, declaration)
+}
+
+fn parse_c_aggregate(source_name: &str, declaration: &str, keyword: &str) -> Option<ProjectType> {
+    let body_start = declaration.find('{')?;
+    let body_end = declaration.rfind('}')?;
+    let head = declaration[..body_start].trim();
+    let body = &declaration[body_start + 1..body_end];
+    let tail = declaration[body_end + 1..].trim();
+
+    let name = aggregate_name(head, tail, keyword)?;
+    let fields = split_c_declarations(body)
+        .into_iter()
+        .filter_map(|field| parse_c_field(&field))
+        .collect::<Vec<_>>();
+    let definition = if keyword == "union" {
+        TypeDefinition::Union { fields }
+    } else {
+        TypeDefinition::Struct { fields }
+    };
+    Some(ProjectType::with_definition(
+        name,
+        format!("header:{source_name}"),
+        definition,
+    ))
+}
+
+fn parse_c_enum(source_name: &str, declaration: &str) -> Option<ProjectType> {
+    let body_start = declaration.find('{')?;
+    let body_end = declaration.rfind('}')?;
+    let head = declaration[..body_start].trim();
+    let body = &declaration[body_start + 1..body_end];
+    let tail = declaration[body_end + 1..].trim();
+    let name = aggregate_name(head, tail, "enum")?;
+    let variants = parse_c_enum_variants(body);
+    Some(ProjectType::with_definition(
+        name,
+        format!("header:{source_name}"),
+        TypeDefinition::Enum { variants },
+    ))
+}
+
+fn parse_c_typedef(source_name: &str, declaration: &str) -> Option<ProjectType> {
+    let body = declaration.strip_prefix("typedef")?.trim();
+    if body.contains('(') && body.contains(')') {
+        return parse_c_function_prototype(source_name, body);
+    }
+
+    let (target, name, array_count) = parse_c_named_type(body)?;
+    let definition = if let Some(count) = array_count {
+        TypeDefinition::Array {
+            element: target,
+            count,
+        }
+    } else if target.ends_with('*') {
+        TypeDefinition::Pointer {
+            to: target.trim_end_matches('*').trim().to_owned(),
+        }
+    } else {
+        TypeDefinition::Typedef { target }
+    };
+    Some(ProjectType::with_definition(
+        name,
+        format!("header:{source_name}"),
+        definition,
+    ))
+}
+
+fn parse_c_function_prototype(source_name: &str, declaration: &str) -> Option<ProjectType> {
+    let open = declaration.find('(')?;
+    let close = declaration.rfind(')')?;
+    if close < open {
+        return None;
+    }
+    let before = declaration[..open].trim();
+    if before.contains("if ") || before.contains("while ") || before.contains("for ") {
+        return None;
+    }
+    let (return_type, name, _) = parse_c_named_type(before)?;
+    let params_text = declaration[open + 1..close].trim();
+    let parameters = parse_c_parameters(params_text);
+    Some(ProjectType::with_definition(
+        name,
+        format!("header:{source_name}"),
+        TypeDefinition::Function {
+            return_type,
+            calling_convention: String::new(),
+            parameters,
+        },
+    ))
+}
+
+fn aggregate_name(head: &str, tail: &str, keyword: &str) -> Option<String> {
+    let tail_name = tail
+        .split_whitespace()
+        .next()
+        .map(clean_c_identifier)
+        .filter(|name| !name.is_empty());
+    if tail_name.is_some() {
+        return tail_name;
+    }
+
+    head.split_whitespace()
+        .skip_while(|token| *token != keyword)
+        .nth(1)
+        .map(clean_c_identifier)
+        .filter(|name| !name.is_empty())
+}
+
+fn parse_c_field(field: &str) -> Option<TypeField> {
+    let field = field.trim().trim_end_matches(';').trim();
+    if field.is_empty() || field.starts_with('#') {
+        return None;
+    }
+    let field = field.split(':').next().unwrap_or(field).trim();
+    let (type_name, name, array_count) = parse_c_named_type(field)?;
+    let type_name = if let Some(count) = array_count {
+        format!("{type_name}[{count}]")
+    } else {
+        type_name
+    };
+    Some(TypeField {
+        name,
+        type_name,
+        offset: None,
+        size: None,
+    })
+}
+
+fn parse_c_enum_variants(body: &str) -> Vec<EnumVariant> {
+    let mut variants = Vec::new();
+    let mut next_value = 0i64;
+    for raw in body.split(',') {
+        let raw = raw.trim();
+        if raw.is_empty() {
+            continue;
+        }
+        let (name, value) = match raw.split_once('=') {
+            Some((name, value)) => {
+                let parsed = parse_signed_number(value.trim()).unwrap_or(next_value);
+                (name.trim(), parsed)
+            }
+            None => (raw, next_value),
+        };
+        let name = clean_c_identifier(name);
+        if name.is_empty() {
+            continue;
+        }
+        variants.push(EnumVariant { name, value });
+        next_value = value.saturating_add(1);
+    }
+    variants
+}
+
+fn parse_c_parameters(text: &str) -> Vec<TypeParameter> {
+    if text.is_empty() || text == "void" {
+        return Vec::new();
+    }
+
+    text.split(',')
+        .enumerate()
+        .filter_map(|(index, parameter)| {
+            let parameter = parameter.trim();
+            if parameter == "..." {
+                return Some(TypeParameter {
+                    name: "varargs".to_owned(),
+                    type_name: "...".to_owned(),
+                });
+            }
+            let (type_name, name, _) = parse_c_named_type(parameter).unwrap_or_else(|| {
+                (
+                    normalize_c_type(parameter),
+                    format!("arg{}", index.saturating_add(1)),
+                    None,
+                )
+            });
+            Some(TypeParameter { name, type_name })
+        })
+        .collect()
+}
+
+fn parse_c_named_type(text: &str) -> Option<(String, String, Option<u64>)> {
+    let text = text.trim();
+    if text.is_empty() {
+        return None;
+    }
+
+    let (without_array, array_count) = if let Some(open) = text.rfind('[') {
+        let close = text.rfind(']')?;
+        if close > open {
+            let count = text[open + 1..close].trim().parse::<u64>().ok();
+            (text[..open].trim(), count)
+        } else {
+            (text, None)
+        }
+    } else {
+        (text, None)
+    };
+
+    let mut parts = without_array.split_whitespace().collect::<Vec<_>>();
+    let mut name = parts.pop()?.trim().to_owned();
+    let mut leading_pointer = 0usize;
+    while name.starts_with('*') {
+        leading_pointer += 1;
+        name.remove(0);
+    }
+    name = clean_c_identifier(&name);
+    if name.is_empty() {
+        return None;
+    }
+
+    let mut type_name = normalize_c_type(&parts.join(" "));
+    if leading_pointer > 0 {
+        if !type_name.is_empty() {
+            type_name.push(' ');
+        }
+        type_name.push_str(&"*".repeat(leading_pointer));
+    }
+    type_name = normalize_c_type(&type_name);
+    if type_name.is_empty() {
+        return None;
+    }
+
+    Some((type_name, name, array_count))
+}
+
+fn normalize_c_type(text: &str) -> String {
+    text.replace('\t', " ")
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ")
+}
+
+fn clean_c_identifier(text: &str) -> String {
+    text.trim()
+        .trim_matches(|character: char| !character.is_ascii_alphanumeric() && character != '_')
+        .to_owned()
+}
+
+fn parse_signed_number(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let negative = text.starts_with('-');
+    let digits = text.trim_start_matches('-').trim_start_matches('+');
+    let parsed = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        digits.parse::<i64>().ok()?
+    };
+    Some(if negative { -parsed } else { parsed })
+}
+
+fn type_to_c_declaration(type_item: &ProjectType) -> Option<String> {
+    let definition = type_item.definition.as_ref()?;
+    let name = &type_item.name;
+    match definition {
+        TypeDefinition::Integer { signed, bits } => {
+            let keyword = match (*signed, *bits) {
+                (true, 8) => "signed char",
+                (false, 8) => "unsigned char",
+                (true, 16) => "short",
+                (false, 16) => "unsigned short",
+                (true, 32) => "int",
+                (false, 32) => "unsigned int",
+                (true, 64) => "__int64",
+                (false, 64) => "unsigned __int64",
+                _ => return Some(format!("/* unsupported integer width: {name} */")),
+            };
+            Some(format!("typedef {keyword} {name};"))
+        }
+        TypeDefinition::Pointer { to } => Some(format!("typedef {to} *{name};")),
+        TypeDefinition::Array { element, count } => {
+            Some(format!("typedef {element} {name}[{count}];"))
+        }
+        TypeDefinition::Struct { fields } => Some(format_c_aggregate("struct", name, fields)),
+        TypeDefinition::Union { fields } => Some(format_c_aggregate("union", name, fields)),
+        TypeDefinition::Enum { variants } => Some(format_c_enum(name, variants)),
+        TypeDefinition::Typedef { target } => Some(format!("typedef {target} {name};")),
+        TypeDefinition::Function {
+            return_type,
+            calling_convention,
+            parameters,
+        } => {
+            let params = if parameters.is_empty() {
+                "void".to_owned()
+            } else {
+                parameters
+                    .iter()
+                    .map(|parameter| format!("{} {}", parameter.type_name, parameter.name))
+                    .collect::<Vec<_>>()
+                    .join(", ")
+            };
+            let convention = if calling_convention.is_empty() {
+                String::new()
+            } else {
+                format!("{calling_convention} ")
+            };
+            Some(format!("{return_type} {convention}{name}({params});"))
+        }
+        TypeDefinition::Opaque => Some(format!("typedef struct {name} {name};")),
+    }
+}
+
+fn format_c_aggregate(keyword: &str, name: &str, fields: &[TypeField]) -> String {
+    let mut output = format!("typedef {keyword} {name} {{\n");
+    if fields.is_empty() {
+        output.push_str("    unsigned char _opaque;\n");
+    } else {
+        for field in fields {
+            output.push_str(&format!("    {} {};\n", field.type_name, field.name));
+        }
+    }
+    output.push_str(&format!("}} {name};"));
+    output
+}
+
+fn format_c_enum(name: &str, variants: &[EnumVariant]) -> String {
+    let mut output = format!("typedef enum {name} {{\n");
+    for variant in variants {
+        output.push_str(&format!("    {} = {},\n", variant.name, variant.value));
+    }
+    output.push_str(&format!("}} {name};"));
+    output
 }
 
 pub fn format_address(value: Option<u64>, prefix: &str) -> String {
@@ -1553,8 +2410,20 @@ mod tests {
             }],
             vec![ProjectType {
                 name: "CONFIG".to_owned(),
-                kind: "UDT".to_owned(),
-                source: "udt".to_owned(),
+                kind: "struct".to_owned(),
+                source: "user".to_owned(),
+                definition: Some(TypeDefinition::Struct {
+                    fields: vec![TypeField {
+                        name: "flags".to_owned(),
+                        type_name: "DWORD".to_owned(),
+                        offset: Some(0),
+                        size: Some(4),
+                    }],
+                }),
+            }],
+            vec![ProjectTypeApplication {
+                target: ProjectTypeTarget::Address(0x1400_02000),
+                type_name: "CONFIG".to_owned(),
             }],
             vec![ProjectSourceFile {
                 path: r"C:\src\demo.cpp".to_owned(),
@@ -1576,11 +2445,77 @@ mod tests {
         assert_eq!(loaded.debug_info.as_ref().unwrap().pe_pdb_age, Some(2));
         assert_eq!(loaded.symbols[0].original_name, "?main@@YAHXZ");
         assert_eq!(loaded.types[0].name, "CONFIG");
+        assert_eq!(
+            loaded.type_applications[0].target,
+            ProjectTypeTarget::Address(0x1400_02000)
+        );
         assert_eq!(loaded.source_files[0].path, r"C:\src\demo.cpp");
         assert_eq!(loaded.annotations.names[0].name, "main");
         assert_eq!(
             loaded.annotations.manual_definitions[0].kind,
             ManualDefinitionKind::Data
         );
+    }
+
+    #[test]
+    fn type_library_tracks_applications() {
+        let mut project = ProjectState::default();
+        assert!(project.project_type("DWORD").is_some());
+
+        project.upsert_project_type(ProjectType::with_definition(
+            "CONFIG",
+            "user",
+            TypeDefinition::Struct {
+                fields: vec![TypeField {
+                    name: "size".to_owned(),
+                    type_name: "DWORD".to_owned(),
+                    offset: None,
+                    size: None,
+                }],
+            },
+        ));
+        project.apply_type_to_target(ProjectTypeTarget::Function(0x1400_01000), "CONFIG *");
+
+        assert_eq!(
+            project.applied_function_type(0x1400_01000),
+            Some("CONFIG *")
+        );
+        assert!(project
+            .project_type("CONFIG")
+            .unwrap()
+            .display_signature()
+            .contains("struct CONFIG"));
+    }
+
+    #[test]
+    fn imports_and_exports_c_header_types() {
+        let header = r#"
+            typedef unsigned long DWORD;
+            typedef struct CONFIG {
+                DWORD flags;
+                const char *name;
+                unsigned char key[16];
+            } CONFIG;
+            typedef enum MODE { MODE_A = 1, MODE_B } MODE;
+            int parse_config(CONFIG *config, const char *path);
+        "#;
+
+        let types = import_c_header_types("config.h", header);
+        assert!(types.iter().any(|type_item| type_item.name == "DWORD"));
+        let config = types
+            .iter()
+            .find(|type_item| type_item.name == "CONFIG")
+            .expect("CONFIG struct");
+        match config.definition.as_ref().expect("definition") {
+            TypeDefinition::Struct { fields } => {
+                assert_eq!(fields.len(), 3);
+                assert_eq!(fields[2].type_name, "unsigned char[16]");
+            }
+            other => panic!("unexpected definition: {other:?}"),
+        }
+        let exported = export_c_header_types(&types);
+        assert!(exported.contains("typedef struct CONFIG"));
+        assert!(exported.contains("int parse_config"));
+        assert!(exported.contains("MODE_B = 2"));
     }
 }

@@ -4,6 +4,46 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.9.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a schema v3 internal type model covering integers, pointers, arrays, structs, unions, enums, typedefs, opaque records, and function prototypes.
+- Added project-level type applications for addresses and functions, with persistence in FY_IDA project files.
+- Added a built-in minimal Windows/CRT type library with common aliases, pointer types, and CRT function prototypes.
+- Added lightweight C Header import for typedefs, structs, unions, enums, and function prototypes.
+- Added C Header export for the current project type library.
+- Added GUI Type menu actions for local types, new structs, new enums, function prototypes, C Header import/export, type-library import, and applying a type to the current address or function.
+- Added real Local Types and Structures panels in the right sidebar.
+- Added applied type and function prototype display in the property panel and disassembly row comments.
+- Added type-library and type-application matches to global search.
+- Added headless `--type-header <HEADER>` and `--export-types <HEADER>` support for importing/exporting type libraries.
+- Added unit coverage for type-library persistence, C Header import/export, and type applications.
+
+### Changed
+
+- Updated the workspace version to `0.9.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and project schema metadata for the type-system checkpoint.
+- Saved projects now include project type libraries and type applications in addition to PDB symbol snapshots.
+- PDB UDT summaries are merged into the local project type list after PDB loading.
+
+### Fixed
+
+- The GUI Local Types and Structures tabs now show real project data instead of placeholders.
+- Reopened projects can restore saved user/Header/PDB type entries and address/function type applications.
+
+### Known Issues
+
+- C Header import is a lightweight parser for common declarations; it does not perform full preprocessing, macro expansion, or complete C semantic analysis.
+- PDB type recovery is still summary-level UDT recovery; full TPI/IPI struct layouts, enums, classes, and prototypes remain future work.
+- Type applications are metadata overlays only; they do not yet drive decompiler type propagation or stack-variable recovery.
+- Function prototype editing stores and displays prototypes, but argument/local-variable modeling remains future work.
+
+### Recovery
+
+- Source tag: `v0.9.0-alpha.1`.
+- Roll back with: `git checkout v0.9.0-alpha.1`.
+
 ## v0.8.0-alpha.1 - 2026-06-23
 
 ### Added

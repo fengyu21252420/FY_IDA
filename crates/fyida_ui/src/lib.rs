@@ -14,10 +14,11 @@ use fyida_analysis::{
     PdbSymbolKind, PdbTypeSummary, StaticAnalysis,
 };
 use fyida_core::{
-    format_address, sha256_hex, FileSelection, ManualDefinitionKind, ProjectDebugInfo,
-    ProjectDocument, ProjectFunction, ProjectInput, ProjectInputKind,
-    ProjectSourceFile as ProjectSourceFileRecord, ProjectState, ProjectSymbol, ProjectType,
-    RawArch, RawImage, APP_NAME,
+    export_c_header_types, format_address, import_c_header_types, sha256_hex, EnumVariant,
+    FileSelection, ManualDefinitionKind, ProjectDebugInfo, ProjectDocument, ProjectFunction,
+    ProjectInput, ProjectInputKind, ProjectSourceFile as ProjectSourceFileRecord, ProjectState,
+    ProjectSymbol, ProjectType, ProjectTypeTarget, RawArch, RawImage, TypeDefinition, TypeField,
+    APP_NAME,
 };
 use fyida_loader::{
     load_file_metadata, load_pe_file_with_bytes, load_pe_from_selection_with_bytes,
@@ -78,6 +79,13 @@ struct FyIdaApp {
     rename_text: String,
     comment_open: bool,
     comment_text: String,
+    type_editor_open: bool,
+    type_editor_kind: TypeEditorKind,
+    type_name_text: String,
+    type_body_text: String,
+    type_error_text: String,
+    type_apply_open: bool,
+    type_apply_name: String,
     project_path: Option<PathBuf>,
     source_hash: Option<String>,
     input_bytes: Vec<u8>,
@@ -91,6 +99,31 @@ struct FyIdaApp {
 enum ProjectLoadResult {
     Pe(fyida_core::PeImage, Vec<u8>),
     Raw(RawImage, Vec<u8>),
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TypeEditorKind {
+    Struct,
+    Enum,
+    Function,
+}
+
+impl TypeEditorKind {
+    fn title(self) -> &'static str {
+        match self {
+            Self::Struct => "新建结构体",
+            Self::Enum => "新建枚举",
+            Self::Function => "编辑函数原型",
+        }
+    }
+
+    fn default_body(self) -> &'static str {
+        match self {
+            Self::Struct => "DWORD flags\nuint8_t key[16]",
+            Self::Enum => "MODE_A = 0\nMODE_B = 1",
+            Self::Function => "int __cdecl function_name(void *context)",
+        }
+    }
 }
 
 #[derive(Debug, Clone)]
@@ -147,6 +180,13 @@ impl FyIdaApp {
             rename_text: String::new(),
             comment_open: false,
             comment_text: String::new(),
+            type_editor_open: false,
+            type_editor_kind: TypeEditorKind::Struct,
+            type_name_text: String::new(),
+            type_body_text: TypeEditorKind::Struct.default_body().to_owned(),
+            type_error_text: String::new(),
+            type_apply_open: false,
+            type_apply_name: String::new(),
             project_path: None,
             source_hash: None,
             input_bytes: Vec::new(),
@@ -318,7 +358,10 @@ impl FyIdaApp {
                     .collect::<Vec<_>>()
             })
             .unwrap_or_default();
-        let (debug_info, symbols, types, source_files) = self.current_pdb_project_snapshot();
+        let (debug_info, symbols, pdb_types, source_files) = self.current_pdb_project_snapshot();
+        let mut types = self.project.project_types();
+        merge_project_type_records(&mut types, pdb_types);
+        let type_applications = self.project.type_applications();
 
         Ok(ProjectDocument::new(
             env!("CARGO_PKG_VERSION"),
@@ -332,6 +375,7 @@ impl FyIdaApp {
             debug_info,
             symbols,
             types,
+            type_applications,
             source_files,
             self.project.annotations(),
         ))
@@ -383,6 +427,7 @@ impl FyIdaApp {
                 name: type_item.name.clone(),
                 kind: type_item.kind.clone(),
                 source: type_item.source.clone(),
+                definition: None,
             })
             .collect::<Vec<_>>();
         let source_files = analysis
@@ -458,12 +503,20 @@ impl FyIdaApp {
         let saved_debug_info = document.debug_info.clone();
         let saved_symbols = document.symbols.clone();
         let saved_types = document.types.clone();
+        let saved_type_applications = document.type_applications.clone();
         let saved_sources = document.source_files.clone();
         self.project.apply_annotations(document.annotations);
+        self.project.replace_project_types(saved_types.clone());
+        self.project
+            .replace_type_applications(saved_type_applications);
+        let pdb_snapshot_types = saved_types
+            .into_iter()
+            .filter(is_pdb_project_type)
+            .collect::<Vec<_>>();
         self.apply_project_pdb_snapshot(
             saved_debug_info,
             saved_symbols,
-            saved_types,
+            pdb_snapshot_types,
             saved_sources,
         );
         self.project_path = Some(project_path.clone());
@@ -583,6 +636,7 @@ impl FyIdaApp {
         self.disassembly_rows = disassembly.rows;
         self.analysis = Some(analysis);
         self.project.load_pe(image);
+        self.sync_pdb_types_to_project();
         self.center_tab = 0;
         self.right_tab = 1;
         self.bottom_tab = 0;
@@ -649,6 +703,7 @@ impl FyIdaApp {
                         None => "未知",
                     }
                 ));
+                self.sync_pdb_types_to_project();
                 self.left_tab = 1;
                 self.right_tab = 2;
             }
@@ -724,6 +779,287 @@ impl FyIdaApp {
             .unwrap_or("")
             .to_owned();
         self.comment_open = true;
+    }
+
+    fn open_type_editor(&mut self, kind: TypeEditorKind) {
+        self.type_editor_kind = kind;
+        self.type_error_text.clear();
+        self.type_name_text = match kind {
+            TypeEditorKind::Struct => "CONFIG".to_owned(),
+            TypeEditorKind::Enum => "MODE".to_owned(),
+            TypeEditorKind::Function => self
+                .current_function_start()
+                .and_then(|address| {
+                    self.project
+                        .name_for(address)
+                        .map(str::to_owned)
+                        .or_else(|| {
+                            self.analysis.as_ref().and_then(|analysis| {
+                                analysis
+                                    .functions
+                                    .iter()
+                                    .find(|function| function.start_va == address)
+                                    .map(|function| function.name.clone())
+                            })
+                        })
+                })
+                .unwrap_or_else(|| "function_name".to_owned()),
+        };
+        self.type_body_text = match kind {
+            TypeEditorKind::Function => format!("int __cdecl {}(void)", self.type_name_text),
+            _ => kind.default_body().to_owned(),
+        };
+        self.type_editor_open = true;
+    }
+
+    fn open_type_apply_dialog(&mut self) {
+        let Some(target) = self.current_type_target() else {
+            self.logs
+                .push("应用类型失败：尚未选择地址或函数。".to_owned());
+            return;
+        };
+        self.type_apply_name = self
+            .project
+            .applied_type(target)
+            .map(str::to_owned)
+            .or_else(|| {
+                self.project
+                    .project_types()
+                    .into_iter()
+                    .find(|type_item| {
+                        !type_item.source.starts_with("builtin:")
+                            && matches!(
+                                type_item.definition,
+                                Some(TypeDefinition::Struct { .. })
+                                    | Some(TypeDefinition::Union { .. })
+                                    | Some(TypeDefinition::Enum { .. })
+                                    | Some(TypeDefinition::Function { .. })
+                            )
+                    })
+                    .map(|type_item| type_item.name)
+            })
+            .unwrap_or_default();
+        self.type_apply_open = true;
+    }
+
+    fn commit_type_editor(&mut self) {
+        match self.build_type_from_editor() {
+            Ok(type_item) => {
+                let type_name = type_item.name.clone();
+                self.project.upsert_project_type(type_item);
+                if self.type_editor_kind == TypeEditorKind::Function {
+                    if let Some(function_start) = self.current_function_start() {
+                        self.project.apply_type_to_target(
+                            ProjectTypeTarget::Function(function_start),
+                            type_name.clone(),
+                        );
+                    }
+                }
+                self.logs.push(format!("已更新类型：{type_name}"));
+                self.type_editor_open = false;
+                self.right_tab = 2;
+                self.bottom_tab = 0;
+            }
+            Err(message) => {
+                self.type_error_text = message;
+            }
+        }
+    }
+
+    fn build_type_from_editor(&self) -> Result<ProjectType, String> {
+        match self.type_editor_kind {
+            TypeEditorKind::Struct => {
+                let name = require_type_name(&self.type_name_text)?;
+                Ok(ProjectType::with_definition(
+                    name,
+                    "user",
+                    TypeDefinition::Struct {
+                        fields: parse_type_fields(&self.type_body_text)?,
+                    },
+                ))
+            }
+            TypeEditorKind::Enum => {
+                let name = require_type_name(&self.type_name_text)?;
+                Ok(ProjectType::with_definition(
+                    name,
+                    "user",
+                    TypeDefinition::Enum {
+                        variants: parse_enum_variants(&self.type_body_text)?,
+                    },
+                ))
+            }
+            TypeEditorKind::Function => {
+                let prototype = self.type_body_text.trim();
+                if prototype.is_empty() {
+                    return Err("函数原型不能为空。".to_owned());
+                }
+                let imported = import_c_header_types("prototype", &format!("{prototype};"));
+                let mut type_item = imported
+                    .into_iter()
+                    .find(|item| matches!(item.definition, Some(TypeDefinition::Function { .. })))
+                    .ok_or_else(|| {
+                        "无法解析函数原型，请使用类似 int __cdecl fn(void)。".to_owned()
+                    })?;
+                let explicit_name = self.type_name_text.trim();
+                if !explicit_name.is_empty() {
+                    type_item.name = explicit_name.to_owned();
+                }
+                type_item.source = "user".to_owned();
+                Ok(type_item)
+            }
+        }
+    }
+
+    fn import_c_header_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter("C Header", &["h", "hpp", "hh"])
+            .pick_file()
+        {
+            match std::fs::read_to_string(&path) {
+                Ok(text) => {
+                    let source = path
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("header");
+                    let types = import_c_header_types(source, &text);
+                    let count = self.project.upsert_project_types(types);
+                    self.logs.push(format!(
+                        "已导入 C Header：{}，类型 {} 个",
+                        path.display(),
+                        count
+                    ));
+                    self.right_tab = 2;
+                    self.bottom_tab = 0;
+                }
+                Err(error) => {
+                    self.logs
+                        .push(format!("导入 C Header 失败：{} ({error})", path.display()));
+                    self.bottom_tab = 0;
+                }
+            }
+        }
+    }
+
+    fn export_c_header_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .set_file_name("fyida_types.h")
+            .add_filter("C Header", &["h"])
+            .save_file()
+        {
+            let header = export_c_header_types(&self.project.project_types());
+            match std::fs::write(&path, header) {
+                Ok(()) => {
+                    self.logs
+                        .push(format!("已导出 C Header：{}", path.display()));
+                    self.bottom_tab = 0;
+                }
+                Err(error) => {
+                    self.logs
+                        .push(format!("导出 C Header 失败：{} ({error})", path.display()));
+                    self.bottom_tab = 0;
+                }
+            }
+        }
+    }
+
+    fn import_type_library_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .add_filter(
+                "FY_IDA Project or Header",
+                &["fyida", "json", "h", "hpp", "hh"],
+            )
+            .pick_file()
+        {
+            let extension = path
+                .extension()
+                .and_then(|extension| extension.to_str())
+                .unwrap_or_default()
+                .to_ascii_lowercase();
+            let imported = if matches!(extension.as_str(), "h" | "hpp" | "hh") {
+                match std::fs::read_to_string(&path) {
+                    Ok(text) => {
+                        let source = path
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("header");
+                        Ok(import_c_header_types(source, &text))
+                    }
+                    Err(error) => Err(format!("{error}")),
+                }
+            } else {
+                ProjectDocument::load_from_path(&path)
+                    .map(|document| document.types)
+                    .map_err(|error| error.to_string())
+            };
+
+            match imported {
+                Ok(types) => {
+                    let count = self.project.upsert_project_types(types);
+                    self.logs.push(format!(
+                        "已导入类型库：{}，类型 {} 个",
+                        path.display(),
+                        count
+                    ));
+                    self.right_tab = 2;
+                    self.bottom_tab = 0;
+                }
+                Err(error) => {
+                    self.logs
+                        .push(format!("导入类型库失败：{} ({error})", path.display()));
+                    self.bottom_tab = 0;
+                }
+            }
+        }
+    }
+
+    fn apply_type_to_current_target(&mut self) {
+        let Some(target) = self.current_type_target() else {
+            self.logs
+                .push("应用类型失败：尚未选择地址或函数。".to_owned());
+            return;
+        };
+        let type_name = self.type_apply_name.trim().to_owned();
+        if type_name.is_empty() {
+            self.logs.push("应用类型失败：类型名不能为空。".to_owned());
+            return;
+        }
+        self.project.apply_type_to_target(target, type_name.clone());
+        self.logs.push(format!(
+            "已应用类型：{} 0x{:016X} -> {}",
+            target.label(),
+            target.address(),
+            type_name
+        ));
+        self.type_apply_open = false;
+        self.right_tab = 1;
+        self.bottom_tab = 0;
+    }
+
+    fn sync_pdb_types_to_project(&mut self) {
+        let Some(analysis) = &self.analysis else {
+            return;
+        };
+        let types = analysis
+            .pdb_types
+            .iter()
+            .map(|type_item| ProjectType {
+                name: type_item.name.clone(),
+                kind: type_item.kind.clone(),
+                source: type_item.source.clone(),
+                definition: None,
+            })
+            .collect::<Vec<_>>();
+        self.project.upsert_project_types(types);
+    }
+
+    fn current_type_target(&self) -> Option<ProjectTypeTarget> {
+        self.current_function_start()
+            .map(ProjectTypeTarget::Function)
+            .or_else(|| {
+                self.project
+                    .current_address()
+                    .map(ProjectTypeTarget::Address)
+            })
     }
 
     fn toggle_current_bookmark(&mut self) {
@@ -953,18 +1289,51 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("类型", |ui| {
-                        disabled_menu_items(
-                            ui,
-                            &[
-                                "局部类型",
-                                "新建结构体",
-                                "新建枚举",
-                                "编辑函数原型",
-                                "导入 C Header",
-                                "导出 C Header",
-                                "导入类型库",
-                            ],
-                        );
+                        if ui.button("局部类型").clicked() {
+                            self.right_tab = 2;
+                            ui.close_menu();
+                        }
+                        if ui.button("新建结构体").clicked() {
+                            self.open_type_editor(TypeEditorKind::Struct);
+                            ui.close_menu();
+                        }
+                        if ui.button("新建枚举").clicked() {
+                            self.open_type_editor(TypeEditorKind::Enum);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.project.current_address().is_some(),
+                                egui::Button::new("编辑函数原型"),
+                            )
+                            .clicked()
+                        {
+                            self.open_type_editor(TypeEditorKind::Function);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.project.current_address().is_some(),
+                                egui::Button::new("应用类型到当前位置"),
+                            )
+                            .clicked()
+                        {
+                            self.open_type_apply_dialog();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui.button("导入 C Header").clicked() {
+                            self.import_c_header_dialog();
+                            ui.close_menu();
+                        }
+                        if ui.button("导出 C Header").clicked() {
+                            self.export_c_header_dialog();
+                            ui.close_menu();
+                        }
+                        if ui.button("导入类型库").clicked() {
+                            self.import_type_library_dialog();
+                            ui.close_menu();
+                        }
                     });
 
                     ui.menu_button("脚本", |ui| {
@@ -994,8 +1363,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.8.0-alpha.1");
-                        ui.label("PDB 符号与 demangle MVP。");
+                        ui.label("FY_IDA v0.9.0-alpha.1");
+                        ui.label("类型系统、C Header 与类型应用 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -1592,6 +1961,22 @@ impl FyIdaApp {
                         ui.label(self.source_hash.as_deref().unwrap_or("尚未计算"));
                         ui.end_row();
 
+                        if let Some(address) = self.project.current_address() {
+                            ui.label("地址类型");
+                            ui.label(self.project.applied_address_type(address).unwrap_or("-"));
+                            ui.end_row();
+                        }
+
+                        if let Some(function_start) = self.current_function_start() {
+                            ui.label("函数原型");
+                            ui.label(
+                                self.project
+                                    .applied_function_type(function_start)
+                                    .unwrap_or("-"),
+                            );
+                            ui.end_row();
+                        }
+
                         if let Some(image) = self.project.pe_image() {
                             ui.separator();
                             ui.separator();
@@ -1691,10 +2076,96 @@ impl FyIdaApp {
                         }
                     });
             }
-            "局部类型" => placeholder_list(ui, &["暂无局部类型", "后续支持函数原型与结构体"]),
-            "结构体" => placeholder_list(ui, &["暂无结构体定义"]),
+            "局部类型" => self.local_type_panel(ui),
+            "结构体" => self.structure_panel(ui),
             _ => self.annotation_panel(ui),
         }
+    }
+
+    fn local_type_panel(&mut self, ui: &mut Ui) {
+        let types = self.project.project_types();
+        if types.is_empty() {
+            placeholder_list(ui, &["暂无局部类型"]);
+            return;
+        }
+
+        Grid::new("local_type_grid")
+            .num_columns(4)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("名称");
+                ui.strong("类型");
+                ui.strong("来源");
+                ui.strong("签名");
+                ui.end_row();
+
+                for type_item in types {
+                    ui.label(&type_item.name);
+                    ui.label(&type_item.kind);
+                    ui.label(&type_item.source);
+                    ui.label(type_item.display_signature());
+                    ui.end_row();
+                }
+            });
+
+        ui.separator();
+        if ui.button("应用类型到当前位置").clicked() {
+            self.open_type_apply_dialog();
+        }
+    }
+
+    fn structure_panel(&self, ui: &mut Ui) {
+        let structures = self
+            .project
+            .project_types()
+            .into_iter()
+            .filter(|type_item| {
+                matches!(
+                    type_item.definition,
+                    Some(TypeDefinition::Struct { .. }) | Some(TypeDefinition::Union { .. })
+                )
+            })
+            .collect::<Vec<_>>();
+        if structures.is_empty() {
+            placeholder_list(ui, &["暂无结构体定义"]);
+            return;
+        }
+
+        ScrollArea::vertical().show(ui, |ui| {
+            for type_item in structures {
+                ui.strong(type_item.display_signature());
+                match type_item.definition {
+                    Some(TypeDefinition::Struct { fields })
+                    | Some(TypeDefinition::Union { fields }) => {
+                        Grid::new(format!("structure_fields_{}", type_item.name))
+                            .num_columns(3)
+                            .striped(true)
+                            .spacing([10.0, 4.0])
+                            .show(ui, |ui| {
+                                ui.label("字段");
+                                ui.label("类型");
+                                ui.label("偏移");
+                                ui.end_row();
+
+                                for field in fields {
+                                    ui.label(field.name);
+                                    ui.label(field.type_name);
+                                    ui.label(
+                                        field
+                                            .offset
+                                            .map(|offset| format!("0x{offset:X}"))
+                                            .unwrap_or_else(|| "-".to_owned()),
+                                    );
+                                    ui.end_row();
+                                }
+                            });
+                    }
+                    _ => {}
+                }
+                ui.separator();
+            }
+        });
     }
 
     fn annotation_panel(&self, ui: &mut Ui) {
@@ -2145,6 +2616,12 @@ impl FyIdaApp {
         if let Some(symbol) = self.pdb_symbol_at(row.address) {
             parts.push(format!("PDB: {}", symbol.display_name()));
         }
+        if let Some(type_name) = self.project.applied_address_type(row.address) {
+            parts.push(format!("type: {type_name}"));
+        }
+        if let Some(type_name) = self.project.applied_function_type(row.address) {
+            parts.push(format!("prototype: {type_name}"));
+        }
         if let Some(comment) = self.project.address_comment(row.address) {
             parts.push(comment.to_owned());
         }
@@ -2408,6 +2885,60 @@ impl FyIdaApp {
                 }
             });
         self.comment_open = comment_open && self.comment_open;
+
+        let mut type_editor_open = self.type_editor_open;
+        Window::new(self.type_editor_kind.title())
+            .open(&mut type_editor_open)
+            .resizable(true)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("类型名");
+                ui.add(TextEdit::singleline(&mut self.type_name_text).hint_text("CONFIG"));
+                ui.label(match self.type_editor_kind {
+                    TypeEditorKind::Struct => "字段，每行一个：DWORD flags",
+                    TypeEditorKind::Enum => "枚举值，每行一个：MODE_A = 0",
+                    TypeEditorKind::Function => "函数原型：int __cdecl fn(void)",
+                });
+                ui.add(TextEdit::multiline(&mut self.type_body_text).desired_rows(8));
+                if !self.type_error_text.is_empty() {
+                    ui.label(RichText::new(&self.type_error_text).color(error_color()));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("确定").clicked() {
+                        self.commit_type_editor();
+                    }
+                    if ui.button("取消").clicked() {
+                        self.type_editor_open = false;
+                    }
+                });
+            });
+        self.type_editor_open = type_editor_open && self.type_editor_open;
+
+        let mut type_apply_open = self.type_apply_open;
+        Window::new("应用类型")
+            .open(&mut type_apply_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if let Some(target) = self.current_type_target() {
+                    ui.label(format!(
+                        "目标：{} 0x{:016X}",
+                        target.label(),
+                        target.address()
+                    ));
+                }
+                ui.label("类型名");
+                ui.add(TextEdit::singleline(&mut self.type_apply_name).hint_text("CONFIG *"));
+                ui.horizontal(|ui| {
+                    if ui.button("应用").clicked() {
+                        self.apply_type_to_current_target();
+                    }
+                    if ui.button("取消").clicked() {
+                        self.type_apply_open = false;
+                    }
+                });
+            });
+        self.type_apply_open = type_apply_open && self.type_apply_open;
     }
 
     fn resolve_jump_input(&self) -> Option<(u64, String)> {
@@ -2638,6 +3169,37 @@ impl FyIdaApp {
             }
         }
 
+        for type_item in self.project.project_types() {
+            let signature = type_item.display_signature();
+            if type_item.name.to_lowercase().contains(&query_lower)
+                || type_item.kind.to_lowercase().contains(&query_lower)
+                || type_item.source.to_lowercase().contains(&query_lower)
+                || signature.to_lowercase().contains(&query_lower)
+            {
+                results.push(SearchResult::plain(format!(
+                    "类型 [{}] {} - {}",
+                    type_item.kind, type_item.name, signature
+                )));
+            }
+        }
+
+        for application in self.project.type_applications() {
+            if application.type_name.to_lowercase().contains(&query_lower)
+                || address_matches(application.target.address(), query)
+            {
+                results.push(SearchResult::jump(
+                    format!(
+                        "类型应用 {} 0x{:016X} -> {}",
+                        application.target.label(),
+                        application.target.address(),
+                        application.type_name
+                    ),
+                    application.target.address(),
+                    application.type_name,
+                ));
+            }
+        }
+
         let Some(analysis) = &self.analysis else {
             if results.len() == 1 {
                 results.push(SearchResult::plain(
@@ -2831,6 +3393,131 @@ fn address_matches(address: u64, query: &str) -> bool {
     }
 
     format!("{address:016X}").to_lowercase().contains(&query)
+}
+
+fn require_type_name(text: &str) -> Result<String, String> {
+    let name = text.trim();
+    if name.is_empty() {
+        return Err("类型名不能为空。".to_owned());
+    }
+    if !name
+        .chars()
+        .all(|character| character.is_ascii_alphanumeric() || character == '_')
+    {
+        return Err("类型名只能包含字母、数字和下划线。".to_owned());
+    }
+    Ok(name.to_owned())
+}
+
+fn parse_type_fields(text: &str) -> Result<Vec<TypeField>, String> {
+    let mut fields = Vec::new();
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim().trim_end_matches(';').trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let (type_name, name) = parse_named_type_line(line)
+            .ok_or_else(|| format!("第 {} 行字段无法解析：{}", index + 1, line))?;
+        fields.push(TypeField {
+            name,
+            type_name,
+            offset: None,
+            size: None,
+        });
+    }
+    Ok(fields)
+}
+
+fn parse_enum_variants(text: &str) -> Result<Vec<EnumVariant>, String> {
+    let mut variants = Vec::new();
+    let mut next_value = 0i64;
+    for (index, line) in text.lines().enumerate() {
+        let line = line.trim().trim_end_matches(',').trim();
+        if line.is_empty() || line.starts_with("//") {
+            continue;
+        }
+        let (name, value) = match line.split_once('=') {
+            Some((name, value)) => {
+                let value = parse_signed_number(value.trim())
+                    .ok_or_else(|| format!("第 {} 行枚举值无法解析：{}", index + 1, line))?;
+                (name.trim(), value)
+            }
+            None => (line, next_value),
+        };
+        let name = require_type_name(name)?;
+        variants.push(EnumVariant { name, value });
+        next_value = value.saturating_add(1);
+    }
+    Ok(variants)
+}
+
+fn parse_named_type_line(line: &str) -> Option<(String, String)> {
+    let line = line.trim();
+    let (without_array, array_suffix) = if let Some(open) = line.rfind('[') {
+        let close = line.rfind(']')?;
+        if close > open {
+            (
+                line[..open].trim(),
+                Some(line[open..=close].trim().to_owned()),
+            )
+        } else {
+            (line, None)
+        }
+    } else {
+        (line, None)
+    };
+    let mut parts = without_array.split_whitespace().collect::<Vec<_>>();
+    let mut name = parts.pop()?.trim().to_owned();
+    let mut pointer_prefix = String::new();
+    while name.starts_with('*') {
+        pointer_prefix.push('*');
+        name.remove(0);
+    }
+    let name = require_type_name(&name).ok()?;
+    let mut type_name = parts.join(" ");
+    if !pointer_prefix.is_empty() {
+        if !type_name.is_empty() {
+            type_name.push(' ');
+        }
+        type_name.push_str(&pointer_prefix);
+    }
+    if let Some(array_suffix) = array_suffix {
+        type_name.push_str(&array_suffix);
+    }
+    (!type_name.trim().is_empty()).then_some((type_name, name))
+}
+
+fn parse_signed_number(text: &str) -> Option<i64> {
+    let text = text.trim();
+    let negative = text.starts_with('-');
+    let digits = text.trim_start_matches('-').trim_start_matches('+');
+    let value = if let Some(hex) = digits
+        .strip_prefix("0x")
+        .or_else(|| digits.strip_prefix("0X"))
+    {
+        i64::from_str_radix(hex, 16).ok()?
+    } else {
+        digits.parse::<i64>().ok()?
+    };
+    Some(if negative { -value } else { value })
+}
+
+fn merge_project_type_records(target: &mut Vec<ProjectType>, incoming: Vec<ProjectType>) {
+    for type_item in incoming {
+        if !target
+            .iter()
+            .any(|existing| existing.name == type_item.name)
+        {
+            target.push(type_item);
+        }
+    }
+}
+
+fn is_pdb_project_type(type_item: &ProjectType) -> bool {
+    type_item.definition.is_none()
+        && (type_item.kind.eq_ignore_ascii_case("UDT")
+            || type_item.source.eq_ignore_ascii_case("udt")
+            || type_item.source.to_ascii_lowercase().contains("pdb"))
 }
 
 fn parse_byte_pattern(text: &str) -> Option<Vec<u8>> {

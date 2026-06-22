@@ -1,3 +1,4 @@
+use std::collections::BTreeMap;
 use std::path::PathBuf;
 
 use clap::Parser;
@@ -9,7 +10,7 @@ use fyida_loader::RawLoadOptions;
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.8.0-alpha.1 已提供 PDB 符号线索、外部 PDB public symbols 与 demangle 能力。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.9.0-alpha.1 已提供内部类型模型、C Header 导入/导出、类型应用和 PDB 类型快照。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -30,6 +31,12 @@ pub struct Cli {
     #[arg(long, value_name = "PDB", help = "为 PE 手动加载外部 PDB 符号文件")]
     pub pdb: Option<PathBuf>,
 
+    #[arg(long, value_name = "HEADER", help = "导入 C Header 类型定义")]
+    pub type_header: Option<PathBuf>,
+
+    #[arg(long, value_name = "HEADER", help = "导出内置/导入的类型库为 C Header")]
+    pub export_types: Option<PathBuf>,
+
     #[arg(value_name = "FILE", help = "启动 GUI 时预选的输入文件路径")]
     pub file: Option<PathBuf>,
 }
@@ -38,6 +45,13 @@ pub fn run_headless(cli: &Cli) -> i32 {
     let Some(file) = &cli.file else {
         println!("FY_IDA headless 模式需要提供输入文件。");
         return 2;
+    };
+    let cli_types = match load_cli_types(cli) {
+        Ok(types) => types,
+        Err(message) => {
+            eprintln!("类型参数错误：{message}");
+            return 2;
+        }
     };
 
     if cli.raw {
@@ -88,6 +102,7 @@ pub fn run_headless(cli: &Cli) -> i32 {
 
                 let analysis = fyida_analysis::analyze_raw(&image, &loaded.bytes);
                 print_static_analysis(&analysis);
+                print_type_library(&cli_types);
                 0
             }
             Err(error) => {
@@ -172,6 +187,7 @@ pub fn run_headless(cli: &Cli) -> i32 {
                 }
             }
             print_static_analysis(&analysis);
+            print_type_library(&cli_types);
             0
         }
         Err(error) => {
@@ -179,6 +195,50 @@ pub fn run_headless(cli: &Cli) -> i32 {
             1
         }
     }
+}
+
+fn load_cli_types(cli: &Cli) -> Result<Vec<fyida_core::ProjectType>, String> {
+    let mut types = fyida_core::builtin_type_library();
+    if let Some(header_path) = &cli.type_header {
+        let text = std::fs::read_to_string(header_path)
+            .map_err(|source| format!("无法读取 C Header {}：{source}", header_path.display()))?;
+        let source_name = header_path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("header");
+        merge_types(
+            &mut types,
+            fyida_core::import_c_header_types(source_name, &text),
+        );
+        println!(
+            "C Header 类型已导入：{} / total {}",
+            header_path.display(),
+            types.len()
+        );
+    }
+
+    if let Some(export_path) = &cli.export_types {
+        let header = fyida_core::export_c_header_types(&types);
+        std::fs::write(export_path, header)
+            .map_err(|source| format!("无法导出 C Header {}：{source}", export_path.display()))?;
+        println!("C Header 类型已导出：{}", export_path.display());
+    }
+
+    Ok(types)
+}
+
+fn merge_types(
+    target: &mut Vec<fyida_core::ProjectType>,
+    incoming: impl IntoIterator<Item = fyida_core::ProjectType>,
+) {
+    let mut by_name = target
+        .drain(..)
+        .map(|type_item| (type_item.name.clone(), type_item))
+        .collect::<BTreeMap<_, _>>();
+    for type_item in incoming {
+        by_name.insert(type_item.name.clone(), type_item);
+    }
+    *target = by_name.into_values().collect();
 }
 
 fn raw_options(cli: &Cli) -> Result<RawLoadOptions, String> {
@@ -307,5 +367,17 @@ fn print_static_analysis(analysis: &fyida_analysis::StaticAnalysis) {
     println!("  PDBTypes：{}", analysis.pdb_types.len());
     for type_item in analysis.pdb_types.iter().take(64) {
         println!("    [{}] {}", type_item.kind, type_item.name);
+    }
+}
+
+fn print_type_library(types: &[fyida_core::ProjectType]) {
+    println!("  TypeLibrary：{}", types.len());
+    for type_item in types.iter().take(64) {
+        println!(
+            "    [{}] {} - {}",
+            type_item.kind,
+            type_item.name,
+            type_item.display_signature()
+        );
     }
 }
