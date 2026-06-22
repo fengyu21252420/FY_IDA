@@ -4,6 +4,31 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.17.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added GUI global-search coverage for generated pseudo-C lines.
+- Added GUI global-search coverage for generated IR instructions, including op, arguments, and source comments.
+- Added clickable pseudocode/IR search results that navigate back to the source disassembly address.
+- Added bounded search snippets so long generated lines stay readable in the search-results panel.
+- Added unit coverage for IR search text assembly and snippet bounding.
+
+### Changed
+
+- Updated the workspace version to `0.17.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, and CHANGELOG metadata for the pseudocode/IR-search checkpoint.
+
+### Known Issues
+
+- Pseudocode/IR search is currently GUI-side; headless exports already contain the generated pseudocode/IR model but do not yet provide a dedicated search command.
+- Search results are still rendered as clickable rows rather than a sortable table.
+
+### Recovery
+
+- Source tag: `v0.17.0-alpha.1`.
+- Roll back with: `git checkout v0.17.0-alpha.1`.
+
 ## v0.16.0-alpha.1 - 2026-06-23
 
 ### Added

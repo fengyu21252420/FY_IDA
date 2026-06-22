@@ -1444,9 +1444,9 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.16.0-alpha.1");
+                        ui.label("FY_IDA v0.17.0-alpha.1");
                         ui.label(
-                            "正式 headless analyze 入口、运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。",
+                            "伪代码/IR 搜索、正式 headless analyze 入口、运行库过滤、本地签名库、Runtime 识别与基础 x64 伪 C/IR MVP。",
                         );
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
@@ -3648,6 +3648,51 @@ impl FyIdaApp {
             }
         }
 
+        for function in &analysis.pseudocode_functions {
+            let function_name = self
+                .project
+                .name_for(function.function_start)
+                .unwrap_or(&function.name);
+            for line in &function.lines {
+                let address_match = line
+                    .address
+                    .map(|address| address_matches(address, query))
+                    .unwrap_or(false);
+                if line.text.to_lowercase().contains(&query_lower) || address_match {
+                    let snippet = search_snippet(&line.text);
+                    if let Some(address) = line.address {
+                        results.push(SearchResult::jump(
+                            format!("伪代码 0x{address:016X} {function_name}: {snippet}"),
+                            address,
+                            "伪代码".to_owned(),
+                        ));
+                    } else {
+                        results.push(SearchResult::plain(format!(
+                            "伪代码 {function_name}: {snippet}"
+                        )));
+                    }
+                }
+            }
+
+            for instruction in &function.ir {
+                let text = ir_search_text(&instruction.op, &instruction.args, &instruction.comment);
+                if text.to_lowercase().contains(&query_lower)
+                    || address_matches(instruction.address, query)
+                {
+                    results.push(SearchResult::jump(
+                        format!(
+                            "IR 0x{:016X} {}: {}",
+                            instruction.address,
+                            function_name,
+                            search_snippet(&text)
+                        ),
+                        instruction.address,
+                        "IR".to_owned(),
+                    ));
+                }
+            }
+        }
+
         for export in &analysis.exports {
             if export.name.to_lowercase().contains(&query_lower)
                 || address_matches(export.va, query)
@@ -3781,6 +3826,26 @@ fn runtime_function_signature_in(
     signatures
         .iter()
         .find(|signature| signature.address == address && is_runtime_function_signature(signature))
+}
+
+fn ir_search_text(op: &str, args: &[String], comment: &str) -> String {
+    let args = args.join(", ");
+    if comment.trim().is_empty() {
+        format!("{op} {args}")
+    } else {
+        format!("{op} {args} ; {comment}")
+    }
+}
+
+fn search_snippet(text: &str) -> String {
+    let trimmed = text.trim();
+    let mut chars = trimmed.chars();
+    let snippet = chars.by_ref().take(96).collect::<String>();
+    if chars.next().is_some() {
+        format!("{snippet}...")
+    } else {
+        snippet
+    }
 }
 
 fn parse_number(text: &str) -> Option<u64> {
@@ -4229,5 +4294,27 @@ mod tests {
             "crypto",
             &["140001000", "memcpy", "函数"]
         ));
+    }
+
+    #[test]
+    fn ir_search_text_includes_arguments_and_comments() {
+        let text = ir_search_text(
+            "call",
+            &["CreateFileW".to_owned(), "rcx".to_owned()],
+            "source 140001000 call CreateFileW",
+        );
+
+        assert!(text.contains("CreateFileW"));
+        assert!(text.contains("rcx"));
+        assert!(text.contains("source 140001000"));
+    }
+
+    #[test]
+    fn search_snippet_trims_and_bounds_long_text() {
+        let long = format!("  {}  ", "a".repeat(120));
+        let snippet = search_snippet(&long);
+
+        assert_eq!(snippet.chars().count(), 99);
+        assert!(snippet.ends_with("..."));
     }
 }
