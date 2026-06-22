@@ -431,6 +431,10 @@ impl RelocationEntry {
 pub enum XrefKind {
     CodeCall,
     CodeJump,
+    Data,
+    String,
+    Import,
+    Relocation,
 }
 
 impl XrefKind {
@@ -438,6 +442,10 @@ impl XrefKind {
         match self {
             Self::CodeCall => "代码调用",
             Self::CodeJump => "代码跳转",
+            Self::Data => "数据引用",
+            Self::String => "字符串引用",
+            Self::Import => "导入引用",
+            Self::Relocation => "重定位引用",
         }
     }
 }
@@ -464,7 +472,13 @@ pub fn analyze_pe(image: &PeImage, bytes: &[u8]) -> StaticAnalysis {
         ..StaticAnalysis::default()
     };
 
-    let discovery = discover_functions_and_xrefs(image, bytes);
+    let discovery = discover_functions_and_xrefs(
+        image,
+        bytes,
+        &analysis.strings,
+        &analysis.imports,
+        &analysis.relocations,
+    );
     analysis.functions = discovery.functions;
     analysis.xrefs = discovery.xrefs;
     analysis.function_cfgs = discovery.function_cfgs;
@@ -479,10 +493,11 @@ pub fn analyze_pe(image: &PeImage, bytes: &[u8]) -> StaticAnalysis {
 }
 
 pub fn analyze_raw(image: &RawImage, bytes: &[u8]) -> StaticAnalysis {
-    let discovery = discover_raw_functions_and_xrefs(image, bytes);
+    let strings = scan_raw_strings(image, bytes);
+    let discovery = discover_raw_functions_and_xrefs(image, bytes, &strings);
     let mut analysis = StaticAnalysis {
         functions: discovery.functions,
-        strings: scan_raw_strings(image, bytes),
+        strings,
         imports: Vec::new(),
         exports: Vec::new(),
         relocations: Vec::new(),
@@ -507,7 +522,7 @@ pub fn static_analysis_log_lines(analysis: &StaticAnalysis) -> Vec<String> {
         format!("导入表解析：{} 个导入符号。", analysis.imports.len()),
         format!("导出表解析：{} 个导出符号。", analysis.exports.len()),
         format!("重定位解析：{} 条。", analysis.relocations.len()),
-        format!("代码交叉引用：{} 条。", analysis.xrefs.len()),
+        format!("交叉引用：{} 条。", analysis.xrefs.len()),
         format!("CFG 生成：{} 个函数图。", analysis.function_cfgs.len()),
         format!(
             "伪 C/IR 生成：{} 个函数。",
@@ -642,7 +657,7 @@ pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.22.0-alpha.1，Python 标注动作写入、headless 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、本地签名库、Runtime 识别、运行库过滤和基础 x64 伪 C/IR 已接入。".to_owned(),
+        "当前版本：v0.23.0-alpha.1，x64 RIP-relative/absolute 内存 xref、Python 标注动作写入、headless 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 导出、伪代码/IR 搜索、正式 headless analyze 入口、本地签名库、Runtime 识别、运行库过滤和基础 x64 伪 C/IR 已接入。".to_owned(),
         "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串、基础引用和图数据。"
             .to_owned(),
     ]
@@ -810,7 +825,13 @@ struct DiscoveryResult {
     call_graph: CallGraph,
 }
 
-fn discover_functions_and_xrefs(image: &PeImage, bytes: &[u8]) -> DiscoveryResult {
+fn discover_functions_and_xrefs(
+    image: &PeImage,
+    bytes: &[u8],
+    strings: &[ExtractedString],
+    imports: &[ImportSymbol],
+    relocations: &[RelocationEntry],
+) -> DiscoveryResult {
     if image.nt_headers.file_header.machine != 0x8664
         || image.nt_headers.optional_header.kind != PeKind::Pe32Plus
     {
@@ -845,9 +866,13 @@ fn discover_functions_and_xrefs(image: &PeImage, bytes: &[u8]) -> DiscoveryResul
             format!("sub_{start_va:016X}")
         };
 
-        let decoded = analyze_decoded_function(start_va, name, &instructions, |target| {
-            image.is_executable_va(target)
-        });
+        let decoded = analyze_decoded_function(
+            start_va,
+            name,
+            &instructions,
+            |target| image.is_executable_va(target),
+            |target| classify_pe_memory_xref(target, image, strings, imports, relocations),
+        );
         for target in &decoded.discovered_call_targets {
             if discovered.len() < MAX_FUNCTIONS && discovered.insert(*target) {
                 worklist.push_back(*target);
@@ -873,7 +898,11 @@ fn discover_functions_and_xrefs(image: &PeImage, bytes: &[u8]) -> DiscoveryResul
     }
 }
 
-fn discover_raw_functions_and_xrefs(image: &RawImage, bytes: &[u8]) -> DiscoveryResult {
+fn discover_raw_functions_and_xrefs(
+    image: &RawImage,
+    bytes: &[u8],
+    strings: &[ExtractedString],
+) -> DiscoveryResult {
     let mut worklist = VecDeque::from([image.entry_address]);
     let mut discovered = HashSet::from([image.entry_address]);
     let mut processed = HashSet::new();
@@ -902,9 +931,13 @@ fn discover_raw_functions_and_xrefs(image: &RawImage, bytes: &[u8]) -> Discovery
         } else {
             format!("sub_{start_va:016X}")
         };
-        let decoded = analyze_decoded_function(start_va, name, &instructions, |target| {
-            image.contains_va(target)
-        });
+        let decoded = analyze_decoded_function(
+            start_va,
+            name,
+            &instructions,
+            |target| image.contains_va(target),
+            |target| classify_raw_memory_xref(target, image, strings),
+        );
         for target in &decoded.discovered_call_targets {
             if discovered.len() < MAX_FUNCTIONS && discovered.insert(*target) {
                 worklist.push_back(*target);
@@ -935,6 +968,7 @@ fn analyze_decoded_function(
     name: String,
     instructions: &[DecodedInstruction],
     target_allowed: impl Fn(u64) -> bool,
+    memory_xref: impl Fn(u64) -> Option<(XrefKind, String)>,
 ) -> DecodedFunctionAnalysis {
     let mut truncated = Vec::new();
     for instruction in instructions {
@@ -982,6 +1016,17 @@ fn analyze_decoded_function(
                 });
             }
         }
+
+        for target in &instruction.memory_targets {
+            if let Some((kind, label)) = memory_xref(*target) {
+                xrefs.push(XrefSummary {
+                    from_va: instruction.address,
+                    to_va: *target,
+                    kind,
+                    label,
+                });
+            }
+        }
     }
 
     let cfg = build_function_cfg(start_va, &truncated);
@@ -999,6 +1044,103 @@ fn analyze_decoded_function(
         xrefs,
         calls,
         discovered_call_targets,
+    }
+}
+
+fn classify_pe_memory_xref(
+    target: u64,
+    image: &PeImage,
+    strings: &[ExtractedString],
+    imports: &[ImportSymbol],
+    relocations: &[RelocationEntry],
+) -> Option<(XrefKind, String)> {
+    if let Some(import) = imports.iter().find(|import| import.thunk_va == target) {
+        return Some((
+            XrefKind::Import,
+            format!("{} -> {}", XrefKind::Import.label(), import.display_name()),
+        ));
+    }
+
+    if let Some(string) = strings
+        .iter()
+        .find(|string| string_contains_address(string, target))
+    {
+        return Some((
+            XrefKind::String,
+            format!(
+                "{} -> {} {}",
+                XrefKind::String.label(),
+                string.encoding.label(),
+                bounded_xref_text(&string.value)
+            ),
+        ));
+    }
+
+    if let Some(relocation) = relocations
+        .iter()
+        .find(|relocation| relocation.va == target)
+    {
+        return Some((
+            XrefKind::Relocation,
+            format!(
+                "{} -> RVA 0x{:08X} {}",
+                XrefKind::Relocation.label(),
+                relocation.rva,
+                relocation.kind_label()
+            ),
+        ));
+    }
+
+    image.section_containing_va(target).map(|section| {
+        (
+            XrefKind::Data,
+            format!("{} -> section {}", XrefKind::Data.label(), section.name),
+        )
+    })
+}
+
+fn classify_raw_memory_xref(
+    target: u64,
+    image: &RawImage,
+    strings: &[ExtractedString],
+) -> Option<(XrefKind, String)> {
+    if let Some(string) = strings
+        .iter()
+        .find(|string| string_contains_address(string, target))
+    {
+        return Some((
+            XrefKind::String,
+            format!(
+                "{} -> {} {}",
+                XrefKind::String.label(),
+                string.encoding.label(),
+                bounded_xref_text(&string.value)
+            ),
+        ));
+    }
+
+    image
+        .contains_va(target)
+        .then(|| (XrefKind::Data, XrefKind::Data.label().to_owned()))
+}
+
+fn string_contains_address(string: &ExtractedString, address: u64) -> bool {
+    let byte_len = match string.encoding {
+        StringEncoding::Ascii => string.value.len(),
+        StringEncoding::Utf16Le => string.value.encode_utf16().count().saturating_mul(2),
+    };
+    let byte_len = u64::try_from(byte_len.max(1)).unwrap_or(1);
+    address >= string.address && address < string.address.saturating_add(byte_len)
+}
+
+fn bounded_xref_text(text: &str) -> String {
+    const MAX_LEN: usize = 48;
+    if text.chars().count() <= MAX_LEN {
+        text.to_owned()
+    } else {
+        let mut value = text.chars().take(MAX_LEN).collect::<String>();
+        value.push_str("...");
+        value
     }
 }
 
@@ -2985,8 +3127,13 @@ mod tests {
     fn sample_bytes() -> Vec<u8> {
         let mut bytes = vec![0u8; 0x900];
 
-        bytes[0x200..0x206].copy_from_slice(&[0xE8, 0x0B, 0x00, 0x00, 0x00, 0xC3]);
-        bytes[0x210] = 0xC3;
+        bytes[0x200..0x214].copy_from_slice(&[
+            0xE8, 0x1B, 0x00, 0x00, 0x00, // call 0x140001020
+            0x48, 0x8D, 0x0D, 0xF4, 0x0F, 0x00, 0x00, // lea rcx, [rip+0xFF4]
+            0x48, 0x8B, 0x05, 0x4D, 0x11, 0x00, 0x00, // mov rax, [rip+0x114D]
+            0xC3,
+        ]);
+        bytes[0x220] = 0xC3;
 
         write_c_string(&mut bytes, 0x400, "hello world");
         let utf16 = "wide";
@@ -3042,7 +3189,11 @@ mod tests {
 
     fn sample_raw_bytes() -> Vec<u8> {
         let mut bytes = vec![0u8; 0x80];
-        bytes[0x00..0x06].copy_from_slice(&[0xE8, 0x0B, 0x00, 0x00, 0x00, 0xC3]);
+        bytes[0x00..0x0D].copy_from_slice(&[
+            0x48, 0x8D, 0x0D, 0x19, 0x00, 0x00, 0x00, // lea rcx, [rip+0x19]
+            0xE8, 0x04, 0x00, 0x00, 0x00, // call 0x180000010
+            0xC3,
+        ]);
         bytes[0x10] = 0xC3;
         write_c_string(&mut bytes, 0x20, "raw string");
         bytes
@@ -3062,11 +3213,22 @@ mod tests {
         assert!(analysis
             .functions
             .iter()
-            .any(|function| function.start_va == 0x1400_01010));
+            .any(|function| function.start_va == 0x1400_01020));
         assert!(analysis
             .xrefs
             .iter()
-            .any(|xref| xref.from_va == 0x1400_01000 && xref.to_va == 0x1400_01010));
+            .any(|xref| xref.from_va == 0x1400_01000 && xref.to_va == 0x1400_01020));
+        assert!(analysis.xrefs.iter().any(|xref| {
+            xref.from_va == 0x1400_01005
+                && xref.to_va == 0x1400_02000
+                && xref.kind == XrefKind::String
+        }));
+        assert!(analysis.xrefs.iter().any(|xref| {
+            xref.from_va == 0x1400_0100C
+                && xref.to_va == 0x1400_02160
+                && xref.kind == XrefKind::Import
+                && xref.label.contains("CreateFileW")
+        }));
         assert!(analysis.strings.iter().any(
             |string| string.value == "hello world" && string.encoding == StringEncoding::Ascii
         ));
@@ -3097,7 +3259,7 @@ mod tests {
             .call_graph
             .edges
             .iter()
-            .any(|edge| { edge.caller_va == 0x1400_01000 && edge.callee_va == 0x1400_01010 }));
+            .any(|edge| { edge.caller_va == 0x1400_01000 && edge.callee_va == 0x1400_01020 }));
         assert!(analysis.pseudocode_functions.iter().any(|function| {
             function.function_start == 0x1400_01000
                 && function.lines.iter().any(|line| line.text.contains("sub_"))
@@ -3127,7 +3289,12 @@ mod tests {
         assert!(analysis
             .xrefs
             .iter()
-            .any(|xref| xref.from_va == 0x1800_00000 && xref.to_va == 0x1800_00010));
+            .any(|xref| xref.from_va == 0x1800_00007 && xref.to_va == 0x1800_00010));
+        assert!(analysis.xrefs.iter().any(|xref| {
+            xref.from_va == 0x1800_00000
+                && xref.to_va == 0x1800_00020
+                && xref.kind == XrefKind::String
+        }));
         assert!(analysis.imports.is_empty());
         assert!(analysis.exports.is_empty());
         assert!(analysis.relocations.is_empty());

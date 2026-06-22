@@ -4,6 +4,36 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.23.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added x64 decoded-instruction memory target metadata for RIP-relative and absolute memory operands.
+- Added PE memory-xref classification for string, import IAT thunk, relocation, and data-section targets.
+- Added Raw Binary memory-xref classification for string and data targets.
+- Added unit coverage for memory-target extraction and PE/Raw memory xrefs.
+
+### Changed
+
+- Updated the workspace version to `0.23.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the memory-xref checkpoint.
+- Xref views, search, headless reports, and Python helpers can now see data-oriented xrefs in addition to direct code calls and jumps.
+
+### Fixed
+
+- RIP-relative x64 references to strings and import IAT thunks are now recovered as xrefs, improving import-caller automation such as `examples/scripts/batch_rename_import_callers.py`.
+
+### Known Issues
+
+- Memory xrefs do not yet track read/write direction or register-computed indirect memory targets.
+- Import-caller recovery still depends on discovered functions reaching the instruction that references the IAT thunk.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.23.0-alpha.1`.
+- Roll back with: `git checkout v0.23.0-alpha.1`.
+
 ## v0.22.0-alpha.1 - 2026-06-23
 
 ### Added

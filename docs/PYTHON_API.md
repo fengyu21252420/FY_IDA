@@ -1,6 +1,6 @@
 # FY_IDA Python API
 
-FY_IDA v0.22.0-alpha.1 and later expose a lightweight script API through environment variables, the headless JSON report model, and a JSON action file for saved annotations.
+FY_IDA v0.23.0-alpha.1 and later expose a lightweight script API through environment variables, the headless JSON report model, and a JSON action file for saved annotations.
 
 ## Headless Scripts
 
@@ -21,7 +21,7 @@ The script receives:
 - `FYIDA_AUTOMATION_LABEL`: `script` for direct scripts, or a plugin label.
 - `FYIDA_AUTOMATION_KIND`: `script` or `plugin`.
 
-The JSON report contains input metadata, sections, functions, strings, imports, exports, relocations, xrefs, PDB records/symbols/types, the current type library, optional headless search results, current annotations, and structured Python automation results.
+The JSON report contains input metadata, sections, functions, strings, imports, exports, relocations, xrefs, PDB records/symbols/types, the current type library, optional headless search results, current annotations, and structured Python automation results. In v0.23.0-alpha.1 and later, xrefs include recovered x64 RIP-relative or absolute memory references to strings, import IAT thunks, relocations, and data sections.
 
 Successful Python runs are recorded under `automation.runs` with label, kind, plugin metadata, script path, status, exit code, elapsed time, stdout, stderr, and output-truncation flags. Annotation actions are recorded under `automation.actions`, summarized by `automation.action_count`, applied to report `annotations`, and saved by `--save-project`. Use `--export automation --export-format text` or `--export automation --export-format csv` to emit only automation run/action records.
 
@@ -48,7 +48,7 @@ project.add_bookmark(0x140001000)
 project.mark_code(0x140001000)
 ```
 
-Example scripts add `examples\python` to `sys.path` before importing the helper. `examples\scripts\find_string_xrefs.py` searches strings and prints their xrefs; set `FYIDA_QUERY` or pass a first script argument when running it directly. `examples\scripts\batch_rename_import_callers.py` demonstrates queuing names, function comments, and bookmarks for functions that reference imports.
+Example scripts add `examples\python` to `sys.path` before importing the helper. `examples\scripts\find_string_xrefs.py` searches strings and prints their xrefs; set `FYIDA_QUERY` or pass a first script argument when running it directly. `examples\scripts\batch_rename_import_callers.py` demonstrates queuing names, function comments, and bookmarks for functions that reference imports; `project.xrefs_to(import.thunk_va)` includes recovered IAT memory references when the decoded x64 instruction targets the import thunk.
 
 To persist script-requested annotations into a FY_IDA project file, run:
 

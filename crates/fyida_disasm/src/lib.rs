@@ -2,7 +2,8 @@ use std::fmt;
 
 use fyida_core::{PeImage, PeKind, RawArch, RawImage};
 use iced_x86::{
-    Code, Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter,
+    Code, Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter, OpKind,
+    Register,
 };
 
 const DEFAULT_MAX_BYTES: usize = 256;
@@ -28,6 +29,7 @@ pub struct DecodedInstruction {
     pub invalid: bool,
     pub flow: InstructionFlow,
     pub near_branch_target: Option<u64>,
+    pub memory_targets: Vec<u64>,
 }
 
 impl DecodedInstruction {
@@ -205,6 +207,7 @@ pub fn disassemble_x64(
                 invalid,
                 flow: InstructionFlow::Other,
                 near_branch_target: None,
+                memory_targets: Vec::new(),
             });
             continue;
         }
@@ -214,6 +217,7 @@ pub fn disassemble_x64(
         let (mnemonic, operands) = split_instruction_text(&formatted);
         let flow = classify_flow(&instruction);
         let near_branch_target = direct_branch_target(&instruction, &flow);
+        let memory_targets = memory_targets(&instruction);
 
         rows.push(DecodedInstruction {
             address: instruction.ip(),
@@ -223,6 +227,7 @@ pub fn disassemble_x64(
             invalid,
             flow,
             near_branch_target,
+            memory_targets,
         });
     }
 
@@ -296,6 +301,31 @@ fn direct_branch_target(instruction: &Instruction, flow: &InstructionFlow) -> Op
         _ => None,
     }
     .filter(|target| *target != 0)
+}
+
+fn memory_targets(instruction: &Instruction) -> Vec<u64> {
+    if !instruction.op_kinds().any(|kind| kind == OpKind::Memory) {
+        return Vec::new();
+    }
+
+    let mut targets = Vec::new();
+    if instruction.is_ip_rel_memory_operand() {
+        let target = instruction.ip_rel_memory_address();
+        if target != 0 {
+            targets.push(target);
+        }
+    } else if instruction.memory_base() == Register::None
+        && instruction.memory_index() == Register::None
+        && instruction.memory_displ_size() > 0
+    {
+        let target = instruction.memory_displacement64();
+        if target != 0 {
+            targets.push(target);
+        }
+    }
+    targets.sort_unstable();
+    targets.dedup();
+    targets
 }
 
 fn split_instruction_text(text: &str) -> (String, String) {
@@ -393,6 +423,13 @@ mod tests {
         assert_eq!(rows[2].mnemonic, "sub");
         assert_eq!(rows[3].mnemonic, "ret");
         assert_eq!(rows[3].flow, InstructionFlow::Return);
+    }
+
+    #[test]
+    fn records_rip_relative_memory_targets() {
+        let rows = disassemble_x64(0x1400_01000, &[0x48, 0x8B, 0x05, 0xF9, 0x0F, 0x00, 0x00], 1);
+
+        assert_eq!(rows[0].memory_targets, vec![0x1400_02000]);
     }
 
     #[test]
