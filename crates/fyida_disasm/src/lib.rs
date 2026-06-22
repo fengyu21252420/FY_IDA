@@ -1,6 +1,6 @@
 use std::fmt;
 
-use fyida_core::{PeImage, PeKind};
+use fyida_core::{PeImage, PeKind, RawArch, RawImage};
 use iced_x86::{
     Code, Decoder, DecoderOptions, FlowControl, Formatter, Instruction, IntelFormatter,
 };
@@ -48,6 +48,36 @@ pub enum DisassemblyError {
     EntryPointNotInSection { rva: u32 },
     NoBytesAvailable { file_offset: u64 },
 }
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum RawDisassemblyError {
+    UnsupportedArchitecture { arch: RawArch },
+    EntryPointOutOfBounds { entry: u64, file_size: usize },
+    NoBytesAvailable { entry: u64 },
+}
+
+impl fmt::Display for RawDisassemblyError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::UnsupportedArchitecture { arch } => {
+                write!(
+                    formatter,
+                    "当前版本仅支持 x64 Raw Binary，检测到 {}",
+                    arch.label()
+                )
+            }
+            Self::EntryPointOutOfBounds { entry, file_size } => write!(
+                formatter,
+                "Raw 入口点 0x{entry:016X} 超出文件大小 0x{file_size:08X}"
+            ),
+            Self::NoBytesAvailable { entry } => {
+                write!(formatter, "Raw 入口点 0x{entry:016X} 没有可解码字节")
+            }
+        }
+    }
+}
+
+impl std::error::Error for RawDisassemblyError {}
 
 impl fmt::Display for DisassemblyError {
     fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
@@ -199,6 +229,53 @@ pub fn disassemble_x64(
     rows
 }
 
+pub fn disassemble_raw_entry_point(
+    image: &RawImage,
+    bytes: &[u8],
+) -> Result<Vec<DecodedInstruction>, RawDisassemblyError> {
+    disassemble_raw_entry_point_with_limit(image, bytes, DEFAULT_MAX_INSTRUCTIONS)
+}
+
+pub fn disassemble_raw_entry_point_with_limit(
+    image: &RawImage,
+    bytes: &[u8],
+    max_instructions: usize,
+) -> Result<Vec<DecodedInstruction>, RawDisassemblyError> {
+    if image.arch != RawArch::X64 {
+        return Err(RawDisassemblyError::UnsupportedArchitecture { arch: image.arch });
+    }
+
+    let offset = usize::try_from(image.entry_offset().ok_or(
+        RawDisassemblyError::EntryPointOutOfBounds {
+            entry: image.entry_address,
+            file_size: bytes.len(),
+        },
+    )?)
+    .map_err(|_| RawDisassemblyError::EntryPointOutOfBounds {
+        entry: image.entry_address,
+        file_size: bytes.len(),
+    })?;
+    if offset >= bytes.len() {
+        return Err(RawDisassemblyError::EntryPointOutOfBounds {
+            entry: image.entry_address,
+            file_size: bytes.len(),
+        });
+    }
+
+    let decode_len = bytes.len().saturating_sub(offset).min(DEFAULT_MAX_BYTES);
+    if decode_len == 0 {
+        return Err(RawDisassemblyError::NoBytesAvailable {
+            entry: image.entry_address,
+        });
+    }
+
+    Ok(disassemble_x64(
+        image.entry_address,
+        &bytes[offset..offset + decode_len],
+        max_instructions,
+    ))
+}
+
 fn classify_flow(instruction: &Instruction) -> InstructionFlow {
     match instruction.flow_control() {
         FlowControl::Next => InstructionFlow::Next,
@@ -239,6 +316,7 @@ mod tests {
 
     use fyida_core::{
         CoffFileHeader, DosHeader, FileSelection, NtHeaders, PeImage, PeOptionalHeader, PeSection,
+        RawImage,
     };
 
     use super::*;
@@ -295,6 +373,11 @@ mod tests {
         bytes
     }
 
+    fn sample_raw_image() -> RawImage {
+        let selection = FileSelection::new(PathBuf::from(r"C:\samples\raw.bin"), 0x20);
+        RawImage::new(selection, 0x1800_00000, 0x1800_00002, RawArch::X64)
+    }
+
     #[test]
     fn decodes_x64_instructions_from_entry_point() {
         let image = sample_image();
@@ -330,5 +413,19 @@ mod tests {
             disassemble_entry_point_with_limit(&image, &sample_bytes(), 4).expect_err("x86");
 
         assert!(error.to_string().contains("当前版本仅支持 x64 PE"));
+    }
+
+    #[test]
+    fn decodes_raw_x64_from_entry_point() {
+        let image = sample_raw_image();
+        let bytes = [
+            0xCC, 0xCC, 0x48, 0x83, 0xEC, 0x20, 0x48, 0x83, 0xC4, 0x20, 0xC3,
+        ];
+
+        let rows = disassemble_raw_entry_point_with_limit(&image, &bytes, 3).expect("raw decode");
+
+        assert_eq!(rows[0].address, 0x1800_00002);
+        assert_eq!(rows[0].mnemonic, "sub");
+        assert_eq!(rows[2].mnemonic, "ret");
     }
 }

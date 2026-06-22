@@ -6,6 +6,19 @@ pub const PE_DIRECTORY_IMPORT: usize = 1;
 pub const PE_DIRECTORY_BASERELOC: usize = 5;
 pub const PE_DIRECTORY_LIMIT: usize = 16;
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RawArch {
+    X64,
+}
+
+impl RawArch {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::X64 => "x64",
+        }
+    }
+}
+
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSelection {
     path: PathBuf,
@@ -169,6 +182,62 @@ impl PeSection {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RawImage {
+    file: FileSelection,
+    pub base_address: u64,
+    pub entry_address: u64,
+    pub arch: RawArch,
+}
+
+impl RawImage {
+    pub fn new(file: FileSelection, base_address: u64, entry_address: u64, arch: RawArch) -> Self {
+        Self {
+            file,
+            base_address,
+            entry_address,
+            arch,
+        }
+    }
+
+    pub fn file(&self) -> &FileSelection {
+        &self.file
+    }
+
+    pub fn size_bytes(&self) -> u64 {
+        self.file.size_bytes()
+    }
+
+    pub fn end_address(&self) -> u64 {
+        self.base_address.saturating_add(self.size_bytes())
+    }
+
+    pub fn va_to_file_offset(&self, va: u64) -> Option<u64> {
+        let offset = va.checked_sub(self.base_address)?;
+        (offset < self.size_bytes()).then_some(offset)
+    }
+
+    pub fn file_offset_to_va(&self, file_offset: u64) -> Option<u64> {
+        (file_offset < self.size_bytes()).then_some(self.base_address.saturating_add(file_offset))
+    }
+
+    pub fn va_to_rva(&self, va: u64) -> Option<u64> {
+        self.va_to_file_offset(va)
+    }
+
+    pub fn rva_to_va(&self, rva: u64) -> Option<u64> {
+        self.file_offset_to_va(rva)
+    }
+
+    pub fn entry_offset(&self) -> Option<u64> {
+        self.va_to_file_offset(self.entry_address)
+    }
+
+    pub fn contains_va(&self, va: u64) -> bool {
+        self.va_to_file_offset(va).is_some()
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub struct PeImage {
     file: FileSelection,
     pub dos_header: DosHeader,
@@ -309,6 +378,7 @@ pub enum AnalysisState {
     NoFile,
     NotAnalyzed,
     PeLoaded,
+    RawLoaded,
     Error(String),
 }
 
@@ -318,6 +388,7 @@ impl AnalysisState {
             Self::NoFile => "尚未打开文件".to_owned(),
             Self::NotAnalyzed => "已选择文件 / 暂未分析".to_owned(),
             Self::PeLoaded => "PE 已加载".to_owned(),
+            Self::RawLoaded => "Raw Binary 已加载".to_owned(),
             Self::Error(message) => format!("错误：{message}"),
         }
     }
@@ -327,6 +398,7 @@ impl AnalysisState {
 pub struct ProjectState {
     selected_file: Option<FileSelection>,
     pe_image: Option<PeImage>,
+    raw_image: Option<RawImage>,
     analysis_state: AnalysisState,
     dirty: bool,
     current_address: Option<u64>,
@@ -340,6 +412,7 @@ impl Default for ProjectState {
         Self {
             selected_file: None,
             pe_image: None,
+            raw_image: None,
             analysis_state: AnalysisState::NoFile,
             dirty: false,
             current_address: None,
@@ -357,6 +430,10 @@ impl ProjectState {
 
     pub fn pe_image(&self) -> Option<&PeImage> {
         self.pe_image.as_ref()
+    }
+
+    pub fn raw_image(&self) -> Option<&RawImage> {
+        self.raw_image.as_ref()
     }
 
     pub fn analysis_state(&self) -> &AnalysisState {
@@ -386,6 +463,7 @@ impl ProjectState {
     pub fn select_file(&mut self, selection: FileSelection) {
         self.selected_file = Some(selection);
         self.pe_image = None;
+        self.raw_image = None;
         self.analysis_state = AnalysisState::NotAnalyzed;
         self.dirty = true;
         self.jump_to(0x1400_01000, Some("入口占位".to_owned()));
@@ -398,6 +476,7 @@ impl ProjectState {
 
         self.selected_file = Some(pe_image.file().clone());
         self.pe_image = Some(pe_image);
+        self.raw_image = None;
         self.analysis_state = AnalysisState::PeLoaded;
         self.dirty = true;
         self.current_address = Some(entry_point);
@@ -406,9 +485,25 @@ impl ProjectState {
         self.current_function = Some("入口点".to_owned());
     }
 
+    pub fn load_raw(&mut self, raw_image: RawImage) {
+        let entry_point = raw_image.entry_address;
+        let entry_rva = raw_image.entry_offset();
+
+        self.selected_file = Some(raw_image.file().clone());
+        self.pe_image = None;
+        self.raw_image = Some(raw_image);
+        self.analysis_state = AnalysisState::RawLoaded;
+        self.dirty = true;
+        self.current_address = Some(entry_point);
+        self.current_rva = entry_rva;
+        self.current_file_offset = entry_rva;
+        self.current_function = Some("raw_entry".to_owned());
+    }
+
     pub fn set_file_error(&mut self, selection: FileSelection, message: impl Into<String>) {
         self.selected_file = Some(selection);
         self.pe_image = None;
+        self.raw_image = None;
         self.analysis_state = AnalysisState::Error(message.into());
         self.dirty = false;
         self.current_address = None;
@@ -419,6 +514,7 @@ impl ProjectState {
 
     pub fn set_error(&mut self, message: impl Into<String>) {
         self.pe_image = None;
+        self.raw_image = None;
         self.analysis_state = AnalysisState::Error(message.into());
     }
 
@@ -430,6 +526,9 @@ impl ProjectState {
             self.current_file_offset = self
                 .current_rva
                 .and_then(|rva| pe_image.rva_to_file_offset(rva));
+        } else if let Some(raw_image) = &self.raw_image {
+            self.current_rva = raw_image.va_to_rva(address);
+            self.current_file_offset = raw_image.va_to_file_offset(address);
         } else {
             self.current_rva = address.checked_sub(0x1400_00000);
             self.current_file_offset = self.current_rva.map(|rva| rva.saturating_add(0x400));
@@ -628,5 +727,20 @@ mod tests {
         assert_eq!(project.current_rva(), Some(0x1010));
         assert_eq!(project.current_file_offset(), Some(0x210));
         assert_eq!(project.current_function(), Some("入口点"));
+    }
+
+    #[test]
+    fn project_load_raw_sets_entry_point_context() {
+        let selection = FileSelection::new(PathBuf::from(r"C:\samples\raw.bin"), 0x80);
+        let image = RawImage::new(selection, 0x1800_00000, 0x1800_00020, RawArch::X64);
+        let mut project = ProjectState::default();
+
+        project.load_raw(image);
+
+        assert_eq!(project.analysis_state(), &AnalysisState::RawLoaded);
+        assert_eq!(project.current_address(), Some(0x1800_00020));
+        assert_eq!(project.current_rva(), Some(0x20));
+        assert_eq!(project.current_file_offset(), Some(0x20));
+        assert_eq!(project.current_function(), Some("raw_entry"));
     }
 }

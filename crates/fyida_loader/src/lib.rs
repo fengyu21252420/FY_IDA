@@ -3,7 +3,7 @@ use std::path::{Path, PathBuf};
 
 use fyida_core::{
     CoffFileHeader, DosHeader, FileSelection, NtHeaders, PeDataDirectory, PeImage, PeKind,
-    PeOptionalHeader, PeSection, PE_DIRECTORY_LIMIT,
+    PeOptionalHeader, PeSection, RawArch, RawImage, PE_DIRECTORY_LIMIT,
 };
 
 #[derive(Debug)]
@@ -20,6 +20,10 @@ pub enum LoaderError {
     InvalidPe {
         path: PathBuf,
         source: PeParseError,
+    },
+    InvalidRaw {
+        path: PathBuf,
+        message: String,
     },
 }
 
@@ -38,6 +42,7 @@ impl fmt::Display for LoaderError {
             }
             Self::NotAFile(path) => write!(formatter, "选择的路径不是普通文件：{}", path.display()),
             Self::InvalidPe { source, .. } => write!(formatter, "不是有效的 PE 文件：{source}"),
+            Self::InvalidRaw { message, .. } => write!(formatter, "Raw Binary 参数无效：{message}"),
         }
     }
 }
@@ -84,6 +89,29 @@ pub struct LoadedPeFile {
     pub bytes: Vec<u8>,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct RawLoadOptions {
+    pub base_address: u64,
+    pub entry_address: u64,
+    pub arch: RawArch,
+}
+
+impl Default for RawLoadOptions {
+    fn default() -> Self {
+        Self {
+            base_address: 0x1400_00000,
+            entry_address: 0x1400_00000,
+            arch: RawArch::X64,
+        }
+    }
+}
+
+#[derive(Debug, Clone)]
+pub struct LoadedRawFile {
+    pub image: RawImage,
+    pub bytes: Vec<u8>,
+}
+
 pub fn load_file_metadata(path: impl AsRef<Path>) -> Result<FileSelection, LoaderError> {
     let path = path.as_ref().to_path_buf();
     let metadata = std::fs::metadata(&path).map_err(|source| LoaderError::Metadata {
@@ -124,6 +152,56 @@ pub fn load_pe_file(path: impl AsRef<Path>) -> Result<PeImage, LoaderError> {
 pub fn load_pe_file_with_bytes(path: impl AsRef<Path>) -> Result<LoadedPeFile, LoaderError> {
     let selection = load_file_metadata(path)?;
     load_pe_from_selection_with_bytes(selection)
+}
+
+pub fn load_raw_from_selection_with_bytes(
+    selection: FileSelection,
+    options: RawLoadOptions,
+) -> Result<LoadedRawFile, LoaderError> {
+    let path = selection.path().to_path_buf();
+    let bytes = std::fs::read(&path).map_err(|source| LoaderError::Read {
+        path: path.clone(),
+        source,
+    })?;
+    let image = raw_image_from_selection(selection, options)
+        .map_err(|message| LoaderError::InvalidRaw { path, message })?;
+    Ok(LoadedRawFile { image, bytes })
+}
+
+pub fn load_raw_file_with_bytes(
+    path: impl AsRef<Path>,
+    options: RawLoadOptions,
+) -> Result<LoadedRawFile, LoaderError> {
+    let selection = load_file_metadata(path)?;
+    load_raw_from_selection_with_bytes(selection, options)
+}
+
+pub fn raw_image_from_selection(
+    selection: FileSelection,
+    options: RawLoadOptions,
+) -> Result<RawImage, String> {
+    if selection.size_bytes() == 0 {
+        return Err("文件为空，无法按 Raw Binary 加载".to_owned());
+    }
+    let end_address = options
+        .base_address
+        .checked_add(selection.size_bytes())
+        .ok_or_else(|| "base + 文件大小溢出 u64 地址空间".to_owned())?;
+    if options.entry_address < options.base_address || options.entry_address >= end_address {
+        return Err(format!(
+            "entry 0x{:016X} 不在 base 0x{:016X} 到 0x{:016X} 范围内",
+            options.entry_address,
+            options.base_address,
+            end_address.saturating_sub(1)
+        ));
+    }
+
+    Ok(RawImage::new(
+        selection,
+        options.base_address,
+        options.entry_address,
+        options.arch,
+    ))
 }
 
 pub fn parse_pe_bytes(selection: FileSelection, bytes: &[u8]) -> Result<PeImage, PeParseError> {
@@ -408,6 +486,13 @@ mod tests {
         FileSelection::new(PathBuf::from(r"C:\samples\demo.exe"), bytes.len() as u64)
     }
 
+    fn raw_selection_for(bytes: &[u8]) -> FileSelection {
+        FileSelection::new(
+            PathBuf::from(r"C:\samples\firmware.bin"),
+            bytes.len() as u64,
+        )
+    }
+
     #[test]
     fn directory_is_not_accepted_as_file() {
         let error = load_file_metadata(".").expect_err("directories should be rejected");
@@ -463,5 +548,37 @@ mod tests {
         let error = parse_pe_bytes(selection_for(bytes), bytes).expect_err("not PE");
 
         assert_eq!(error, PeParseError::MissingDosSignature);
+    }
+
+    #[test]
+    fn creates_raw_image_with_user_supplied_mapping() {
+        let bytes = vec![0x90; 0x40];
+        let options = RawLoadOptions {
+            base_address: 0x1800_00000,
+            entry_address: 0x1800_00010,
+            arch: RawArch::X64,
+        };
+
+        let image = raw_image_from_selection(raw_selection_for(&bytes), options).expect("raw");
+
+        assert_eq!(image.base_address, 0x1800_00000);
+        assert_eq!(image.entry_address, 0x1800_00010);
+        assert_eq!(image.entry_offset(), Some(0x10));
+        assert_eq!(image.file_offset_to_va(0x20), Some(0x1800_00020));
+    }
+
+    #[test]
+    fn rejects_raw_entry_outside_file_range() {
+        let bytes = vec![0x90; 0x40];
+        let options = RawLoadOptions {
+            base_address: 0x1800_00000,
+            entry_address: 0x1800_00080,
+            arch: RawArch::X64,
+        };
+
+        let error =
+            raw_image_from_selection(raw_selection_for(&bytes), options).expect_err("bad entry");
+
+        assert!(error.contains("不在 base"));
     }
 }

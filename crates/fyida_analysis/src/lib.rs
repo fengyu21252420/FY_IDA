@@ -1,10 +1,13 @@
 use std::collections::{HashSet, VecDeque};
 
 use fyida_core::{
-    FileSelection, PeImage, PeKind, PE_DIRECTORY_BASERELOC, PE_DIRECTORY_EXPORT,
+    FileSelection, PeImage, PeKind, RawImage, PE_DIRECTORY_BASERELOC, PE_DIRECTORY_EXPORT,
     PE_DIRECTORY_IMPORT,
 };
-use fyida_disasm::{disassemble_entry_point, disassemble_x64, InstructionFlow};
+use fyida_disasm::{
+    disassemble_entry_point, disassemble_raw_entry_point, disassemble_x64, DecodedInstruction,
+    InstructionFlow,
+};
 
 const MAX_FUNCTIONS: usize = 256;
 const MAX_FUNCTION_BYTES: usize = 4096;
@@ -162,6 +165,18 @@ pub fn analyze_pe(image: &PeImage, bytes: &[u8]) -> StaticAnalysis {
     analysis
 }
 
+pub fn analyze_raw(image: &RawImage, bytes: &[u8]) -> StaticAnalysis {
+    let (functions, xrefs) = discover_raw_functions_and_xrefs(image, bytes);
+    StaticAnalysis {
+        functions,
+        strings: scan_raw_strings(image, bytes),
+        imports: Vec::new(),
+        exports: Vec::new(),
+        relocations: Vec::new(),
+        xrefs,
+    }
+}
+
 pub fn static_analysis_log_lines(analysis: &StaticAnalysis) -> Vec<String> {
     vec![
         format!("函数发现：{} 个函数入口。", analysis.functions.len()),
@@ -224,11 +239,44 @@ pub fn pe_entry_disassembly(image: &PeImage, bytes: &[u8]) -> DisassemblyBuild {
     }
 }
 
+pub fn raw_entry_disassembly(image: &RawImage, bytes: &[u8]) -> DisassemblyBuild {
+    match disassemble_raw_entry_point(image, bytes) {
+        Ok(instructions) if !instructions.is_empty() => instructions_to_disassembly_build(
+            instructions,
+            "x64 Raw 反汇编完成",
+            "无效 x64 指令占位，分析继续",
+        ),
+        Ok(_) => DisassemblyBuild {
+            rows: vec![DisassemblyRow {
+                address: image.entry_address,
+                bytes: "--".to_owned(),
+                mnemonic: "提示".to_owned(),
+                operands: format!("FO 0x{:08X}", image.entry_offset().unwrap_or(0)),
+                comment: "Raw 入口点附近没有可显示的 x64 指令。".to_owned(),
+            }],
+            log_lines: vec!["x64 Raw 反汇编未产生指令。".to_owned()],
+        },
+        Err(error) => {
+            let message = error.to_string();
+            DisassemblyBuild {
+                rows: vec![DisassemblyRow {
+                    address: image.entry_address,
+                    bytes: "--".to_owned(),
+                    mnemonic: "提示".to_owned(),
+                    operands: format!("FO 0x{:08X}", image.entry_offset().unwrap_or(0)),
+                    comment: message.clone(),
+                }],
+                log_lines: vec![format!("Raw 反汇编提示：{message}")],
+            }
+        }
+    }
+}
+
 pub fn startup_log_lines() -> Vec<String> {
     vec![
         "FY_IDA GUI 已启动。".to_owned(),
-        "当前版本：v0.4.0-alpha.1 开发中，基础静态分析已接入。".to_owned(),
-        "可打开 Windows x64 PE 文件并显示入口点指令、函数、字符串、导入导出和重定位摘要。"
+        "当前版本：v0.4.1-alpha.1 开发中，Raw Binary x64 支持已接入。".to_owned(),
+        "可打开 Windows x64 PE 或 Raw Binary，并显示入口点指令、函数、字符串和基础引用。"
             .to_owned(),
     ]
 }
@@ -250,6 +298,21 @@ pub fn pe_loaded_log_lines(image: &PeImage) -> Vec<String> {
         ),
         format!("Subsystem：{}", image.subsystem_label()),
         format!("Section 数量：{}", image.sections.len()),
+    ]
+}
+
+pub fn raw_loaded_log_lines(image: &RawImage) -> Vec<String> {
+    vec![
+        format!("Raw Binary 加载完成：{}", image.file().path().display()),
+        format!("文件大小：{}", image.file().formatted_size()),
+        format!("Arch：{}", image.arch.label()),
+        format!("Base：0x{:016X}", image.base_address),
+        format!(
+            "Entry：VA 0x{:016X} / FO 0x{:08X}",
+            image.entry_address,
+            image.entry_offset().unwrap_or(0)
+        ),
+        format!("End：0x{:016X}", image.end_address()),
     ]
 }
 
@@ -293,7 +356,9 @@ fn discover_functions_and_xrefs(
 
         let mut last_end = start_va;
         let mut call_count = 0usize;
+        let mut instruction_count = 0usize;
         for instruction in &instructions {
+            instruction_count += 1;
             let instruction_end = instruction
                 .address
                 .saturating_add(u64::try_from(instruction.bytes.len()).unwrap_or(0));
@@ -343,7 +408,95 @@ fn discover_functions_and_xrefs(
             start_va,
             name,
             size: last_end.saturating_sub(start_va),
-            instruction_count: instructions.len(),
+            instruction_count,
+            call_count,
+        });
+    }
+
+    functions.sort_by_key(|function| function.start_va);
+    xrefs.sort_by_key(|xref| (xref.from_va, xref.to_va));
+    (functions, xrefs)
+}
+
+fn discover_raw_functions_and_xrefs(
+    image: &RawImage,
+    bytes: &[u8],
+) -> (Vec<FunctionSummary>, Vec<XrefSummary>) {
+    let mut worklist = VecDeque::from([image.entry_address]);
+    let mut discovered = HashSet::from([image.entry_address]);
+    let mut processed = HashSet::new();
+    let mut xref_keys = HashSet::new();
+    let mut functions = Vec::new();
+    let mut xrefs = Vec::new();
+
+    while let Some(start_va) = worklist.pop_front() {
+        if processed.contains(&start_va) || !image.contains_va(start_va) {
+            continue;
+        }
+        processed.insert(start_va);
+
+        let Some(function_bytes) = bytes_from_raw_va(image, bytes, start_va, MAX_FUNCTION_BYTES)
+        else {
+            continue;
+        };
+        let instructions = disassemble_x64(start_va, function_bytes, MAX_INSTRUCTIONS_PER_FUNCTION);
+        if instructions.is_empty() {
+            continue;
+        }
+
+        let mut last_end = start_va;
+        let mut call_count = 0usize;
+        let mut instruction_count = 0usize;
+        for instruction in &instructions {
+            instruction_count += 1;
+            let instruction_end = instruction
+                .address
+                .saturating_add(u64::try_from(instruction.bytes.len()).unwrap_or(0));
+            last_end = last_end.max(instruction_end);
+
+            if let Some(target) = instruction.near_branch_target {
+                let kind = match instruction.flow {
+                    InstructionFlow::DirectCall => Some(XrefKind::CodeCall),
+                    InstructionFlow::UnconditionalBranch | InstructionFlow::ConditionalBranch => {
+                        Some(XrefKind::CodeJump)
+                    }
+                    _ => None,
+                };
+
+                if let Some(kind) = kind {
+                    if xref_keys.insert((instruction.address, target, kind)) {
+                        xrefs.push(XrefSummary {
+                            from_va: instruction.address,
+                            to_va: target,
+                            kind,
+                            label: format!("{} -> 0x{target:016X}", kind.label()),
+                        });
+                    }
+                }
+
+                if instruction.flow == InstructionFlow::DirectCall && image.contains_va(target) {
+                    call_count += 1;
+                    if discovered.len() < MAX_FUNCTIONS && discovered.insert(target) {
+                        worklist.push_back(target);
+                    }
+                }
+            }
+
+            if instruction.flow == InstructionFlow::Return {
+                break;
+            }
+        }
+
+        let name = if start_va == image.entry_address {
+            "raw_entry".to_owned()
+        } else {
+            format!("sub_{start_va:016X}")
+        };
+        functions.push(FunctionSummary {
+            start_va,
+            name,
+            size: last_end.saturating_sub(start_va),
+            instruction_count,
             call_count,
         });
     }
@@ -609,6 +762,15 @@ fn scan_strings(image: &PeImage, bytes: &[u8]) -> Vec<ExtractedString> {
     strings
 }
 
+fn scan_raw_strings(image: &RawImage, bytes: &[u8]) -> Vec<ExtractedString> {
+    let mut strings = Vec::new();
+    scan_ascii_strings_raw(image, bytes, &mut strings, MAX_STRINGS);
+    scan_utf16le_strings_raw(image, bytes, &mut strings, MAX_STRINGS);
+    strings.sort_by_key(|string| (string.address, string.encoding as u8));
+    strings.truncate(MAX_STRINGS);
+    strings
+}
+
 fn scan_ascii_strings(
     image: &PeImage,
     bytes: &[u8],
@@ -681,6 +843,76 @@ fn scan_utf16le_strings(
     }
 }
 
+fn scan_ascii_strings_raw(
+    image: &RawImage,
+    bytes: &[u8],
+    strings: &mut Vec<ExtractedString>,
+    max_strings: usize,
+) {
+    let mut index = 0usize;
+    while index < bytes.len() && strings.len() < max_strings {
+        if !is_ascii_string_byte(bytes[index]) {
+            index += 1;
+            continue;
+        }
+
+        let start = index;
+        while index < bytes.len() && is_ascii_string_byte(bytes[index]) {
+            index += 1;
+        }
+
+        let nul_terminated = index < bytes.len() && bytes[index] == 0;
+        if index.saturating_sub(start) >= MIN_STRING_CHARS && nul_terminated {
+            let file_offset = u64::try_from(start).unwrap_or(0);
+            let address = image.file_offset_to_va(file_offset).unwrap_or(file_offset);
+            strings.push(ExtractedString {
+                address,
+                file_offset,
+                encoding: StringEncoding::Ascii,
+                value: String::from_utf8_lossy(&bytes[start..index]).to_string(),
+            });
+        }
+    }
+}
+
+fn scan_utf16le_strings_raw(
+    image: &RawImage,
+    bytes: &[u8],
+    strings: &mut Vec<ExtractedString>,
+    max_strings: usize,
+) {
+    let mut index = 0usize;
+    while index + 1 < bytes.len() && strings.len() < max_strings {
+        let Some(first_char) = read_utf16_printable(bytes, index) else {
+            index += 1;
+            continue;
+        };
+
+        let start = index;
+        let mut chars = vec![first_char];
+        index += 2;
+        while index + 1 < bytes.len() {
+            let Some(ch) = read_utf16_printable(bytes, index) else {
+                break;
+            };
+            chars.push(ch);
+            index += 2;
+        }
+
+        let nul_terminated = index + 1 < bytes.len() && bytes[index] == 0 && bytes[index + 1] == 0;
+        if chars.len() >= MIN_STRING_CHARS && nul_terminated {
+            let file_offset = u64::try_from(start).unwrap_or(0);
+            let address = image.file_offset_to_va(file_offset).unwrap_or(file_offset);
+            strings.push(ExtractedString {
+                address,
+                file_offset,
+                encoding: StringEncoding::Utf16Le,
+                value: String::from_utf16_lossy(&chars),
+            });
+        }
+    }
+}
+
 fn section_raw_bytes<'a>(image: &PeImage, bytes: &'a [u8], section_rva: u32) -> Option<&'a [u8]> {
     let section = image.section_containing_rva(u64::from(section_rva))?;
     let start = usize::try_from(section.pointer_to_raw_data).ok()?;
@@ -712,6 +944,20 @@ fn bytes_from_va<'a>(
     let len = available
         .min(usize::try_from(raw_remaining).unwrap_or(usize::MAX))
         .min(max_len);
+    (len > 0).then_some(&bytes[start..start + len])
+}
+
+fn bytes_from_raw_va<'a>(
+    image: &RawImage,
+    bytes: &'a [u8],
+    va: u64,
+    max_len: usize,
+) -> Option<&'a [u8]> {
+    let start = usize::try_from(image.va_to_file_offset(va)?).ok()?;
+    if start >= bytes.len() {
+        return None;
+    }
+    let len = bytes.len().saturating_sub(start).min(max_len);
     (len > 0).then_some(&bytes[start..start + len])
 }
 
@@ -771,6 +1017,41 @@ fn disassembly_error_row(image: &PeImage, message: &str) -> DisassemblyRow {
     }
 }
 
+fn instructions_to_disassembly_build(
+    instructions: Vec<DecodedInstruction>,
+    complete_label: &str,
+    invalid_comment: &str,
+) -> DisassemblyBuild {
+    let invalid_count = instructions
+        .iter()
+        .filter(|instruction| instruction.invalid)
+        .count();
+    let rows = instructions
+        .into_iter()
+        .map(|instruction| DisassemblyRow {
+            address: instruction.address,
+            bytes: instruction.bytes_text(),
+            mnemonic: instruction.mnemonic,
+            operands: instruction.operands,
+            comment: if instruction.invalid {
+                invalid_comment.to_owned()
+            } else {
+                String::new()
+            },
+        })
+        .collect::<Vec<_>>();
+    let mut log_lines = vec![format!(
+        "{complete_label}：入口点附近 {} 条指令。",
+        rows.len()
+    )];
+    if invalid_count > 0 {
+        log_lines.push(format!(
+            "发现 {invalid_count} 条无效指令，已用 db 占位显示。"
+        ));
+    }
+    DisassemblyBuild { rows, log_lines }
+}
+
 fn empty_workspace_rows() -> Vec<DisassemblyRow> {
     vec![
         DisassemblyRow {
@@ -803,7 +1084,7 @@ mod tests {
 
     use fyida_core::{
         CoffFileHeader, DosHeader, FileSelection, NtHeaders, PeDataDirectory, PeOptionalHeader,
-        PeSection,
+        PeSection, RawArch, RawImage,
     };
 
     use super::*;
@@ -940,6 +1221,19 @@ mod tests {
         bytes
     }
 
+    fn sample_raw_image() -> RawImage {
+        let selection = FileSelection::new(PathBuf::from(r"C:\samples\raw.bin"), 0x80);
+        RawImage::new(selection, 0x1800_00000, 0x1800_00000, RawArch::X64)
+    }
+
+    fn sample_raw_bytes() -> Vec<u8> {
+        let mut bytes = vec![0u8; 0x80];
+        bytes[0x00..0x06].copy_from_slice(&[0xE8, 0x0B, 0x00, 0x00, 0x00, 0xC3]);
+        bytes[0x10] = 0xC3;
+        write_c_string(&mut bytes, 0x20, "raw string");
+        bytes
+    }
+
     #[test]
     fn analyzes_functions_strings_imports_exports_relocations_and_xrefs() {
         let image = sample_image();
@@ -975,5 +1269,33 @@ mod tests {
         assert_eq!(analysis.exports[0].va, 0x1400_01000);
         assert_eq!(analysis.relocations[0].rva, 0x1020);
         assert_eq!(analysis.relocations[0].kind_label(), "DIR64");
+    }
+
+    #[test]
+    fn analyzes_raw_functions_strings_and_xrefs() {
+        let image = sample_raw_image();
+        let bytes = sample_raw_bytes();
+
+        let analysis = analyze_raw(&image, &bytes);
+
+        assert!(analysis
+            .functions
+            .iter()
+            .any(|function| function.name == "raw_entry" && function.start_va == 0x1800_00000));
+        assert!(analysis
+            .functions
+            .iter()
+            .any(|function| function.start_va == 0x1800_00010));
+        assert!(analysis
+            .strings
+            .iter()
+            .any(|string| string.value == "raw string" && string.address == 0x1800_00020));
+        assert!(analysis
+            .xrefs
+            .iter()
+            .any(|xref| xref.from_va == 0x1800_00000 && xref.to_va == 0x1800_00010));
+        assert!(analysis.imports.is_empty());
+        assert!(analysis.exports.is_empty());
+        assert!(analysis.relocations.is_empty());
     }
 }

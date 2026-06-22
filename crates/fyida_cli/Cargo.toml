@@ -8,6 +8,7 @@ publish = false
 [dependencies]
 clap.workspace = true
 fyida_analysis.workspace = true
+fyida_core.workspace = true
 fyida_disasm.workspace = true
 fyida_loader.workspace = true
 

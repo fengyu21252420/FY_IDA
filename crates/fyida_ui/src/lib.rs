@@ -7,12 +7,15 @@ use eframe::egui::{
     Visuals, Window,
 };
 use fyida_analysis::{
-    analyze_pe, empty_workspace_disassembly, file_error_log_lines, pe_entry_disassembly,
-    pe_loaded_log_lines, startup_log_lines, static_analysis_log_lines, DisassemblyRow,
-    StaticAnalysis,
+    analyze_pe, analyze_raw, empty_workspace_disassembly, file_error_log_lines,
+    pe_entry_disassembly, pe_loaded_log_lines, raw_entry_disassembly, raw_loaded_log_lines,
+    startup_log_lines, static_analysis_log_lines, DisassemblyRow, StaticAnalysis,
 };
-use fyida_core::{format_address, FileSelection, ProjectState, APP_NAME};
-use fyida_loader::{load_file_metadata, load_pe_from_selection_with_bytes};
+use fyida_core::{format_address, FileSelection, ProjectState, RawArch, RawImage, APP_NAME};
+use fyida_loader::{
+    load_file_metadata, load_pe_from_selection_with_bytes, load_raw_from_selection_with_bytes,
+    RawLoadOptions,
+};
 use rfd::FileDialog;
 
 const LEFT_TABS: [&str; 7] = ["函数", "名称", "字符串", "导入", "导出", "段", "书签"];
@@ -55,6 +58,12 @@ struct FyIdaApp {
     quick_jump_text: String,
     search_open: bool,
     search_text: String,
+    raw_dialog_open: bool,
+    pending_raw_selection: Option<FileSelection>,
+    raw_base_text: String,
+    raw_entry_text: String,
+    raw_arch_text: String,
+    raw_error_text: String,
     logs: Vec<String>,
     search_results: Vec<String>,
     disassembly_rows: Vec<DisassemblyRow>,
@@ -78,6 +87,12 @@ impl FyIdaApp {
             quick_jump_text: String::new(),
             search_open: false,
             search_text: String::new(),
+            raw_dialog_open: false,
+            pending_raw_selection: None,
+            raw_base_text: "0x140000000".to_owned(),
+            raw_entry_text: "0x140000000".to_owned(),
+            raw_arch_text: "x64".to_owned(),
+            raw_error_text: String::new(),
             logs: startup_log_lines(),
             search_results: vec!["尚未执行搜索。".to_owned()],
             disassembly_rows: empty_workspace_disassembly(),
@@ -100,6 +115,38 @@ impl FyIdaApp {
             .pick_file()
         {
             self.select_path(path);
+        }
+    }
+
+    fn open_raw_file_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .set_title("打开 Raw Binary")
+            .add_filter("Raw Binary", &["bin", "dat", "raw", "dump"])
+            .add_filter("所有文件", &["*"])
+            .pick_file()
+        {
+            match load_file_metadata(&path) {
+                Ok(selection) => {
+                    self.pending_raw_selection = Some(selection);
+                    self.raw_dialog_open = true;
+                    self.raw_error_text.clear();
+                    if self.raw_base_text.trim().is_empty() {
+                        self.raw_base_text = "0x140000000".to_owned();
+                    }
+                    if self.raw_entry_text.trim().is_empty() {
+                        self.raw_entry_text = self.raw_base_text.clone();
+                    }
+                }
+                Err(error) => {
+                    let message = error.to_string();
+                    self.project.set_error(message.clone());
+                    self.disassembly_rows = file_error_disassembly_row(&message);
+                    self.analysis = None;
+                    self.logs.push(message);
+                    self.right_tab = 1;
+                    self.bottom_tab = 0;
+                }
+            }
         }
     }
 
@@ -127,6 +174,15 @@ impl FyIdaApp {
         }
     }
 
+    fn load_raw_selected_file(&mut self, selection: FileSelection, options: RawLoadOptions) {
+        self.add_recent_file(selection.path().to_path_buf());
+
+        match load_raw_from_selection_with_bytes(selection.clone(), options) {
+            Ok(loaded) => self.apply_raw_image(loaded.image, &loaded.bytes),
+            Err(error) => self.apply_file_error(selection, error.to_string()),
+        }
+    }
+
     fn apply_pe_image(&mut self, image: fyida_core::PeImage, bytes: &[u8]) {
         let analysis = analyze_pe(&image, bytes);
         let disassembly = pe_entry_disassembly(&image, bytes);
@@ -136,6 +192,20 @@ impl FyIdaApp {
         self.disassembly_rows = disassembly.rows;
         self.analysis = Some(analysis);
         self.project.load_pe(image);
+        self.center_tab = 0;
+        self.right_tab = 1;
+        self.bottom_tab = 0;
+    }
+
+    fn apply_raw_image(&mut self, image: RawImage, bytes: &[u8]) {
+        let analysis = analyze_raw(&image, bytes);
+        let disassembly = raw_entry_disassembly(&image, bytes);
+        self.logs.extend(raw_loaded_log_lines(&image));
+        self.logs.extend(static_analysis_log_lines(&analysis));
+        self.logs.extend(disassembly.log_lines);
+        self.disassembly_rows = disassembly.rows;
+        self.analysis = Some(analysis);
+        self.project.load_raw(image);
         self.center_tab = 0;
         self.right_tab = 1;
         self.bottom_tab = 0;
@@ -184,7 +254,7 @@ impl FyIdaApp {
                             ui.close_menu();
                         }
                         if ui.button("打开 Raw Binary...").clicked() {
-                            self.open_file_dialog();
+                            self.open_raw_file_dialog();
                             ui.close_menu();
                         }
                         ui.separator();
@@ -286,8 +356,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.4.0-alpha.1");
-                        ui.label("基础静态分析索引 MVP。");
+                        ui.label("FY_IDA v0.4.1-alpha.1");
+                        ui.label("Raw Binary x64 支持 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -648,7 +718,34 @@ impl FyIdaApp {
         let (image_base, sections) = match self.project.pe_image() {
             Some(image) => (image.image_base(), image.sections.clone()),
             None => {
-                placeholder_list(ui, &["尚未解析 section table"]);
+                if let Some(raw) = self.project.raw_image() {
+                    let base_address = raw.base_address;
+                    let size_bytes = raw.size_bytes();
+                    Grid::new("raw_segment_grid")
+                        .num_columns(5)
+                        .striped(true)
+                        .spacing([10.0, 4.0])
+                        .show(ui, |ui| {
+                            ui.strong("名称");
+                            ui.strong("Base");
+                            ui.strong("FO");
+                            ui.strong("大小");
+                            ui.strong("权限");
+                            ui.end_row();
+
+                            if ui.selectable_label(false, "raw").clicked() {
+                                self.project.jump_to(base_address, Some("raw".to_owned()));
+                                self.logs.push("跳转到 Raw Binary 起始地址。".to_owned());
+                            }
+                            ui.label(format!("{:016X}", base_address));
+                            ui.label("00000000");
+                            ui.label(format!("0x{:X}", size_bytes));
+                            ui.label("R-X");
+                            ui.end_row();
+                        });
+                } else {
+                    placeholder_list(ui, &["尚未解析 section table"]);
+                }
                 return;
             }
         };
@@ -809,6 +906,34 @@ impl FyIdaApp {
                             ui.label("Sections");
                             ui.label(image.sections.len().to_string());
                             ui.end_row();
+                        } else if let Some(raw) = self.project.raw_image() {
+                            ui.separator();
+                            ui.separator();
+                            ui.end_row();
+
+                            ui.label("格式");
+                            ui.label("Raw Binary");
+                            ui.end_row();
+
+                            ui.label("Arch");
+                            ui.label(raw.arch.label());
+                            ui.end_row();
+
+                            ui.label("Base");
+                            ui.label(format!("0x{:016X}", raw.base_address));
+                            ui.end_row();
+
+                            ui.label("Entry");
+                            ui.label(format!("0x{:016X}", raw.entry_address));
+                            ui.end_row();
+
+                            ui.label("Entry FO");
+                            ui.label(format!("0x{:08X}", raw.entry_offset().unwrap_or(0)));
+                            ui.end_row();
+
+                            ui.label("End");
+                            ui.label(format!("0x{:016X}", raw.end_address()));
+                            ui.end_row();
                         }
                     });
             }
@@ -883,7 +1008,7 @@ impl FyIdaApp {
                     self.open_file_dialog();
                 }
                 if ui.button("打开 Raw Binary").clicked() {
-                    self.open_file_dialog();
+                    self.open_raw_file_dialog();
                 }
                 ui.add_enabled(false, egui::Button::new("打开项目"));
             });
@@ -928,6 +1053,16 @@ impl FyIdaApp {
                         ui.label(format!("VA {:016X}", image.entry_point_va()));
                         ui.label(format!("RVA {:08X}", image.entry_point_rva()));
                         ui.label("EntryPoint");
+                        ui.end_row();
+                    } else if let Some(raw) = self.project.raw_image() {
+                        ui.label("FO 00000000");
+                        ui.label("Raw Binary 起始字节");
+                        ui.label(format!("VA {:016X}", raw.base_address));
+                        ui.end_row();
+
+                        ui.label(format!("FO {:08X}", raw.entry_offset().unwrap_or(0)));
+                        ui.label("Raw EntryPoint");
+                        ui.label(format!("VA {:016X}", raw.entry_address));
                         ui.end_row();
                     } else {
                         ui.label("00001000");
@@ -1004,25 +1139,112 @@ impl FyIdaApp {
                 }
             });
         self.search_open = search_open && self.search_open;
+
+        let mut raw_open = self.raw_dialog_open;
+        Window::new("打开 Raw Binary")
+            .open(&mut raw_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                if let Some(selection) = &self.pending_raw_selection {
+                    ui.label(format!("文件：{}", selection.path().display()));
+                    ui.label(format!("大小：{}", selection.formatted_size()));
+                } else {
+                    ui.label("尚未选择 Raw Binary 文件。");
+                }
+                ui.separator();
+                ui.label("Base");
+                ui.add(TextEdit::singleline(&mut self.raw_base_text).hint_text("0x140000000"));
+                ui.label("Entry");
+                ui.add(TextEdit::singleline(&mut self.raw_entry_text).hint_text("0x140000000"));
+                ui.label("Arch");
+                ui.add_enabled(
+                    false,
+                    TextEdit::singleline(&mut self.raw_arch_text).hint_text("x64"),
+                );
+                if !self.raw_error_text.is_empty() {
+                    ui.label(RichText::new(&self.raw_error_text).color(error_color()));
+                }
+                ui.horizontal(|ui| {
+                    if ui.button("加载").clicked() {
+                        match self.raw_options_from_dialog() {
+                            Ok(options) => {
+                                if let Some(selection) = self.pending_raw_selection.take() {
+                                    self.load_raw_selected_file(selection, options);
+                                    self.raw_dialog_open = false;
+                                    self.raw_error_text.clear();
+                                } else {
+                                    self.raw_error_text = "尚未选择 Raw Binary 文件。".to_owned();
+                                }
+                            }
+                            Err(message) => {
+                                self.raw_error_text = message;
+                            }
+                        }
+                    }
+                    if ui.button("取消").clicked() {
+                        self.raw_dialog_open = false;
+                        self.pending_raw_selection = None;
+                    }
+                });
+            });
+        self.raw_dialog_open = raw_open && self.raw_dialog_open;
     }
 
     fn resolve_jump_input(&self) -> Option<(u64, String)> {
         let text = self.quick_jump_text.trim();
-        let image = self.project.pe_image()?;
 
-        if let Some(raw_rva) = text.strip_prefix("rva:") {
-            let rva = parse_number(raw_rva.trim())?;
-            return Some((image.rva_to_va(rva), format!("RVA 0x{rva:08X}")));
+        if let Some(image) = self.project.pe_image() {
+            if let Some(raw_rva) = text.strip_prefix("rva:") {
+                let rva = parse_number(raw_rva.trim())?;
+                return Some((image.rva_to_va(rva), format!("RVA 0x{rva:08X}")));
+            }
+
+            if let Some(raw_file_offset) = text.strip_prefix("file:") {
+                let file_offset = parse_number(raw_file_offset.trim())?;
+                let va = image.file_offset_to_va(file_offset)?;
+                return Some((va, format!("FO 0x{file_offset:08X}")));
+            }
+
+            let va = parse_number(text)?;
+            return Some((va, format!("VA 0x{va:016X}")));
         }
 
-        if let Some(raw_file_offset) = text.strip_prefix("file:") {
-            let file_offset = parse_number(raw_file_offset.trim())?;
-            let va = image.file_offset_to_va(file_offset)?;
-            return Some((va, format!("FO 0x{file_offset:08X}")));
+        if let Some(raw) = self.project.raw_image() {
+            if let Some(raw_file_offset) = text.strip_prefix("file:") {
+                let file_offset = parse_number(raw_file_offset.trim())?;
+                let va = raw.file_offset_to_va(file_offset)?;
+                return Some((va, format!("FO 0x{file_offset:08X}")));
+            }
+            if let Some(raw_rva) = text.strip_prefix("rva:") {
+                let rva = parse_number(raw_rva.trim())?;
+                let va = raw.rva_to_va(rva)?;
+                return Some((va, format!("Raw+0x{rva:X}")));
+            }
+            let va = parse_number(text)?;
+            return raw
+                .contains_va(va)
+                .then_some((va, format!("VA 0x{va:016X}")));
         }
 
-        let va = parse_number(text)?;
-        Some((va, format!("VA 0x{va:016X}")))
+        None
+    }
+
+    fn raw_options_from_dialog(&self) -> Result<RawLoadOptions, String> {
+        let base_address = parse_number(self.raw_base_text.trim())
+            .ok_or_else(|| "Base 需要是十六进制或十进制地址。".to_owned())?;
+        let entry_address = parse_number(self.raw_entry_text.trim())
+            .ok_or_else(|| "Entry 需要是十六进制或十进制地址。".to_owned())?;
+        let arch = match self.raw_arch_text.trim().to_lowercase().as_str() {
+            "x64" | "amd64" | "x86_64" => RawArch::X64,
+            _ => return Err("当前版本 Raw Binary 仅支持 x64。".to_owned()),
+        };
+
+        Ok(RawLoadOptions {
+            base_address,
+            entry_address,
+            arch,
+        })
     }
 
     fn run_search(&self) -> Vec<String> {
@@ -1034,7 +1256,7 @@ impl FyIdaApp {
         let Some(analysis) = &self.analysis else {
             return vec![
                 format!("搜索请求：{query}"),
-                "尚未打开可分析的 PE 文件。".to_owned(),
+                "尚未打开可分析的 PE 或 Raw Binary 文件。".to_owned(),
             ];
         };
 
@@ -1265,4 +1487,8 @@ fn mnemonic_color() -> Color32 {
 
 fn comment_color() -> Color32 {
     Color32::from_rgb(106, 115, 125)
+}
+
+fn error_color() -> Color32 {
+    Color32::from_rgb(215, 58, 73)
 }

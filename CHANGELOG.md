@@ -4,6 +4,39 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.4.1-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a Raw Binary image model with user-supplied base address, entry address, x64 architecture, and VA/File Offset mapping helpers.
+- Added Raw Binary loading with parameter validation and clear Chinese errors for empty files or out-of-range entry points.
+- Added x64 Raw Binary entry-point disassembly through the existing `iced-x86` backend.
+- Added Raw Binary static analysis for entry function discovery, direct call/jump xrefs, and ASCII/UTF-16LE string extraction.
+- Added GUI Raw Binary file selection with base/entry/arch parameter dialog, Raw properties, Raw segment display, Raw Hex View rows, and Raw-aware quick jump.
+- Added headless Raw Binary support through `--raw --base <addr> --entry <addr> --arch x64 <file>`.
+- Added unit coverage for Raw mapping, Raw disassembly, Raw analysis, invalid Raw entry validation, and Raw project state.
+
+### Changed
+
+- Updated the workspace version to `0.4.1-alpha.1`.
+- Updated GUI, CLI, and README status text for Raw Binary support.
+- Corrected function summary instruction counts so decoding after a terminating `ret` is not counted as part of the function body.
+
+### Fixed
+
+- The “打开 Raw Binary” GUI path now loads files through the Raw Binary pipeline instead of falling through to PE parsing errors.
+
+### Known Issues
+
+- Raw Binary GUI currently supports only x64 with a simple base/entry dialog.
+- Raw Binary analysis has no imports, exports, relocations, or section metadata because the format is user-supplied bytes only.
+- Project database save/load, manual annotations, CFG graph rendering, and call graph rendering remain future milestones.
+
+### Recovery
+
+- Source tag: `v0.4.1-alpha.1`.
+- Roll back with: `git checkout v0.4.1-alpha.1`.
+
 ## v0.4.0-alpha.1 - 2026-06-23
 
 ### Added
