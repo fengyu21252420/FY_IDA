@@ -4,6 +4,35 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.32.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added batch `--save-project <DIR>` support that writes one FY_IDA project file per successful input file.
+- Added `saved_project` paths to batch JSON, text, and CSV reports when project files are written.
+- Added CLI unit coverage for batch project output path generation and saved project files.
+
+### Changed
+
+- Updated the workspace version to `0.32.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the batch project save checkpoint.
+- In batch mode, `--save-project` is now interpreted as an output directory rather than being rejected as a single-file-only option.
+
+### Fixed
+
+- Batch automation can now persist Python-requested names, comments, bookmarks, and manual code/data annotations into per-file FY_IDA project files.
+
+### Known Issues
+
+- Batch project output mirrors relative input directories and overwrites existing project files with the same relative input name.
+- Batch raw mode still applies the same Raw Binary base/entry/arch options to every file in the directory.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.32.0-alpha.1`.
+- Roll back with: `git checkout v0.32.0-alpha.1`.
+
 ## v0.31.0-alpha.1 - 2026-06-23
 
 ### Added

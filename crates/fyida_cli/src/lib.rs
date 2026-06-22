@@ -23,7 +23,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.31.0-alpha.1 已支持 batch 报告中的用户标注计数汇总、headless 用户标注专用 `--export annotations` text/CSV 导出、headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python annotations/PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.32.0-alpha.1 已支持 batch 模式下 `--save-project <DIR>` 为每个成功文件写出 FY_IDA 项目文件、batch 报告中的项目路径和用户标注计数汇总、headless 用户标注专用 `--export annotations` text/CSV 导出、headless PDB records/symbols/types 专用 `--export pdb` text/CSV 导出、headless sections/relocations 专用 text/CSV 导出、headless 扁平指令明细 JSON 与 `--export instructions` text/CSV 导出、headless CFG 明细 JSON 与 `--export cfg` text/CSV 导出、headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python annotations/PDB/sections/指令/CFG/调用图/报告辅助 API 示例、Python 标注动作写入、headless `--save-project` 项目保存、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -85,7 +85,7 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "PROJECT",
-        help = "将 headless 分析结果和 Python 标注动作保存为 FY_IDA 项目文件"
+        help = "将 headless 分析结果和 Python 标注动作保存为 FY_IDA 项目文件；batch 模式下作为项目输出目录"
     )]
     pub save_project: Option<PathBuf>,
 
@@ -516,6 +516,7 @@ struct BatchFileReport {
     manual_definitions: usize,
     pdb_symbols: usize,
     pdb_types: usize,
+    saved_project: Option<String>,
     error: Option<String>,
     report: Option<HeadlessReport>,
 }
@@ -588,18 +589,6 @@ pub fn run_headless(cli: &Cli) -> i32 {
     };
 
     if let Some(batch_dir) = &cli.batch_dir {
-        if cli.save_project.is_some() {
-            let message = "--save-project 当前仅支持单文件 headless 分析。".to_owned();
-            let _ = write_errors(
-                cli,
-                &[BatchError {
-                    path: batch_dir.display().to_string(),
-                    message: message.clone(),
-                }],
-            );
-            eprintln!("{message}");
-            return 2;
-        }
         return run_batch(cli, batch_dir, &type_load);
     }
 
@@ -667,6 +656,19 @@ pub fn run_headless(cli: &Cli) -> i32 {
 
 fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
     let started = Instant::now();
+    if let Some(project_dir) = &cli.save_project {
+        if let Err(message) = ensure_batch_project_output_dir(project_dir) {
+            let _ = write_errors(
+                cli,
+                &[BatchError {
+                    path: project_dir.display().to_string(),
+                    message: message.clone(),
+                }],
+            );
+            eprintln!("批量项目输出目录不可用：{message}");
+            return 1;
+        }
+    }
     let files = match collect_batch_files(batch_dir, cli.recursive) {
         Ok(files) => files,
         Err(message) => {
@@ -713,13 +715,43 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                         manual_definitions: 0,
                         pdb_symbols: 0,
                         pdb_types: 0,
+                        saved_project: None,
                         error: Some(message),
                         report: None,
                     });
                 } else {
+                    let mut report = report;
+                    let saved_project = match &cli.save_project {
+                        Some(project_dir) => {
+                            match save_batch_project_report(project_dir, batch_dir, &file, &report)
+                            {
+                                Ok(path) => {
+                                    report
+                                        .messages
+                                        .push(format!("项目已保存：{}", path.display()));
+                                    Some(path.display().to_string())
+                                }
+                                Err(message) => {
+                                    let message = format!("项目保存失败：{message}");
+                                    errors.push(BatchError {
+                                        path: file.display().to_string(),
+                                        message: message.clone(),
+                                    });
+                                    entries.push(batch_error_entry(
+                                        file.display().to_string(),
+                                        elapsed_ms,
+                                        message,
+                                    ));
+                                    continue;
+                                }
+                            }
+                        }
+                        None => None,
+                    };
                     entries.push(batch_success(
                         file.display().to_string(),
                         elapsed_ms,
+                        saved_project,
                         report,
                     ));
                 }
@@ -748,6 +780,7 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
                     manual_definitions: 0,
                     pdb_symbols: 0,
                     pdb_types: 0,
+                    saved_project: None,
                     error: Some(message),
                     report: None,
                 });
@@ -777,7 +810,12 @@ fn run_batch(cli: &Cli, batch_dir: &Path, type_load: &CliTypeLoad) -> i32 {
     }
 }
 
-fn batch_success(path: String, elapsed_ms: u128, report: HeadlessReport) -> BatchFileReport {
+fn batch_success(
+    path: String,
+    elapsed_ms: u128,
+    saved_project: Option<String>,
+    report: HeadlessReport,
+) -> BatchFileReport {
     BatchFileReport {
         path,
         status: "ok".to_owned(),
@@ -800,8 +838,34 @@ fn batch_success(path: String, elapsed_ms: u128, report: HeadlessReport) -> Batc
         manual_definitions: report.annotations.manual_definitions.len(),
         pdb_symbols: report.analysis.pdb_symbols.len(),
         pdb_types: report.analysis.pdb_types.len(),
+        saved_project,
         error: None,
         report: Some(report),
+    }
+}
+
+fn batch_error_entry(path: String, elapsed_ms: u128, message: String) -> BatchFileReport {
+    BatchFileReport {
+        path,
+        status: "error".to_owned(),
+        elapsed_ms,
+        functions: 0,
+        strings: 0,
+        imports: 0,
+        exports: 0,
+        xrefs: 0,
+        search_results: 0,
+        automation_runs: 0,
+        annotation_names: 0,
+        annotation_comments: 0,
+        annotation_function_comments: 0,
+        bookmarks: 0,
+        manual_definitions: 0,
+        pdb_symbols: 0,
+        pdb_types: 0,
+        saved_project: None,
+        error: Some(message),
+        report: None,
     }
 }
 
@@ -2951,7 +3015,7 @@ fn text_batch_report(report: &BatchReport) -> String {
     for entry in &report.files {
         let _ = writeln!(
             text,
-            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\tsearch {}\tautomation {}\tannotations names {} comments {} function_comments {} bookmarks {} manual_definitions {}\t{}",
+            "{}\t{}\tfunctions {}\tstrings {}\timports {}\txrefs {}\tsearch {}\tautomation {}\tannotations names {} comments {} function_comments {} bookmarks {} manual_definitions {}\tproject {}\t{}",
             entry.status,
             entry.path,
             entry.functions,
@@ -2965,6 +3029,7 @@ fn text_batch_report(report: &BatchReport) -> String {
             entry.annotation_function_comments,
             entry.bookmarks,
             entry.manual_definitions,
+            entry.saved_project.as_deref().unwrap_or(""),
             entry.error.as_deref().unwrap_or("")
         );
     }
@@ -3937,7 +4002,7 @@ fn csv_annotations(annotations: &UserAnnotations) -> String {
 
 fn csv_batch_report(report: &BatchReport) -> String {
     let mut csv = String::from(
-        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,annotation_names,annotation_comments,annotation_function_comments,bookmarks,manual_definitions,pdb_symbols,pdb_types,error\n",
+        "path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,annotation_names,annotation_comments,annotation_function_comments,bookmarks,manual_definitions,pdb_symbols,pdb_types,saved_project,error\n",
     );
     for entry in &report.files {
         push_csv_row(
@@ -3960,6 +4025,7 @@ fn csv_batch_report(report: &BatchReport) -> String {
                 &entry.manual_definitions.to_string(),
                 &entry.pdb_symbols.to_string(),
                 &entry.pdb_types.to_string(),
+                entry.saved_project.as_deref().unwrap_or(""),
                 entry.error.as_deref().unwrap_or(""),
             ],
         );
@@ -4036,6 +4102,45 @@ fn collect_batch_files(root: &Path, recursive: bool) -> Result<Vec<PathBuf>, Str
     }
     files.sort();
     Ok(files)
+}
+
+fn ensure_batch_project_output_dir(path: &Path) -> Result<(), String> {
+    if path.exists() && !path.is_dir() {
+        return Err(format!("{} 已存在但不是目录", path.display()));
+    }
+    std::fs::create_dir_all(path)
+        .map_err(|error| format!("无法创建目录 {}：{error}", path.display()))
+}
+
+fn save_batch_project_report(
+    output_dir: &Path,
+    batch_root: &Path,
+    file: &Path,
+    report: &HeadlessReport,
+) -> Result<PathBuf, String> {
+    let path = batch_project_path(output_dir, batch_root, file);
+    if let Some(parent) = path.parent() {
+        std::fs::create_dir_all(parent)
+            .map_err(|error| format!("无法创建目录 {}：{error}", parent.display()))?;
+    }
+    save_project_report(&path, report)?;
+    Ok(path)
+}
+
+fn batch_project_path(output_dir: &Path, batch_root: &Path, file: &Path) -> PathBuf {
+    let relative = file.strip_prefix(batch_root).ok();
+    let parent = relative
+        .and_then(Path::parent)
+        .unwrap_or_else(|| Path::new(""));
+    let mut output = output_dir.join(parent);
+    let file_name_source = relative.unwrap_or(file);
+    let file_name = file_name_source
+        .file_name()
+        .and_then(|name| name.to_str())
+        .map(|name| format!("{name}.fyida.json"))
+        .unwrap_or_else(|| format!("{}.fyida.json", safe_temp_name(&file.display().to_string())));
+    output.push(file_name);
+    output
 }
 
 fn save_project_report(path: &Path, report: &HeadlessReport) -> Result<(), String> {
@@ -4595,10 +4700,11 @@ mod tests {
         let entry = batch_success(
             "sample.exe".to_owned(),
             9,
+            Some("projects\\sample.exe.fyida.json".to_owned()),
             sample_headless_report_with_automation(),
         );
         let report = BatchReport {
-            version: "0.31.0-alpha.1".to_owned(),
+            version: "0.32.0-alpha.1".to_owned(),
             root: "samples".to_owned(),
             recursive: false,
             files: vec![entry],
@@ -4614,11 +4720,18 @@ mod tests {
         assert_eq!(report.files[0].annotation_function_comments, 1);
         assert_eq!(report.files[0].bookmarks, 1);
         assert_eq!(report.files[0].manual_definitions, 1);
+        assert_eq!(
+            report.files[0].saved_project.as_deref(),
+            Some("projects\\sample.exe.fyida.json")
+        );
         assert!(text.contains(
             "annotations names 1 comments 1 function_comments 1 bookmarks 1 manual_definitions 1"
         ));
-        assert!(csv.starts_with("path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,annotation_names,annotation_comments,annotation_function_comments,bookmarks,manual_definitions,pdb_symbols,pdb_types,error\n"));
-        assert!(csv.contains("sample.exe,ok,9,1,1,1,0,1,0,1,1,1,1,1,1,1,1,"));
+        assert!(text.contains("project projects\\sample.exe.fyida.json"));
+        assert!(csv.starts_with("path,status,elapsed_ms,functions,strings,imports,exports,xrefs,search_results,automation_runs,annotation_names,annotation_comments,annotation_function_comments,bookmarks,manual_definitions,pdb_symbols,pdb_types,saved_project,error\n"));
+        assert!(csv.contains(
+            "sample.exe,ok,9,1,1,1,0,1,0,1,1,1,1,1,1,1,1,projects\\sample.exe.fyida.json,"
+        ));
     }
 
     #[test]
@@ -4660,7 +4773,7 @@ mod tests {
 
         let document = project_document_from_report(&report).unwrap();
 
-        assert_eq!(document.app_version, "0.31.0-alpha.1");
+        assert_eq!(document.app_version, "0.32.0-alpha.1");
         assert_eq!(document.functions[0].name, "renamed_func");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         assert_eq!(document.annotations.comments[0].text, "automation note");
@@ -4668,6 +4781,43 @@ mod tests {
             document.annotations.bookmarks[0].address,
             0x0000_0001_4000_1004
         );
+    }
+
+    #[test]
+    fn batch_project_path_preserves_relative_directory_and_extension() {
+        let path = batch_project_path(
+            Path::new("out"),
+            Path::new("samples"),
+            Path::new("samples\\nested\\sample.exe"),
+        );
+
+        assert_eq!(
+            path,
+            PathBuf::from("out")
+                .join("nested")
+                .join("sample.exe.fyida.json")
+        );
+    }
+
+    #[test]
+    fn save_batch_project_report_writes_project_file() {
+        let directory = unique_test_dir("batch-save-project");
+        let report = sample_headless_report_with_automation();
+
+        let path = save_batch_project_report(
+            &directory,
+            Path::new("samples"),
+            Path::new("samples\\sample.exe"),
+            &report,
+        )
+        .unwrap();
+        let document = ProjectDocument::load_from_path(&path).unwrap();
+
+        assert_eq!(path, directory.join("sample.exe.fyida.json"));
+        assert_eq!(document.app_version, "0.32.0-alpha.1");
+        assert_eq!(document.input.path, "sample.exe");
+        assert_eq!(document.annotations.names[0].name, "renamed_func");
+        let _ = std::fs::remove_dir_all(directory);
     }
 
     #[test]
@@ -4917,7 +5067,7 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.31.0-alpha.1".to_owned(),
+            version: "0.32.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),
