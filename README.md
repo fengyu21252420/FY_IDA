@@ -17,7 +17,7 @@ The project intentionally does not copy IDA code, icons, database formats, or pr
 
 ## Current Status
 
-`v0.4.1-alpha.1` contains the first Raw Binary support checkpoint. It can start `fy_ida.exe`, open a Windows x64 PE or x64 Raw Binary, parse PE headers and sections, show real EntryPoint-near instructions, and list discovered functions, ASCII/UTF-16LE strings, imports, exports, relocations, and direct code xrefs in the Chinese GUI and headless output.
+`v0.5.0-alpha.1` contains the first project database and manual annotation checkpoint. It can start `fy_ida.exe`, open a Windows x64 PE or x64 Raw Binary, show real EntryPoint-near instructions, list discovered functions/strings/imports/exports/relocations/xrefs, and save or reopen FY_IDA project files with user names, comments, bookmarks, and manual code/data markings.
 
 ## Recovery Strategy
 

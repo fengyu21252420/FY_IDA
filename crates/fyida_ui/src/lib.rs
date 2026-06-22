@@ -11,10 +11,13 @@ use fyida_analysis::{
     pe_entry_disassembly, pe_loaded_log_lines, raw_entry_disassembly, raw_loaded_log_lines,
     startup_log_lines, static_analysis_log_lines, DisassemblyRow, StaticAnalysis,
 };
-use fyida_core::{format_address, FileSelection, ProjectState, RawArch, RawImage, APP_NAME};
+use fyida_core::{
+    format_address, sha256_hex, FileSelection, ManualDefinitionKind, ProjectDocument,
+    ProjectFunction, ProjectInput, ProjectInputKind, ProjectState, RawArch, RawImage, APP_NAME,
+};
 use fyida_loader::{
-    load_file_metadata, load_pe_from_selection_with_bytes, load_raw_from_selection_with_bytes,
-    RawLoadOptions,
+    load_file_metadata, load_pe_file_with_bytes, load_pe_from_selection_with_bytes,
+    load_raw_file_with_bytes, load_raw_from_selection_with_bytes, RawLoadOptions,
 };
 use rfd::FileDialog;
 
@@ -64,11 +67,22 @@ struct FyIdaApp {
     raw_entry_text: String,
     raw_arch_text: String,
     raw_error_text: String,
+    rename_open: bool,
+    rename_text: String,
+    comment_open: bool,
+    comment_text: String,
+    project_path: Option<PathBuf>,
+    source_hash: Option<String>,
     logs: Vec<String>,
     search_results: Vec<String>,
     disassembly_rows: Vec<DisassemblyRow>,
     analysis: Option<StaticAnalysis>,
     recent_files: VecDeque<PathBuf>,
+}
+
+enum ProjectLoadResult {
+    Pe(fyida_core::PeImage, Vec<u8>),
+    Raw(RawImage, Vec<u8>),
 }
 
 impl FyIdaApp {
@@ -93,6 +107,12 @@ impl FyIdaApp {
             raw_entry_text: "0x140000000".to_owned(),
             raw_arch_text: "x64".to_owned(),
             raw_error_text: String::new(),
+            rename_open: false,
+            rename_text: String::new(),
+            comment_open: false,
+            comment_text: String::new(),
+            project_path: None,
+            source_hash: None,
             logs: startup_log_lines(),
             search_results: vec!["尚未执行搜索。".to_owned()],
             disassembly_rows: empty_workspace_disassembly(),
@@ -142,12 +162,198 @@ impl FyIdaApp {
                     self.project.set_error(message.clone());
                     self.disassembly_rows = file_error_disassembly_row(&message);
                     self.analysis = None;
+                    self.source_hash = None;
+                    self.project_path = None;
                     self.logs.push(message);
                     self.right_tab = 1;
                     self.bottom_tab = 0;
                 }
             }
         }
+    }
+
+    fn open_project_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .set_title("打开项目")
+            .add_filter("FY_IDA 项目", &["json"])
+            .add_filter("所有文件", &["*"])
+            .pick_file()
+        {
+            match ProjectDocument::load_from_path(&path) {
+                Ok(document) => self.apply_project_document(path, document),
+                Err(error) => {
+                    self.logs.push(error.to_string());
+                    self.bottom_tab = 0;
+                }
+            }
+        }
+    }
+
+    fn save_project(&mut self) {
+        if let Some(path) = self.project_path.clone() {
+            self.save_project_to(path);
+        } else {
+            self.save_project_as_dialog();
+        }
+    }
+
+    fn save_project_as_dialog(&mut self) {
+        if let Some(path) = FileDialog::new()
+            .set_title("项目另存为")
+            .add_filter("FY_IDA 项目", &["fyida.json", "json"])
+            .set_file_name("analysis.fyida.json")
+            .save_file()
+        {
+            self.save_project_to(path);
+        }
+    }
+
+    fn save_project_to(&mut self, path: PathBuf) {
+        match self.current_project_document() {
+            Ok(document) => match document.save_to_path(&path) {
+                Ok(()) => {
+                    self.project_path = Some(path.clone());
+                    self.project.mark_saved();
+                    self.logs.push(format!("项目已保存：{}", path.display()));
+                    self.bottom_tab = 0;
+                }
+                Err(error) => {
+                    self.logs.push(error.to_string());
+                    self.bottom_tab = 0;
+                }
+            },
+            Err(message) => {
+                self.logs.push(format!("项目保存失败：{message}"));
+                self.bottom_tab = 0;
+            }
+        }
+    }
+
+    fn current_project_document(&self) -> Result<ProjectDocument, String> {
+        let selection = self
+            .project
+            .selected_file()
+            .ok_or_else(|| "尚未打开 PE 或 Raw Binary 文件。".to_owned())?;
+        let sha256 = self
+            .source_hash
+            .clone()
+            .ok_or_else(|| "当前文件缺少 hash，无法保存项目。".to_owned())?;
+        let kind = if self.project.pe_image().is_some() {
+            ProjectInputKind::Pe
+        } else if let Some(raw) = self.project.raw_image() {
+            ProjectInputKind::Raw {
+                base_address: raw.base_address,
+                entry_address: raw.entry_address,
+                arch: raw.arch,
+            }
+        } else {
+            return Err("当前输入不是可保存的 PE 或 Raw Binary。".to_owned());
+        };
+        let functions = self
+            .analysis
+            .as_ref()
+            .map(|analysis| {
+                analysis
+                    .functions
+                    .iter()
+                    .map(|function| ProjectFunction {
+                        start_va: function.start_va,
+                        name: self
+                            .project
+                            .name_for(function.start_va)
+                            .unwrap_or(&function.name)
+                            .to_owned(),
+                        size: function.size,
+                        instruction_count: function.instruction_count,
+                    })
+                    .collect::<Vec<_>>()
+            })
+            .unwrap_or_default();
+
+        Ok(ProjectDocument::new(
+            env!("CARGO_PKG_VERSION"),
+            ProjectInput {
+                path: selection.path().display().to_string(),
+                size_bytes: selection.size_bytes(),
+                sha256,
+                kind,
+            },
+            functions,
+            self.project.annotations(),
+        ))
+    }
+
+    fn apply_project_document(&mut self, project_path: PathBuf, document: ProjectDocument) {
+        let input_path = PathBuf::from(&document.input.path);
+        let expected_hash = document.input.sha256.clone();
+        let load_result = match document.input.kind.clone() {
+            ProjectInputKind::Pe => load_pe_file_with_bytes(&input_path)
+                .map(|loaded| ProjectLoadResult::Pe(loaded.image, loaded.bytes)),
+            ProjectInputKind::Raw {
+                base_address,
+                entry_address,
+                arch,
+            } => load_raw_file_with_bytes(
+                &input_path,
+                RawLoadOptions {
+                    base_address,
+                    entry_address,
+                    arch,
+                },
+            )
+            .map(|loaded| ProjectLoadResult::Raw(loaded.image, loaded.bytes)),
+        };
+
+        match load_result {
+            Ok(ProjectLoadResult::Pe(image, bytes)) => {
+                let actual_hash = sha256_hex(&bytes);
+                self.apply_pe_image(image, &bytes);
+                self.finish_project_document_load(
+                    project_path,
+                    document,
+                    actual_hash,
+                    expected_hash,
+                );
+            }
+            Ok(ProjectLoadResult::Raw(image, bytes)) => {
+                let actual_hash = sha256_hex(&bytes);
+                self.apply_raw_image(image, &bytes);
+                self.finish_project_document_load(
+                    project_path,
+                    document,
+                    actual_hash,
+                    expected_hash,
+                );
+            }
+            Err(error) => {
+                self.logs.push(format!(
+                    "打开项目失败，无法加载原始文件 {}：{error}",
+                    input_path.display()
+                ));
+                self.bottom_tab = 0;
+            }
+        }
+    }
+
+    fn finish_project_document_load(
+        &mut self,
+        project_path: PathBuf,
+        document: ProjectDocument,
+        actual_hash: String,
+        expected_hash: String,
+    ) {
+        self.project.apply_annotations(document.annotations);
+        self.project_path = Some(project_path.clone());
+        self.source_hash = Some(actual_hash.clone());
+        self.project.mark_saved();
+        if actual_hash != expected_hash {
+            self.logs.push(format!(
+                "项目已打开，但原始文件 hash 不一致：期望 {expected_hash}，实际 {actual_hash}"
+            ));
+        }
+        self.logs
+            .push(format!("项目已打开：{}", project_path.display()));
+        self.bottom_tab = 0;
     }
 
     fn select_path(&mut self, path: PathBuf) {
@@ -158,6 +364,8 @@ impl FyIdaApp {
                 self.project.set_error(message.clone());
                 self.disassembly_rows = file_error_disassembly_row(&message);
                 self.analysis = None;
+                self.source_hash = None;
+                self.project_path = None;
                 self.logs.push(message);
                 self.right_tab = 1;
                 self.bottom_tab = 0;
@@ -186,6 +394,8 @@ impl FyIdaApp {
     fn apply_pe_image(&mut self, image: fyida_core::PeImage, bytes: &[u8]) {
         let analysis = analyze_pe(&image, bytes);
         let disassembly = pe_entry_disassembly(&image, bytes);
+        self.source_hash = Some(sha256_hex(bytes));
+        self.project_path = None;
         self.logs.extend(pe_loaded_log_lines(&image));
         self.logs.extend(static_analysis_log_lines(&analysis));
         self.logs.extend(disassembly.log_lines);
@@ -200,6 +410,8 @@ impl FyIdaApp {
     fn apply_raw_image(&mut self, image: RawImage, bytes: &[u8]) {
         let analysis = analyze_raw(&image, bytes);
         let disassembly = raw_entry_disassembly(&image, bytes);
+        self.source_hash = Some(sha256_hex(bytes));
+        self.project_path = None;
         self.logs.extend(raw_loaded_log_lines(&image));
         self.logs.extend(static_analysis_log_lines(&analysis));
         self.logs.extend(disassembly.log_lines);
@@ -217,6 +429,8 @@ impl FyIdaApp {
         self.disassembly_rows =
             file_error_disassembly_row("不是有效的 PE 文件，无法进行 x64 反汇编。");
         self.analysis = None;
+        self.source_hash = None;
+        self.project_path = None;
         self.center_tab = 0;
         self.right_tab = 1;
         self.bottom_tab = 0;
@@ -230,9 +444,87 @@ impl FyIdaApp {
         }
     }
 
+    fn open_rename_dialog(&mut self) {
+        let Some(address) = self.project.current_address() else {
+            self.logs.push("重命名失败：尚未选择地址。".to_owned());
+            return;
+        };
+        self.rename_text = self
+            .project
+            .name_for(address)
+            .or_else(|| self.project.current_function())
+            .unwrap_or("")
+            .to_owned();
+        self.rename_open = true;
+    }
+
+    fn open_comment_dialog(&mut self) {
+        let Some(address) = self.project.current_address() else {
+            self.logs.push("添加注释失败：尚未选择地址。".to_owned());
+            return;
+        };
+        self.comment_text = self
+            .project
+            .address_comment(address)
+            .unwrap_or("")
+            .to_owned();
+        self.comment_open = true;
+    }
+
+    fn toggle_current_bookmark(&mut self) {
+        let Some(address) = self.project.current_address() else {
+            self.logs.push("书签操作失败：尚未选择地址。".to_owned());
+            return;
+        };
+        let was_bookmarked = self.project.is_bookmarked(address);
+        self.project.toggle_bookmark(address);
+        self.logs.push(if was_bookmarked {
+            format!("已删除书签：0x{address:016X}")
+        } else {
+            format!("已添加书签：0x{address:016X}")
+        });
+    }
+
+    fn set_current_manual_definition(&mut self, kind: ManualDefinitionKind) {
+        let Some(address) = self.project.current_address() else {
+            self.logs.push("手动定义失败：尚未选择地址。".to_owned());
+            return;
+        };
+        self.project.set_manual_definition(address, kind);
+        self.logs
+            .push(format!("已标记 0x{address:016X} 为{}。", kind.label()));
+    }
+
+    fn undo_annotation(&mut self) {
+        if self.project.undo() {
+            self.logs.push("已撤销上一项人工标注。".to_owned());
+        }
+    }
+
+    fn redo_annotation(&mut self) {
+        if self.project.redo() {
+            self.logs.push("已重做上一项人工标注。".to_owned());
+        }
+    }
+
     fn handle_shortcuts(&mut self, ctx: &Context) {
         if ctx.input(|input| input.key_pressed(Key::O) && input.modifiers.ctrl) {
             self.open_file_dialog();
+        }
+        if ctx.input(|input| input.key_pressed(Key::S) && input.modifiers.ctrl) {
+            self.save_project();
+        }
+        if ctx.input(|input| input.key_pressed(Key::Z) && input.modifiers.ctrl) {
+            self.undo_annotation();
+        }
+        if ctx.input(|input| input.key_pressed(Key::Y) && input.modifiers.ctrl) {
+            self.redo_annotation();
+        }
+        if ctx.input(|input| input.key_pressed(Key::N)) {
+            self.open_rename_dialog();
+        }
+        if ctx.input(|input| input.key_pressed(Key::Semicolon)) {
+            self.open_comment_dialog();
         }
         if ctx.input(|input| input.key_pressed(Key::G)) {
             self.quick_jump_open = true;
@@ -258,9 +550,30 @@ impl FyIdaApp {
                             ui.close_menu();
                         }
                         ui.separator();
-                        ui.add_enabled(false, egui::Button::new("打开项目..."));
-                        ui.add_enabled(false, egui::Button::new("保存项目"));
-                        ui.add_enabled(false, egui::Button::new("项目另存为..."));
+                        if ui.button("打开项目...").clicked() {
+                            self.open_project_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.project.selected_file().is_some(),
+                                egui::Button::new("保存项目"),
+                            )
+                            .clicked()
+                        {
+                            self.save_project();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(
+                                self.project.selected_file().is_some(),
+                                egui::Button::new("项目另存为..."),
+                            )
+                            .clicked()
+                        {
+                            self.save_project_as_dialog();
+                            ui.close_menu();
+                        }
                         ui.separator();
                         ui.menu_button("最近打开", |ui| self.recent_files_menu(ui));
                         ui.separator();
@@ -270,21 +583,60 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("编辑", |ui| {
-                        disabled_menu_items(
-                            ui,
-                            &[
-                                "撤销",
-                                "重做",
-                                "重命名",
-                                "添加注释",
-                                "添加书签",
-                                "删除书签",
-                                "转为代码",
-                                "转为数据",
-                                "复制地址",
-                                "复制反汇编行",
-                            ],
-                        );
+                        if ui
+                            .add_enabled(self.project.can_undo(), egui::Button::new("撤销"))
+                            .clicked()
+                        {
+                            self.undo_annotation();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(self.project.can_redo(), egui::Button::new("重做"))
+                            .clicked()
+                        {
+                            self.redo_annotation();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        let has_address = self.project.current_address().is_some();
+                        if ui
+                            .add_enabled(has_address, egui::Button::new("重命名"))
+                            .clicked()
+                        {
+                            self.open_rename_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(has_address, egui::Button::new("添加注释"))
+                            .clicked()
+                        {
+                            self.open_comment_dialog();
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(has_address, egui::Button::new("添加/删除书签"))
+                            .clicked()
+                        {
+                            self.toggle_current_bookmark();
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        if ui
+                            .add_enabled(has_address, egui::Button::new("转为代码"))
+                            .clicked()
+                        {
+                            self.set_current_manual_definition(ManualDefinitionKind::Code);
+                            ui.close_menu();
+                        }
+                        if ui
+                            .add_enabled(has_address, egui::Button::new("转为数据"))
+                            .clicked()
+                        {
+                            self.set_current_manual_definition(ManualDefinitionKind::Data);
+                            ui.close_menu();
+                        }
+                        ui.separator();
+                        disabled_menu_items(ui, &["复制地址", "复制反汇编行"]);
                     });
 
                     ui.menu_button("视图", |ui| {
@@ -356,8 +708,8 @@ impl FyIdaApp {
                     });
 
                     ui.menu_button("帮助", |ui| {
-                        ui.label("FY_IDA v0.4.1-alpha.1");
-                        ui.label("Raw Binary x64 支持 MVP。");
+                        ui.label("FY_IDA v0.5.0-alpha.1");
+                        ui.label("项目文件与人工标注 MVP。");
                         ui.separator();
                         disabled_menu_items(ui, &["快捷键", "Python API 文档", "关于 FY_IDA"]);
                     });
@@ -389,7 +741,9 @@ impl FyIdaApp {
                     if toolbar_button(ui, "打开", "打开 PE 文件或 Raw Binary").clicked() {
                         self.open_file_dialog();
                     }
-                    toolbar_button(ui, "保存", "保存项目（后续版本实现）");
+                    if toolbar_button(ui, "保存", "保存项目 (Ctrl+S)").clicked() {
+                        self.save_project();
+                    }
                     ui.separator();
                     toolbar_button(ui, "后退", "返回上一位置");
                     toolbar_button(ui, "前进", "前进到下一位置");
@@ -400,8 +754,12 @@ impl FyIdaApp {
                         self.search_open = true;
                     }
                     ui.separator();
-                    toolbar_button(ui, "重命名", "重命名当前符号");
-                    toolbar_button(ui, "注释", "添加注释");
+                    if toolbar_button(ui, "重命名", "重命名当前符号 (N)").clicked() {
+                        self.open_rename_dialog();
+                    }
+                    if toolbar_button(ui, "注释", "添加注释 (;)").clicked() {
+                        self.open_comment_dialog();
+                    }
                     toolbar_button(ui, "交叉引用", "查看交叉引用");
                     toolbar_button(ui, "重新分析", "重新分析当前目标");
                     toolbar_button(ui, "函数图", "切换到函数图");
@@ -487,7 +845,7 @@ impl FyIdaApp {
             "导入" => self.import_list(ui),
             "导出" => self.export_list(ui),
             "段" => self.section_list(ui),
-            _ => placeholder_list(ui, &["暂无书签"]),
+            _ => self.bookmark_list(ui),
         });
     }
 
@@ -500,7 +858,10 @@ impl FyIdaApp {
                     (
                         function.start_va,
                         format!("{:016X}", function.start_va),
-                        function.name.clone(),
+                        self.project
+                            .name_for(function.start_va)
+                            .unwrap_or(&function.name)
+                            .to_owned(),
                         format!(
                             "{} 条指令 / {} 次调用",
                             function.instruction_count, function.call_count
@@ -556,7 +917,16 @@ impl FyIdaApp {
         let mut rows = analysis
             .functions
             .iter()
-            .map(|function| (function.start_va, function.name.clone(), "函数".to_owned()))
+            .map(|function| {
+                (
+                    function.start_va,
+                    self.project
+                        .name_for(function.start_va)
+                        .unwrap_or(&function.name)
+                        .to_owned(),
+                    "函数".to_owned(),
+                )
+            })
             .collect::<Vec<_>>();
         rows.extend(
             analysis
@@ -714,6 +1084,41 @@ impl FyIdaApp {
             });
     }
 
+    fn bookmark_list(&mut self, ui: &mut Ui) {
+        let bookmarks = self.project.bookmarks();
+        if bookmarks.is_empty() {
+            placeholder_list(ui, &["暂无书签"]);
+            return;
+        }
+
+        Grid::new("bookmark_list_grid")
+            .num_columns(2)
+            .striped(true)
+            .spacing([10.0, 4.0])
+            .show(ui, |ui| {
+                ui.strong("地址");
+                ui.strong("名称/注释");
+                ui.end_row();
+
+                for bookmark in bookmarks {
+                    if ui
+                        .selectable_label(false, format!("{:016X}", bookmark.address))
+                        .clicked()
+                    {
+                        self.project
+                            .jump_to(bookmark.address, Some("书签".to_owned()));
+                    }
+                    let label = self
+                        .project
+                        .name_for(bookmark.address)
+                        .or_else(|| self.project.address_comment(bookmark.address))
+                        .unwrap_or("书签");
+                    ui.label(label);
+                    ui.end_row();
+                }
+            });
+    }
+
     fn section_list(&mut self, ui: &mut Ui) {
         let (image_base, sections) = match self.project.pe_image() {
             Some(image) => (image.image_base(), image.sections.clone()),
@@ -838,6 +1243,19 @@ impl FyIdaApp {
                         ui.label(self.project.analysis_state().label());
                         ui.end_row();
 
+                        ui.label("项目文件");
+                        ui.label(
+                            self.project_path
+                                .as_ref()
+                                .map(|path| path.display().to_string())
+                                .unwrap_or_else(|| "未保存".to_owned()),
+                        );
+                        ui.end_row();
+
+                        ui.label("SHA-256");
+                        ui.label(self.source_hash.as_deref().unwrap_or("尚未计算"));
+                        ui.end_row();
+
                         if let Some(image) = self.project.pe_image() {
                             ui.separator();
                             ui.separator();
@@ -939,8 +1357,68 @@ impl FyIdaApp {
             }
             "局部类型" => placeholder_list(ui, &["暂无局部类型", "后续支持函数原型与结构体"]),
             "结构体" => placeholder_list(ui, &["暂无结构体定义"]),
-            _ => placeholder_list(ui, &["暂无注释"]),
+            _ => self.annotation_panel(ui),
         }
+    }
+
+    fn annotation_panel(&self, ui: &mut Ui) {
+        let Some(address) = self.project.current_address() else {
+            placeholder_list(ui, &["尚未选择地址"]);
+            return;
+        };
+
+        Grid::new("annotation_grid")
+            .num_columns(2)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                ui.label("当前地址");
+                ui.label(format!("0x{address:016X}"));
+                ui.end_row();
+
+                ui.label("名称");
+                ui.label(self.project.name_for(address).unwrap_or("-"));
+                ui.end_row();
+
+                ui.label("地址注释");
+                ui.label(self.project.address_comment(address).unwrap_or("-"));
+                ui.end_row();
+
+                ui.label("函数注释");
+                ui.label(
+                    self.project
+                        .function_comment(address)
+                        .or_else(|| {
+                            self.analysis.as_ref().and_then(|analysis| {
+                                analysis
+                                    .functions
+                                    .iter()
+                                    .find(|function| function.start_va == address)
+                                    .and_then(|function| {
+                                        self.project.function_comment(function.start_va)
+                                    })
+                            })
+                        })
+                        .unwrap_or("-"),
+                );
+                ui.end_row();
+
+                ui.label("书签");
+                ui.label(if self.project.is_bookmarked(address) {
+                    "是"
+                } else {
+                    "否"
+                });
+                ui.end_row();
+
+                ui.label("手动定义");
+                ui.label(
+                    self.project
+                        .manual_definition(address)
+                        .map(ManualDefinitionKind::label)
+                        .unwrap_or("-"),
+                );
+                ui.end_row();
+            });
     }
 
     fn bottom_content(&mut self, ui: &mut Ui) {
@@ -987,14 +1465,35 @@ impl FyIdaApp {
                             self.project
                                 .jump_to(row.address, Some(row.mnemonic.clone()));
                         }
-                        ui.label(RichText::new(row.bytes).color(bytes_color()));
-                        ui.label(RichText::new(row.mnemonic).color(mnemonic_color()).strong());
-                        ui.label(row.operands);
-                        ui.label(RichText::new(row.comment).color(comment_color()));
+                        ui.label(RichText::new(&row.bytes).color(bytes_color()));
+                        ui.label(
+                            RichText::new(&row.mnemonic)
+                                .color(mnemonic_color())
+                                .strong(),
+                        );
+                        ui.label(&row.operands);
+                        ui.label(RichText::new(self.row_comment(&row)).color(comment_color()));
                         ui.end_row();
                     }
                 });
         });
+    }
+
+    fn row_comment(&self, row: &DisassemblyRow) -> String {
+        let mut parts = Vec::new();
+        if self.project.is_bookmarked(row.address) {
+            parts.push("[书签]".to_owned());
+        }
+        if let Some(kind) = self.project.manual_definition(row.address) {
+            parts.push(format!("[{}]", kind.label()));
+        }
+        if !row.comment.is_empty() {
+            parts.push(row.comment.clone());
+        }
+        if let Some(comment) = self.project.address_comment(row.address) {
+            parts.push(comment.to_owned());
+        }
+        parts.join(" ")
     }
 
     fn empty_state(&mut self, ui: &mut Ui) {
@@ -1189,6 +1688,61 @@ impl FyIdaApp {
                 });
             });
         self.raw_dialog_open = raw_open && self.raw_dialog_open;
+
+        let mut rename_open = self.rename_open;
+        Window::new("重命名")
+            .open(&mut rename_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("为当前地址设置用户名称。");
+                ui.add(TextEdit::singleline(&mut self.rename_text).hint_text("decrypt_config"));
+                if ui.button("确定").clicked() {
+                    if let Some(address) = self.project.current_address() {
+                        self.project
+                            .rename_address(address, self.rename_text.clone());
+                        self.logs
+                            .push(format!("已重命名 0x{address:016X} 为 {}", self.rename_text));
+                        self.rename_open = false;
+                    }
+                }
+            });
+        self.rename_open = rename_open && self.rename_open;
+
+        let mut comment_open = self.comment_open;
+        Window::new("添加注释")
+            .open(&mut comment_open)
+            .resizable(false)
+            .collapsible(false)
+            .show(ctx, |ui| {
+                ui.label("为当前地址设置注释。");
+                ui.add(TextEdit::multiline(&mut self.comment_text).desired_rows(3));
+                if ui.button("确定").clicked() {
+                    if let Some(address) = self.project.current_address() {
+                        self.project
+                            .set_address_comment(address, self.comment_text.clone());
+                        if self
+                            .analysis
+                            .as_ref()
+                            .map(|analysis| {
+                                analysis
+                                    .functions
+                                    .iter()
+                                    .any(|function| function.start_va == address)
+                            })
+                            .unwrap_or(false)
+                        {
+                            self.project
+                                .set_function_comment(address, self.comment_text.clone());
+                        }
+                        self.logs
+                            .push(format!("已更新 0x{address:016X} 的地址/函数注释。"));
+                        self.comment_open = false;
+                        self.right_tab = 4;
+                    }
+                }
+            });
+        self.comment_open = comment_open && self.comment_open;
     }
 
     fn resolve_jump_input(&self) -> Option<(u64, String)> {
@@ -1265,13 +1819,26 @@ impl FyIdaApp {
         results.push(format!("搜索请求：{query}"));
 
         for function in &analysis.functions {
-            if function.name.to_lowercase().contains(&query_lower)
+            let name = self
+                .project
+                .name_for(function.start_va)
+                .unwrap_or(&function.name);
+            if name.to_lowercase().contains(&query_lower)
                 || format!("{:016X}", function.start_va).contains(query)
             {
-                results.push(format!(
-                    "函数 0x{:016X} {}",
-                    function.start_va, function.name
-                ));
+                results.push(format!("函数 0x{:016X} {}", function.start_va, name));
+            }
+        }
+
+        for bookmark in self.project.bookmarks() {
+            if format!("{:016X}", bookmark.address).contains(query)
+                || self
+                    .project
+                    .address_comment(bookmark.address)
+                    .map(|comment| comment.to_lowercase().contains(&query_lower))
+                    .unwrap_or(false)
+            {
+                results.push(format!("书签 0x{:016X}", bookmark.address));
             }
         }
 

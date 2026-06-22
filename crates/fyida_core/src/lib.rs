@@ -1,14 +1,188 @@
+use std::collections::{BTreeMap, BTreeSet};
+use std::fmt;
 use std::path::{Path, PathBuf};
 
+use serde::{Deserialize, Serialize};
+use sha2::{Digest, Sha256};
+
 pub const APP_NAME: &str = "FY_IDA";
+pub const PROJECT_SCHEMA_VERSION: u32 = 1;
 pub const PE_DIRECTORY_EXPORT: usize = 0;
 pub const PE_DIRECTORY_IMPORT: usize = 1;
 pub const PE_DIRECTORY_BASERELOC: usize = 5;
 pub const PE_DIRECTORY_LIMIT: usize = 16;
 
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
 pub enum RawArch {
     X64,
+}
+
+#[derive(Debug)]
+pub enum ProjectIoError {
+    Read {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Write {
+        path: PathBuf,
+        source: std::io::Error,
+    },
+    Parse {
+        path: PathBuf,
+        source: serde_json::Error,
+    },
+    Encode {
+        source: serde_json::Error,
+    },
+}
+
+impl fmt::Display for ProjectIoError {
+    fn fmt(&self, formatter: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            Self::Read { path, source } => {
+                write!(formatter, "无法读取项目文件：{} ({source})", path.display())
+            }
+            Self::Write { path, source } => {
+                write!(formatter, "无法写入项目文件：{} ({source})", path.display())
+            }
+            Self::Parse { path, source } => {
+                write!(formatter, "项目文件格式无效：{} ({source})", path.display())
+            }
+            Self::Encode { source } => write!(formatter, "项目文件编码失败：{source}"),
+        }
+    }
+}
+
+impl std::error::Error for ProjectIoError {}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ProjectInputKind {
+    Pe,
+    Raw {
+        base_address: u64,
+        entry_address: u64,
+        arch: RawArch,
+    },
+}
+
+impl ProjectInputKind {
+    pub fn label(&self) -> &'static str {
+        match self {
+            Self::Pe => "PE",
+            Self::Raw { .. } => "Raw Binary",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectInput {
+    pub path: String,
+    pub size_bytes: u64,
+    pub sha256: String,
+    pub kind: ProjectInputKind,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectFunction {
+    pub start_va: u64,
+    pub name: String,
+    pub size: u64,
+    pub instruction_count: usize,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserName {
+    pub address: u64,
+    pub name: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserComment {
+    pub address: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct FunctionComment {
+    pub function_start: u64,
+    pub text: String,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct Bookmark {
+    pub address: u64,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub enum ManualDefinitionKind {
+    Code,
+    Data,
+}
+
+impl ManualDefinitionKind {
+    pub fn label(self) -> &'static str {
+        match self {
+            Self::Code => "代码",
+            Self::Data => "数据",
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ManualDefinition {
+    pub address: u64,
+    pub kind: ManualDefinitionKind,
+}
+
+#[derive(Debug, Clone, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct UserAnnotations {
+    pub names: Vec<UserName>,
+    pub comments: Vec<UserComment>,
+    pub function_comments: Vec<FunctionComment>,
+    pub bookmarks: Vec<Bookmark>,
+    pub manual_definitions: Vec<ManualDefinition>,
+}
+
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ProjectDocument {
+    pub schema_version: u32,
+    pub app_version: String,
+    pub input: ProjectInput,
+    pub functions: Vec<ProjectFunction>,
+    pub annotations: UserAnnotations,
+}
+
+impl ProjectDocument {
+    pub fn new(
+        app_version: impl Into<String>,
+        input: ProjectInput,
+        functions: Vec<ProjectFunction>,
+        annotations: UserAnnotations,
+    ) -> Self {
+        Self {
+            schema_version: PROJECT_SCHEMA_VERSION,
+            app_version: app_version.into(),
+            input,
+            functions,
+            annotations,
+        }
+    }
+
+    pub fn save_to_path(&self, path: impl AsRef<Path>) -> Result<(), ProjectIoError> {
+        let path = path.as_ref().to_path_buf();
+        let encoded = serde_json::to_string_pretty(self)
+            .map_err(|source| ProjectIoError::Encode { source })?;
+        std::fs::write(&path, encoded).map_err(|source| ProjectIoError::Write { path, source })
+    }
+
+    pub fn load_from_path(path: impl AsRef<Path>) -> Result<Self, ProjectIoError> {
+        let path = path.as_ref().to_path_buf();
+        let bytes = std::fs::read(&path).map_err(|source| ProjectIoError::Read {
+            path: path.clone(),
+            source,
+        })?;
+        serde_json::from_slice(&bytes).map_err(|source| ProjectIoError::Parse { path, source })
+    }
 }
 
 impl RawArch {
@@ -374,6 +548,35 @@ impl PeImage {
 }
 
 #[derive(Debug, Clone, PartialEq, Eq)]
+enum AnnotationCommand {
+    Rename {
+        address: u64,
+        before: Option<String>,
+        after: Option<String>,
+    },
+    AddressComment {
+        address: u64,
+        before: Option<String>,
+        after: Option<String>,
+    },
+    FunctionComment {
+        function_start: u64,
+        before: Option<String>,
+        after: Option<String>,
+    },
+    Bookmark {
+        address: u64,
+        before: bool,
+        after: bool,
+    },
+    ManualDefinition {
+        address: u64,
+        before: Option<ManualDefinitionKind>,
+        after: Option<ManualDefinitionKind>,
+    },
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
 pub enum AnalysisState {
     NoFile,
     NotAnalyzed,
@@ -401,6 +604,13 @@ pub struct ProjectState {
     raw_image: Option<RawImage>,
     analysis_state: AnalysisState,
     dirty: bool,
+    user_names: BTreeMap<u64, String>,
+    address_comments: BTreeMap<u64, String>,
+    function_comments: BTreeMap<u64, String>,
+    bookmarks: BTreeSet<u64>,
+    manual_definitions: BTreeMap<u64, ManualDefinitionKind>,
+    undo_stack: Vec<AnnotationCommand>,
+    redo_stack: Vec<AnnotationCommand>,
     current_address: Option<u64>,
     current_rva: Option<u64>,
     current_file_offset: Option<u64>,
@@ -415,6 +625,13 @@ impl Default for ProjectState {
             raw_image: None,
             analysis_state: AnalysisState::NoFile,
             dirty: false,
+            user_names: BTreeMap::new(),
+            address_comments: BTreeMap::new(),
+            function_comments: BTreeMap::new(),
+            bookmarks: BTreeSet::new(),
+            manual_definitions: BTreeMap::new(),
+            undo_stack: Vec::new(),
+            redo_stack: Vec::new(),
             current_address: None,
             current_rva: None,
             current_file_offset: None,
@@ -444,6 +661,10 @@ impl ProjectState {
         self.dirty
     }
 
+    pub fn mark_saved(&mut self) {
+        self.dirty = false;
+    }
+
     pub fn current_address(&self) -> Option<u64> {
         self.current_address
     }
@@ -460,10 +681,48 @@ impl ProjectState {
         self.current_function.as_deref()
     }
 
+    pub fn name_for(&self, address: u64) -> Option<&str> {
+        self.user_names.get(&address).map(String::as_str)
+    }
+
+    pub fn address_comment(&self, address: u64) -> Option<&str> {
+        self.address_comments.get(&address).map(String::as_str)
+    }
+
+    pub fn function_comment(&self, function_start: u64) -> Option<&str> {
+        self.function_comments
+            .get(&function_start)
+            .map(String::as_str)
+    }
+
+    pub fn is_bookmarked(&self, address: u64) -> bool {
+        self.bookmarks.contains(&address)
+    }
+
+    pub fn manual_definition(&self, address: u64) -> Option<ManualDefinitionKind> {
+        self.manual_definitions.get(&address).copied()
+    }
+
+    pub fn can_undo(&self) -> bool {
+        !self.undo_stack.is_empty()
+    }
+
+    pub fn can_redo(&self) -> bool {
+        !self.redo_stack.is_empty()
+    }
+
+    pub fn bookmarks(&self) -> Vec<Bookmark> {
+        self.bookmarks
+            .iter()
+            .map(|address| Bookmark { address: *address })
+            .collect()
+    }
+
     pub fn select_file(&mut self, selection: FileSelection) {
         self.selected_file = Some(selection);
         self.pe_image = None;
         self.raw_image = None;
+        self.clear_user_state();
         self.analysis_state = AnalysisState::NotAnalyzed;
         self.dirty = true;
         self.jump_to(0x1400_01000, Some("入口占位".to_owned()));
@@ -477,6 +736,7 @@ impl ProjectState {
         self.selected_file = Some(pe_image.file().clone());
         self.pe_image = Some(pe_image);
         self.raw_image = None;
+        self.clear_user_state();
         self.analysis_state = AnalysisState::PeLoaded;
         self.dirty = true;
         self.current_address = Some(entry_point);
@@ -492,6 +752,7 @@ impl ProjectState {
         self.selected_file = Some(raw_image.file().clone());
         self.pe_image = None;
         self.raw_image = Some(raw_image);
+        self.clear_user_state();
         self.analysis_state = AnalysisState::RawLoaded;
         self.dirty = true;
         self.current_address = Some(entry_point);
@@ -504,6 +765,7 @@ impl ProjectState {
         self.selected_file = Some(selection);
         self.pe_image = None;
         self.raw_image = None;
+        self.clear_user_state();
         self.analysis_state = AnalysisState::Error(message.into());
         self.dirty = false;
         self.current_address = None;
@@ -515,6 +777,7 @@ impl ProjectState {
     pub fn set_error(&mut self, message: impl Into<String>) {
         self.pe_image = None;
         self.raw_image = None;
+        self.clear_user_state();
         self.analysis_state = AnalysisState::Error(message.into());
     }
 
@@ -544,12 +807,282 @@ impl ProjectState {
             "已保存"
         }
     }
+
+    pub fn rename_address(&mut self, address: u64, name: impl Into<String>) {
+        let after = normalize_user_text(name.into());
+        let before = self.user_names.get(&address).cloned();
+        if before == after {
+            return;
+        }
+        let command = AnnotationCommand::Rename {
+            address,
+            before,
+            after,
+        };
+        self.apply_command(&command, true);
+        self.undo_stack.push(command);
+        self.redo_stack.clear();
+    }
+
+    pub fn set_address_comment(&mut self, address: u64, text: impl Into<String>) {
+        let after = normalize_user_text(text.into());
+        let before = self.address_comments.get(&address).cloned();
+        if before == after {
+            return;
+        }
+        let command = AnnotationCommand::AddressComment {
+            address,
+            before,
+            after,
+        };
+        self.apply_command(&command, true);
+        self.undo_stack.push(command);
+        self.redo_stack.clear();
+    }
+
+    pub fn set_function_comment(&mut self, function_start: u64, text: impl Into<String>) {
+        let after = normalize_user_text(text.into());
+        let before = self.function_comments.get(&function_start).cloned();
+        if before == after {
+            return;
+        }
+        let command = AnnotationCommand::FunctionComment {
+            function_start,
+            before,
+            after,
+        };
+        self.apply_command(&command, true);
+        self.undo_stack.push(command);
+        self.redo_stack.clear();
+    }
+
+    pub fn toggle_bookmark(&mut self, address: u64) {
+        let before = self.bookmarks.contains(&address);
+        let command = AnnotationCommand::Bookmark {
+            address,
+            before,
+            after: !before,
+        };
+        self.apply_command(&command, true);
+        self.undo_stack.push(command);
+        self.redo_stack.clear();
+    }
+
+    pub fn set_manual_definition(&mut self, address: u64, kind: ManualDefinitionKind) {
+        let before = self.manual_definitions.get(&address).copied();
+        let after = Some(kind);
+        if before == after {
+            return;
+        }
+        let command = AnnotationCommand::ManualDefinition {
+            address,
+            before,
+            after,
+        };
+        self.apply_command(&command, true);
+        self.undo_stack.push(command);
+        self.redo_stack.clear();
+    }
+
+    pub fn undo(&mut self) -> bool {
+        let Some(command) = self.undo_stack.pop() else {
+            return false;
+        };
+        self.apply_command(&command, false);
+        self.redo_stack.push(command);
+        true
+    }
+
+    pub fn redo(&mut self) -> bool {
+        let Some(command) = self.redo_stack.pop() else {
+            return false;
+        };
+        self.apply_command(&command, true);
+        self.undo_stack.push(command);
+        true
+    }
+
+    pub fn annotations(&self) -> UserAnnotations {
+        UserAnnotations {
+            names: self
+                .user_names
+                .iter()
+                .map(|(address, name)| UserName {
+                    address: *address,
+                    name: name.clone(),
+                })
+                .collect(),
+            comments: self
+                .address_comments
+                .iter()
+                .map(|(address, text)| UserComment {
+                    address: *address,
+                    text: text.clone(),
+                })
+                .collect(),
+            function_comments: self
+                .function_comments
+                .iter()
+                .map(|(function_start, text)| FunctionComment {
+                    function_start: *function_start,
+                    text: text.clone(),
+                })
+                .collect(),
+            bookmarks: self.bookmarks(),
+            manual_definitions: self
+                .manual_definitions
+                .iter()
+                .map(|(address, kind)| ManualDefinition {
+                    address: *address,
+                    kind: *kind,
+                })
+                .collect(),
+        }
+    }
+
+    pub fn apply_annotations(&mut self, annotations: UserAnnotations) {
+        self.user_names = annotations
+            .names
+            .into_iter()
+            .filter_map(|item| normalize_user_text(item.name).map(|name| (item.address, name)))
+            .collect();
+        self.address_comments = annotations
+            .comments
+            .into_iter()
+            .filter_map(|item| normalize_user_text(item.text).map(|text| (item.address, text)))
+            .collect();
+        self.function_comments = annotations
+            .function_comments
+            .into_iter()
+            .filter_map(|item| {
+                normalize_user_text(item.text).map(|text| (item.function_start, text))
+            })
+            .collect();
+        self.bookmarks = annotations
+            .bookmarks
+            .into_iter()
+            .map(|bookmark| bookmark.address)
+            .collect();
+        self.manual_definitions = annotations
+            .manual_definitions
+            .into_iter()
+            .map(|definition| (definition.address, definition.kind))
+            .collect();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+        self.dirty = false;
+    }
+
+    fn clear_user_state(&mut self) {
+        self.user_names.clear();
+        self.address_comments.clear();
+        self.function_comments.clear();
+        self.bookmarks.clear();
+        self.manual_definitions.clear();
+        self.undo_stack.clear();
+        self.redo_stack.clear();
+    }
+
+    fn apply_command(&mut self, command: &AnnotationCommand, forward: bool) {
+        match command {
+            AnnotationCommand::Rename {
+                address,
+                before,
+                after,
+            } => set_optional_string(
+                &mut self.user_names,
+                *address,
+                choose(before, after, forward),
+            ),
+            AnnotationCommand::AddressComment {
+                address,
+                before,
+                after,
+            } => set_optional_string(
+                &mut self.address_comments,
+                *address,
+                choose(before, after, forward),
+            ),
+            AnnotationCommand::FunctionComment {
+                function_start,
+                before,
+                after,
+            } => set_optional_string(
+                &mut self.function_comments,
+                *function_start,
+                choose(before, after, forward),
+            ),
+            AnnotationCommand::Bookmark {
+                address,
+                before,
+                after,
+            } => {
+                let value = if forward { *after } else { *before };
+                if value {
+                    self.bookmarks.insert(*address);
+                } else {
+                    self.bookmarks.remove(address);
+                }
+            }
+            AnnotationCommand::ManualDefinition {
+                address,
+                before,
+                after,
+            } => match if forward { after } else { before } {
+                Some(kind) => {
+                    self.manual_definitions.insert(*address, *kind);
+                }
+                None => {
+                    self.manual_definitions.remove(address);
+                }
+            },
+        }
+        self.dirty = true;
+    }
 }
 
 pub fn format_address(value: Option<u64>, prefix: &str) -> String {
     match value {
         Some(value) => format!("{prefix} {value:08X}"),
         None => format!("{prefix} --------"),
+    }
+}
+
+pub fn sha256_hex(bytes: &[u8]) -> String {
+    let mut hasher = Sha256::new();
+    hasher.update(bytes);
+    let digest = hasher.finalize();
+    digest
+        .iter()
+        .map(|byte| format!("{byte:02x}"))
+        .collect::<String>()
+}
+
+fn normalize_user_text(text: String) -> Option<String> {
+    let text = text.trim().to_owned();
+    (!text.is_empty()).then_some(text)
+}
+
+fn choose<'a>(
+    before: &'a Option<String>,
+    after: &'a Option<String>,
+    forward: bool,
+) -> &'a Option<String> {
+    if forward {
+        after
+    } else {
+        before
+    }
+}
+
+fn set_optional_string(map: &mut BTreeMap<u64, String>, address: u64, value: &Option<String>) {
+    match value {
+        Some(value) => {
+            map.insert(address, value.clone());
+        }
+        None => {
+            map.remove(&address);
+        }
     }
 }
 
@@ -742,5 +1275,93 @@ mod tests {
         assert_eq!(project.current_rva(), Some(0x20));
         assert_eq!(project.current_file_offset(), Some(0x20));
         assert_eq!(project.current_function(), Some("raw_entry"));
+    }
+
+    #[test]
+    fn annotation_commands_support_undo_and_redo() {
+        let mut project = ProjectState::default();
+        let address = 0x1400_01000;
+
+        project.rename_address(address, "decrypt_config");
+        project.set_address_comment(address, "reads encrypted blob");
+        project.toggle_bookmark(address);
+        project.set_manual_definition(address, ManualDefinitionKind::Code);
+
+        assert_eq!(project.name_for(address), Some("decrypt_config"));
+        assert_eq!(
+            project.address_comment(address),
+            Some("reads encrypted blob")
+        );
+        assert!(project.is_bookmarked(address));
+        assert_eq!(
+            project.manual_definition(address),
+            Some(ManualDefinitionKind::Code)
+        );
+
+        assert!(project.undo());
+        assert_eq!(project.manual_definition(address), None);
+        assert!(project.undo());
+        assert!(!project.is_bookmarked(address));
+        assert!(project.redo());
+        assert!(project.is_bookmarked(address));
+    }
+
+    #[test]
+    fn project_document_round_trips_user_annotations() {
+        let input = ProjectInput {
+            path: r"C:\samples\demo.exe".to_owned(),
+            size_bytes: 42,
+            sha256: sha256_hex(b"demo"),
+            kind: ProjectInputKind::Pe,
+        };
+        let annotations = UserAnnotations {
+            names: vec![UserName {
+                address: 0x1400_01000,
+                name: "main".to_owned(),
+            }],
+            comments: vec![UserComment {
+                address: 0x1400_01005,
+                text: "interesting branch".to_owned(),
+            }],
+            function_comments: vec![FunctionComment {
+                function_start: 0x1400_01000,
+                text: "entry function".to_owned(),
+            }],
+            bookmarks: vec![Bookmark {
+                address: 0x1400_01010,
+            }],
+            manual_definitions: vec![ManualDefinition {
+                address: 0x1400_01020,
+                kind: ManualDefinitionKind::Data,
+            }],
+        };
+        let document = ProjectDocument::new(
+            "test",
+            input,
+            vec![ProjectFunction {
+                start_va: 0x1400_01000,
+                name: "入口点".to_owned(),
+                size: 0x20,
+                instruction_count: 4,
+            }],
+            annotations,
+        );
+        let path = std::env::temp_dir().join(format!(
+            "fyida_project_roundtrip_{}.fyida.json",
+            std::process::id()
+        ));
+
+        document.save_to_path(&path).expect("save project");
+        let loaded = ProjectDocument::load_from_path(&path).expect("load project");
+        let _ = std::fs::remove_file(&path);
+
+        assert_eq!(loaded.schema_version, PROJECT_SCHEMA_VERSION);
+        assert_eq!(loaded.input.sha256, sha256_hex(b"demo"));
+        assert_eq!(loaded.functions[0].start_va, 0x1400_01000);
+        assert_eq!(loaded.annotations.names[0].name, "main");
+        assert_eq!(
+            loaded.annotations.manual_definitions[0].kind,
+            ManualDefinitionKind::Data
+        );
     }
 }

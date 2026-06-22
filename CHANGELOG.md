@@ -4,6 +4,40 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.5.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added a FY_IDA-owned `.fyida.json` project file format with schema version, app version, source path, file size, SHA-256 hash, load kind, load parameters, function summaries, and user annotations.
+- Added project save, save-as, and open support in the GUI.
+- Added SHA-256 source hashing and project-open hash mismatch warnings.
+- Added user annotation storage for names, address comments, function comments, bookmarks, and manual code/data definitions.
+- Added undo/redo support for rename, comments, bookmarks, and manual code/data definition commands.
+- Added GUI actions and shortcuts for save, undo/redo, rename, comments, bookmarks, and manual code/data marking.
+- Added annotation-aware function/name lists, disassembly comments, bookmark list, annotation panel, search, and project status display.
+- Added unit coverage for project save/load round-trip, annotation undo/redo, SHA-256 persistence, and Raw/PE project state.
+
+### Changed
+
+- Updated the workspace version to `0.5.0-alpha.1`.
+- Updated GUI, CLI, and README status text for the project database and manual annotation checkpoint.
+
+### Fixed
+
+- The toolbar and edit menu now call real annotation actions instead of disabled placeholders.
+
+### Known Issues
+
+- The first project format is JSON-based for readability and migration safety; a SQLite backend remains planned for later schema evolution.
+- Project files reopen the original input path and warn on hash mismatch, but they do not yet embed original binary bytes.
+- Function comments are created from the common comment dialog when the current address is a function entry; richer comment editing UI is still future work.
+- Manual code/data definitions are persisted and displayed, but they do not yet change the analyzer output.
+
+### Recovery
+
+- Source tag: `v0.5.0-alpha.1`.
+- Roll back with: `git checkout v0.5.0-alpha.1`.
+
 ## v0.4.1-alpha.1 - 2026-06-23
 
 ### Added
