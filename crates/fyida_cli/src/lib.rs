@@ -22,7 +22,7 @@ const HEADLESS_ANALYZE_COMMAND: &str = "analyze";
     name = "fy_ida",
     version,
     about = "FY_IDA 中文逆向分析工作台",
-    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.24.0-alpha.1 已恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，并能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python 标注动作写入、headless `--save-project` 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
+    long_about = "FY_IDA 是面向 Windows x64 PE / Raw Binary 的轻量逆向分析工具。当前 v0.25.0-alpha.1 已支持 headless 调用图节点/边明细 JSON 与 `--export call-graph` text/CSV 导出，并恢复 x64 RIP-relative/absolute 内存目标的字符串、导入 IAT、重定位和数据 xref，能把解析到 IAT 的间接 call/import thunk jmp 纳入导入 API 调用图；同时提供 Python 标注动作写入、headless `--save-project` 项目保存、Python 报告辅助 API 示例、递归插件扫描、结构化 Python 自动化报告、headless 搜索报告、伪代码/IR headless 选择性导出、伪代码/IR 搜索、`--headless analyze <FILE>`、本地 JSON 签名库导入、运行库签名识别、GUI 运行库函数过滤、基础 x64 伪 C/IR 输出、headless JSON/CSV 导出和基础静态分析。"
 )]
 pub struct Cli {
     #[arg(long, help = "以命令行占位模式运行，不启动 GUI")]
@@ -74,7 +74,7 @@ pub struct Cli {
     #[arg(
         long,
         value_name = "QUERY",
-        help = "在 headless 报告中搜索函数、字符串、导入导出、xref、伪代码、IR、类型和字节序列"
+        help = "在 headless 报告中搜索函数、字符串、导入导出、xref、调用图、伪代码、IR、类型和字节序列"
     )]
     pub search: Option<String>,
 
@@ -172,6 +172,7 @@ pub enum ExportKind {
     Imports,
     Exports,
     Xrefs,
+    CallGraph,
     RuntimeSignatures,
     Pseudocode,
     Ir,
@@ -267,6 +268,8 @@ struct AnalysisReport {
     cfg_count: usize,
     call_graph_nodes: usize,
     call_graph_edges: usize,
+    call_graph_node_records: Vec<CallGraphNodeRecord>,
+    call_graph_edge_records: Vec<CallGraphEdgeRecord>,
     pseudocode_functions: Vec<PseudocodeRecord>,
     runtime_signatures: Vec<RuntimeSignatureRecord>,
     pdb_records: Vec<PdbRecord>,
@@ -323,6 +326,22 @@ struct XrefRecord {
     from_va: u64,
     to_va: u64,
     kind: String,
+    label: String,
+}
+
+#[derive(Debug, Serialize)]
+struct CallGraphNodeRecord {
+    start_va: u64,
+    name: String,
+    is_external: bool,
+    call_count: usize,
+}
+
+#[derive(Debug, Serialize)]
+struct CallGraphEdgeRecord {
+    caller_va: u64,
+    callee_va: u64,
+    callsite_va: u64,
     label: String,
 }
 
@@ -1405,6 +1424,28 @@ fn analysis_report(analysis: &StaticAnalysis) -> AnalysisReport {
         cfg_count: analysis.function_cfgs.len(),
         call_graph_nodes: analysis.call_graph.nodes.len(),
         call_graph_edges: analysis.call_graph.edges.len(),
+        call_graph_node_records: analysis
+            .call_graph
+            .nodes
+            .iter()
+            .map(|node| CallGraphNodeRecord {
+                start_va: node.start_va,
+                name: node.name.clone(),
+                is_external: node.is_external,
+                call_count: node.call_count,
+            })
+            .collect(),
+        call_graph_edge_records: analysis
+            .call_graph
+            .edges
+            .iter()
+            .map(|edge| CallGraphEdgeRecord {
+                caller_va: edge.caller_va,
+                callee_va: edge.callee_va,
+                callsite_va: edge.callsite_va,
+                label: edge.label.clone(),
+            })
+            .collect(),
         pseudocode_functions: analysis
             .pseudocode_functions
             .iter()
@@ -1641,6 +1682,52 @@ fn build_search_report(
                 Some(xref.from_va),
                 format!("{:016X} -> {:016X}", xref.from_va, xref.to_va),
                 format!("{} {}", xref.kind, xref.label),
+            );
+        }
+    }
+
+    for node in &analysis.call_graph_node_records {
+        if matches_text(query, [&node.name])
+            || address_matches(node.start_va, query)
+            || matches_text(
+                query,
+                [if node.is_external {
+                    "external"
+                } else {
+                    "function"
+                }],
+            )
+        {
+            push_search(
+                &mut results,
+                "call_graph_node",
+                Some(node.start_va),
+                node.name.clone(),
+                format!(
+                    "{} node, calls {}",
+                    if node.is_external {
+                        "external"
+                    } else {
+                        "function"
+                    },
+                    node.call_count
+                ),
+            );
+        }
+    }
+
+    for edge in &analysis.call_graph_edge_records {
+        if matches_text(query, [&edge.label])
+            || address_matches(edge.caller_va, query)
+            || address_matches(edge.callee_va, query)
+            || address_matches(edge.callsite_va, query)
+        {
+            push_search(
+                &mut results,
+                "call_graph_edge",
+                Some(edge.callsite_va),
+                format!("{:016X} -> {:016X}", edge.caller_va, edge.callee_va),
+                edge.label.clone(),
             );
         }
     }
@@ -1932,6 +2019,10 @@ fn text_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Imports => text_imports(&report.analysis.imports),
         ExportKind::Exports => text_exports(&report.analysis.exports),
         ExportKind::Xrefs => text_xrefs(&report.analysis.xrefs),
+        ExportKind::CallGraph => text_call_graph(
+            &report.analysis.call_graph_node_records,
+            &report.analysis.call_graph_edge_records,
+        ),
         ExportKind::RuntimeSignatures => {
             text_runtime_signatures(&report.analysis.runtime_signatures)
         }
@@ -1987,6 +2078,13 @@ fn text_full_report(report: &HeadlessReport) -> String {
         "  CallGraph：{} nodes / {} edges",
         report.analysis.call_graph_nodes, report.analysis.call_graph_edges
     );
+    for edge in report.analysis.call_graph_edge_records.iter().take(32) {
+        let _ = writeln!(
+            text,
+            "    {:016X} -> {:016X} @ {:016X} {}",
+            edge.caller_va, edge.callee_va, edge.callsite_va, edge.label
+        );
+    }
     let _ = writeln!(
         text,
         "  Pseudocode：{} functions",
@@ -2051,6 +2149,11 @@ fn text_summary_report(report: &HeadlessReport) -> String {
     let _ = writeln!(text, "Imports: {}", report.analysis.imports.len());
     let _ = writeln!(text, "Exports: {}", report.analysis.exports.len());
     let _ = writeln!(text, "Xrefs: {}", report.analysis.xrefs.len());
+    let _ = writeln!(
+        text,
+        "CallGraph: {} nodes / {} edges",
+        report.analysis.call_graph_nodes, report.analysis.call_graph_edges
+    );
     let _ = writeln!(
         text,
         "Pseudocode: {}",
@@ -2133,6 +2236,31 @@ fn text_xrefs(xrefs: &[XrefRecord]) -> String {
             text,
             "{:016X}\t{:016X}\t{}\t{}",
             xref.from_va, xref.to_va, xref.kind, xref.label
+        );
+    }
+    text
+}
+
+fn text_call_graph(nodes: &[CallGraphNodeRecord], edges: &[CallGraphEdgeRecord]) -> String {
+    let mut text = String::from("CallGraph\nNodes\n");
+    for node in nodes {
+        let kind = if node.is_external {
+            "external"
+        } else {
+            "function"
+        };
+        let _ = writeln!(
+            text,
+            "{:016X}\t{}\t{}\tcalls {}",
+            node.start_va, node.name, kind, node.call_count
+        );
+    }
+    text.push_str("Edges\n");
+    for edge in edges {
+        let _ = writeln!(
+            text,
+            "{:016X}\t{:016X}\t{:016X}\t{}",
+            edge.caller_va, edge.callee_va, edge.callsite_va, edge.label
         );
     }
     text
@@ -2324,6 +2452,10 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
         ExportKind::Imports => csv_imports(&report.analysis.imports),
         ExportKind::Exports => csv_exports(&report.analysis.exports),
         ExportKind::Xrefs => csv_xrefs(&report.analysis.xrefs),
+        ExportKind::CallGraph => csv_call_graph(
+            &report.analysis.call_graph_node_records,
+            &report.analysis.call_graph_edge_records,
+        ),
         ExportKind::RuntimeSignatures => {
             csv_runtime_signatures(&report.analysis.runtime_signatures)
         }
@@ -2364,6 +2496,22 @@ fn csv_report(report: &HeadlessReport, kind: ExportKind) -> String {
             push_csv_row(
                 &mut csv,
                 &["summary", "xrefs", &report.analysis.xrefs.len().to_string()],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "call_graph_nodes",
+                    &report.analysis.call_graph_nodes.to_string(),
+                ],
+            );
+            push_csv_row(
+                &mut csv,
+                &[
+                    "summary",
+                    "call_graph_edges",
+                    &report.analysis.call_graph_edges.to_string(),
+                ],
             );
             push_csv_row(
                 &mut csv,
@@ -2439,6 +2587,20 @@ fn csv_summary(report: &HeadlessReport) -> String {
     push_csv_row(
         &mut csv,
         &["xrefs", &report.analysis.xrefs.len().to_string()],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "call_graph_nodes",
+            &report.analysis.call_graph_nodes.to_string(),
+        ],
+    );
+    push_csv_row(
+        &mut csv,
+        &[
+            "call_graph_edges",
+            &report.analysis.call_graph_edges.to_string(),
+        ],
     );
     push_csv_row(
         &mut csv,
@@ -2561,6 +2723,45 @@ fn csv_xrefs(xrefs: &[XrefRecord]) -> String {
                 &format!("{:016X}", xref.to_va),
                 &xref.kind,
                 &xref.label,
+            ],
+        );
+    }
+    csv
+}
+
+fn csv_call_graph(nodes: &[CallGraphNodeRecord], edges: &[CallGraphEdgeRecord]) -> String {
+    let mut csv = String::from(
+        "record,address,name,is_external,call_count,caller_va,callee_va,callsite_va,label\n",
+    );
+    for node in nodes {
+        push_csv_row(
+            &mut csv,
+            &[
+                "node",
+                &format!("{:016X}", node.start_va),
+                &node.name,
+                &node.is_external.to_string(),
+                &node.call_count.to_string(),
+                "",
+                "",
+                "",
+                "",
+            ],
+        );
+    }
+    for edge in edges {
+        push_csv_row(
+            &mut csv,
+            &[
+                "edge",
+                "",
+                "",
+                "",
+                "",
+                &format!("{:016X}", edge.caller_va),
+                &format!("{:016X}", edge.callee_va),
+                &format!("{:016X}", edge.callsite_va),
+                &edge.label,
             ],
         );
     }
@@ -3089,6 +3290,20 @@ mod tests {
     }
 
     #[test]
+    fn parses_call_graph_export_kind() {
+        let cli = Cli::try_parse_from([
+            "fy_ida",
+            "--headless",
+            "--export",
+            "call-graph",
+            "sample.exe",
+        ])
+        .unwrap();
+
+        assert_eq!(cli.export, ExportKind::CallGraph);
+    }
+
+    #[test]
     fn parses_search_query_and_export_kind() {
         let cli = Cli::try_parse_from([
             "fy_ida",
@@ -3153,6 +3368,10 @@ mod tests {
             .results
             .iter()
             .any(|result| result.category == "runtime_signature"));
+        assert!(search
+            .results
+            .iter()
+            .any(|result| result.category == "call_graph_edge"));
         assert!(search
             .results
             .iter()
@@ -3257,7 +3476,7 @@ mod tests {
 
         let document = project_document_from_report(&report).unwrap();
 
-        assert_eq!(document.app_version, "0.24.0-alpha.1");
+        assert_eq!(document.app_version, "0.25.0-alpha.1");
         assert_eq!(document.functions[0].name, "renamed_func");
         assert_eq!(document.annotations.names[0].name, "renamed_func");
         assert_eq!(document.annotations.comments[0].text, "automation note");
@@ -3389,6 +3608,26 @@ mod tests {
         assert!(text.contains("0000000140001004\tret\trax\t; returns, quoted \"value\""));
     }
 
+    #[test]
+    fn call_graph_text_and_csv_include_nodes_and_edges() {
+        let analysis = sample_analysis_report();
+
+        let text = text_call_graph(
+            &analysis.call_graph_node_records,
+            &analysis.call_graph_edge_records,
+        );
+        let csv = csv_call_graph(
+            &analysis.call_graph_node_records,
+            &analysis.call_graph_edge_records,
+        );
+
+        assert!(text.contains("USER32.dll!MessageBoxW"));
+        assert!(text.contains("quoted import call"));
+        assert!(csv.contains("record,address,name,is_external"));
+        assert!(csv.contains("USER32.dll!MessageBoxW"));
+        assert!(csv.contains("quoted import call"));
+    }
+
     fn sample_pseudocode_record() -> PseudocodeRecord {
         PseudocodeRecord {
             function_start: 0x0000_0001_4000_1000,
@@ -3410,7 +3649,7 @@ mod tests {
 
     fn sample_headless_report_with_automation() -> HeadlessReport {
         HeadlessReport {
-            version: "0.24.0-alpha.1".to_owned(),
+            version: "0.25.0-alpha.1".to_owned(),
             input: sample_input_report(),
             analysis: sample_analysis_report(),
             type_library: sample_type_library_report(),
@@ -3521,8 +3760,28 @@ mod tests {
                 label: "quoted import".to_owned(),
             }],
             cfg_count: 1,
-            call_graph_nodes: 1,
+            call_graph_nodes: 2,
             call_graph_edges: 1,
+            call_graph_node_records: vec![
+                CallGraphNodeRecord {
+                    start_va: 0x0000_0001_4000_1000,
+                    name: "sub_test".to_owned(),
+                    is_external: false,
+                    call_count: 1,
+                },
+                CallGraphNodeRecord {
+                    start_va: 0x0000_0001_4000_3000,
+                    name: "USER32.dll!MessageBoxW".to_owned(),
+                    is_external: true,
+                    call_count: 1,
+                },
+            ],
+            call_graph_edge_records: vec![CallGraphEdgeRecord {
+                caller_va: 0x0000_0001_4000_1000,
+                callee_va: 0x0000_0001_4000_3000,
+                callsite_va: 0x0000_0001_4000_1004,
+                label: "quoted import call -> USER32.dll!MessageBoxW".to_owned(),
+            }],
             pseudocode_functions: vec![sample_pseudocode_record()],
             runtime_signatures: vec![RuntimeSignatureRecord {
                 address: 0x0000_0001_4000_1000,

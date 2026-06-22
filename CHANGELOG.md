@@ -4,6 +4,38 @@ All notable changes to FY_IDA should be documented in this file.
 
 Version format during early development: `vMAJOR.MINOR.PATCH-alpha.N`.
 
+## v0.25.0-alpha.1 - 2026-06-23
+
+### Added
+
+- Added detailed `call_graph_node_records` and `call_graph_edge_records` arrays to headless JSON reports.
+- Added `--export call-graph` for text and CSV call graph node/edge output.
+- Added call graph node/edge coverage to headless search results.
+- Added `call_graph_nodes`, `call_graph_edges`, `callees_from`, and `callers_to` helpers to `examples/python/fyida.py`.
+- Added `examples/scripts/list_call_graph.py` for call graph scripting examples.
+- Added CLI unit coverage for call graph export parsing, text/CSV output, and call graph search hits.
+
+### Changed
+
+- Updated the workspace version to `0.25.0-alpha.1`.
+- Updated GUI, CLI, startup log, README status text, Python API docs, and CHANGELOG metadata for the headless call-graph export checkpoint.
+- Headless summaries now include call graph node/edge counts alongside function, string, import, and xref counts.
+
+### Fixed
+
+- Headless JSON no longer exposes only call graph counts; scripts can now consume the actual call graph records.
+
+### Known Issues
+
+- Detailed call graph export currently covers the generated graph model, not a rendered graph layout.
+- Register-computed indirect calls and non-IAT virtual dispatch remain unresolved.
+- GitHub Release creation remains dependent on an available GitHub release tool or authenticated API path in the local environment.
+
+### Recovery
+
+- Source tag: `v0.25.0-alpha.1`.
+- Roll back with: `git checkout v0.25.0-alpha.1`.
+
 ## v0.24.0-alpha.1 - 2026-06-23
 
 ### Added

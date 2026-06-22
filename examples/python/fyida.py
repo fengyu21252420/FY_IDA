@@ -51,6 +51,31 @@ class Project:
     def xrefs(self):
         return self._records("xrefs")
 
+    def call_graph_nodes(self, query=None):
+        return self._filter_records("call_graph_node_records", query, "name")
+
+    def call_graph_edges(self, query=None):
+        records = self._records("call_graph_edge_records")
+        if not query:
+            return records
+        needle = query.casefold()
+        return [
+            item
+            for item in records
+            if needle in str(item.get("label", "")).casefold()
+            or needle in hex(item.get("caller_va", 0)).casefold()
+            or needle in hex(item.get("callee_va", 0)).casefold()
+            or needle in hex(item.get("callsite_va", 0)).casefold()
+        ]
+
+    def callees_from(self, address):
+        source = parse_address(address)
+        return [edge for edge in self.call_graph_edges() if edge.get("caller_va") == source]
+
+    def callers_to(self, address):
+        target = parse_address(address)
+        return [edge for edge in self.call_graph_edges() if edge.get("callee_va") == target]
+
     def xrefs_to(self, address):
         target = parse_address(address)
         return [xref for xref in self.xrefs() if xref.get("to_va") == target]
